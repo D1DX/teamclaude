@@ -194,6 +194,21 @@ async function forwardRequest(req, res, body, accountManager, upstream, retryCou
     headers[key] = value;
   }
 
+  // D1DX patch: defend against the claude-code OAuth-beta clobber regression.
+  // Claude Code 2.1.121+ intermittently drops `oauth-2025-04-20` from
+  // `anthropic-beta` when model-level betas are merged in, making upstream
+  // return 401 "OAuth authentication is currently not supported". Always
+  // ensure the gate is present on OAuth requests. Idempotent. (Upstream PR #3.)
+  if (isOAuth) {
+    const REQUIRED_OAUTH_BETA = 'oauth-2025-04-20';
+    const betaKey = Object.keys(headers).find(k => k.toLowerCase() === 'anthropic-beta');
+    const existing = betaKey ? String(headers[betaKey]).split(',').map(s => s.trim()).filter(Boolean) : [];
+    if (!existing.includes(REQUIRED_OAUTH_BETA)) {
+      existing.unshift(REQUIRED_OAUTH_BETA);
+      headers[betaKey || 'anthropic-beta'] = existing.join(',');
+    }
+  }
+
   if (isOAuth) {
     headers['authorization'] = `Bearer ${account.credential}`;
   } else {
@@ -243,21 +258,93 @@ async function forwardRequest(req, res, body, accountManager, upstream, retryCou
     }
     accountManager.updateQuota(account.index, rateLimitHeaders);
 
-    // On 429, wait the retry-after duration and retry on the same account
-    // (this is a transient rate limit, not quota exhaustion)
+    // D1DX patch: 429 → immediate failover (upstream PR #13).
+    // A 429 means this account is rate-limited or out of quota. Mark it
+    // unavailable for the retry-after window and immediately fail over to the
+    // next available account, rather than holding the client connection open
+    // waiting on a dead account (for quota exhaustion retry-after can be hours).
+    // Once every account is throttled, getActiveAccount() returns null on the
+    // next pass and the client gets a 429 with a proper retry-after to back off.
     if (upstreamRes.status === 429) {
       const retryAfter = parseInt(upstreamRes.headers.get('retry-after'), 10) || 60;
       // Discard the 429 response body
       await upstreamRes.body?.cancel();
+      accountManager.markRateLimited(account.index, retryAfter);
 
       if (logDir) {
-        logSections.push(`=== RESPONSE 429 — waiting ${retryAfter}s ===\n${formatHeaders(upstreamRes.headers)}`);
+        logSections.push(`=== RESPONSE 429 — "${account.name}" rate-limited ${retryAfter}s, failing over ===\n${formatHeaders(upstreamRes.headers)}`);
       }
-      console.log(`[TeamClaude] 429 on "${account.name}" — waiting ${retryAfter}s before retry`);
-      await new Promise(resolve => setTimeout(resolve, retryAfter * 1000));
-      // Client may have disconnected during the wait
-      if (res.destroyed) return;
-      return forwardRequest(req, res, body, accountManager, upstream, retryCount, hooks, reqId, ctx, logDir);
+      console.log(`[TeamClaude] 429 on "${account.name}" — rate-limited ${retryAfter}s, failing over`);
+
+      if (retryCount < maxRetries && !res.headersSent) {
+        return forwardRequest(req, res, body, accountManager, upstream, retryCount + 1, hooks, reqId, ctx, logDir);
+      }
+
+      // Retries exhausted — every account is throttled; tell the client to back off.
+      ctx.status = 429;
+      if (logDir) writeRequestLog(logDir, reqId, logSections);
+      if (!res.headersSent) {
+        const clientRetryAfter = computeRetryAfter(accountManager.getStatus().accounts);
+        res.writeHead(429, {
+          'Content-Type': 'application/json',
+          'retry-after': String(clientRetryAfter),
+        });
+        res.end(JSON.stringify({
+          type: 'error',
+          error: {
+            type: 'rate_limit_error',
+            message: `All ${accountManager.accounts.length} accounts rate-limited. Retry in ${clientRetryAfter}s.`,
+          },
+        }));
+      }
+      return;
+    }
+
+    // D1DX patch: 529 Overloaded → hold-and-backoff.
+    // 529 is a transient, global Anthropic overload (not account-specific), so
+    // switching accounts does not help. Hold the client connection and retry
+    // the SAME account with exponential backoff (capped 60s/wait) for up to ~1h
+    // cumulative, then synthesize a 529 so the client can give up cleanly.
+    // retryCount is left untouched — 529 retries must not consume the
+    // account-failover budget used by the 429 path above.
+    if (upstreamRes.status === 529) {
+      await upstreamRes.body?.cancel();
+      if (ctx.overloadStart == null) ctx.overloadStart = Date.now();
+      ctx.overloadAttempts = (ctx.overloadAttempts || 0) + 1;
+      const OVERLOAD_BUDGET_MS = 60 * 60 * 1000; // ~1 hour total
+      const elapsed = Date.now() - ctx.overloadStart;
+      // exponential backoff: 1s, 2s, 4s, ... capped at 60s/wait
+      const backoff = Math.min(60000, 1000 * 2 ** Math.min(ctx.overloadAttempts - 1, 6));
+
+      if (elapsed + backoff < OVERLOAD_BUDGET_MS && !res.headersSent && !res.destroyed) {
+        if (logDir) {
+          logSections.push(`=== RESPONSE 529 — overloaded, retry ${ctx.overloadAttempts} after ${backoff}ms (elapsed ${Math.round(elapsed / 1000)}s) ===\n${formatHeaders(upstreamRes.headers)}`);
+        }
+        console.log(`[TeamClaude] 529 overloaded on "${account.name}" — retry ${ctx.overloadAttempts} in ${Math.round(backoff / 1000)}s (elapsed ${Math.round(elapsed / 1000)}s/3600s)`);
+        await new Promise(resolve => setTimeout(resolve, backoff));
+        // Client may have disconnected during the wait
+        if (res.destroyed) return;
+        return forwardRequest(req, res, body, accountManager, upstream, retryCount, hooks, reqId, ctx, logDir);
+      }
+
+      // Budget exhausted (or client gone) — return the 529 to the client.
+      ctx.status = 529;
+      console.log(`[TeamClaude] 529 overloaded on "${account.name}" — giving up after ${Math.round(elapsed / 1000)}s, returning 529`);
+      if (logDir) {
+        logSections.push(`=== RESPONSE 529 — overload budget exhausted after ${Math.round(elapsed / 1000)}s ===\n${formatHeaders(upstreamRes.headers)}`);
+        writeRequestLog(logDir, reqId, logSections);
+      }
+      if (!res.headersSent) {
+        res.writeHead(529, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({
+          type: 'error',
+          error: {
+            type: 'overloaded_error',
+            message: 'Upstream overloaded (529) — retried with backoff for ~1h before giving up.',
+          },
+        }));
+      }
+      return;
     }
 
     // Log response headers
