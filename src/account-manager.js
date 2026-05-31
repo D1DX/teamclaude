@@ -48,11 +48,23 @@ export class AccountManager {
     this.homeIndex = null; // account to prefer returning to after a 429 failover (cache locality)
   }
 
+  // D1DX patch: actively sweep ALL accounts every request + on every status read,
+  // not just `current`. Clears an expired throttle (so a freed account rejoins the
+  // failover pool immediately) and stale quota windows. In-memory, no network, no
+  // timer — keeps the whole pool fresh and the status display truthful.
+  _sweepAll() {
+    for (const account of this.accounts) {
+      this._isBlocked(account);       // side effect: flips an expired throttle back to active
+      this._clearExpiredQuotas(account);
+    }
+  }
+
   /**
    * Get the best available account (sticky while the current one is preferred).
    * Returns null only if every account is hard-capped / throttled with no reset yet.
    */
   getActiveAccount() {
+    this._sweepAll();
     const current = this.accounts[this.currentIndex];
     if (this._isPreferred(current)) return current; // sticky — stay cache-warm
     return this._selectNext();
@@ -447,6 +459,7 @@ export class AccountManager {
    * Return a status summary of all accounts (safe to expose, no credentials).
    */
   getStatus() {
+    this._sweepAll(); // D1DX patch: truthful display — clear expired throttles/quotas before rendering
     return {
       currentAccount: this.accounts[this.currentIndex]?.name,
       switchThreshold: this.switchThreshold,

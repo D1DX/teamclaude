@@ -165,6 +165,20 @@ async function serverCommand() {
 
   const server = createProxyServer(accountManager, config, hooks);
 
+  // D1DX patch: warm BEFORE listening so request #1 is never blind — quota populated
+  // and 5h windows anchored before any client request is served. Awaited (adds ~1-2s
+  // to boot), but bounded by a 15s deadline so a hung upstream can't block boot
+  // indefinitely; best-effort either way (warmAll catches per-account). No timer.
+  if (config.warmOnStartup !== false) {
+    let deadline;
+    const warmDeadline = new Promise(resolve => { deadline = setTimeout(resolve, 15000); });
+    await Promise.race([
+      accountManager.warmAll(config.upstream || 'https://api.anthropic.com').catch(() => {}),
+      warmDeadline,
+    ]);
+    clearTimeout(deadline);
+  }
+
   server.listen(port, () => {
     if (tui) {
       tui.start();
@@ -190,13 +204,6 @@ async function serverCommand() {
       console.log('');
     }
   });
-
-  // D1DX patch: warm accounts at startup — anchor each 5h window early
-  // and populate the unified-ratelimit headers so weekly-reserve selection isn't
-  // blind on request #1. Startup-only, fire-and-forget, best-effort (no timer).
-  if (config.warmOnStartup !== false) {
-    accountManager.warmAll(config.upstream || 'https://api.anthropic.com').catch(() => {});
-  }
 
   if (!tui) {
     process.on('SIGINT', () => {
