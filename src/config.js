@@ -16,7 +16,9 @@ export function createDefaultConfig() {
       apiKey: 'tc-' + randomBytes(24).toString('base64url'),
     },
     upstream: 'https://api.anthropic.com',
-    switchThreshold: 0.98,
+    switchThreshold: 0.98, // hard ceiling (5h axis + real weekly limit)
+    weeklyReserve: 0.20,   // D1DX: soft weekly reserve floor, time-decayed
+    warmOnStartup: true,   // D1DX: ping each account at boot to anchor windows
     accounts: [],
   };
 }

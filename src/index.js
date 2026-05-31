@@ -87,7 +87,9 @@ async function serverCommand() {
   }
 
   const threshold = config.switchThreshold || 0.98;
-  const accountManager = new AccountManager(accounts, threshold);
+  // D1DX: weeklyReserve defaults to 0.20 for configs predating the key.
+  const weeklyReserve = config.weeklyReserve ?? 0.20;
+  const accountManager = new AccountManager(accounts, threshold, weeklyReserve);
 
   // Persist refreshed tokens back to config (re-read from disk to avoid clobbering
   // accounts added externally, e.g. by `teamclaude import` while server is running)
@@ -188,6 +190,13 @@ async function serverCommand() {
       console.log('');
     }
   });
+
+  // D1DX patch: warm accounts at startup — anchor each 5h window early
+  // and populate the unified-ratelimit headers so weekly-reserve selection isn't
+  // blind on request #1. Startup-only, fire-and-forget, best-effort (no timer).
+  if (config.warmOnStartup !== false) {
+    accountManager.warmAll(config.upstream || 'https://api.anthropic.com').catch(() => {});
+  }
 
   if (!tui) {
     process.on('SIGINT', () => {

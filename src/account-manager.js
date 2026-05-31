@@ -1,5 +1,7 @@
 import { refreshAccessToken, isTokenExpiringSoon } from './oauth.js';
 
+const WEEK_MS = 7 * 24 * 60 * 60 * 1000;
+
 function emptyQuota() {
   return {
     // Standard API rate limits (API key accounts)
@@ -18,7 +20,10 @@ function emptyQuota() {
 }
 
 export class AccountManager {
-  constructor(accounts, switchThreshold = 0.98) {
+  // D1DX patch: weeklyReserve drives the time-decayed weekly cap.
+  // switchThreshold (0.98) stays the HARD ceiling on the 5h axis + the real
+  // weekly limit; weeklyReserve (0.20) is the SOFT preference floor on 7d.
+  constructor(accounts, switchThreshold = 0.98, weeklyReserve = 0.20) {
     this.accounts = accounts.map((acct, index) => ({
       index,
       name: acct.name,
@@ -39,42 +44,56 @@ export class AccountManager {
     }));
     this.currentIndex = 0;
     this.switchThreshold = switchThreshold;
+    this.weeklyReserve = weeklyReserve;
+    this.homeIndex = null; // account to prefer returning to after a 429 failover (cache locality)
   }
 
   /**
-   * Get the best available account, rotating if the current one is near quota.
-   * Returns null if all accounts are exhausted.
+   * Get the best available account (sticky while the current one is preferred).
+   * Returns null only if every account is hard-capped / throttled with no reset yet.
    */
   getActiveAccount() {
     const current = this.accounts[this.currentIndex];
-    if (this._isAvailable(current)) {
-      return current;
-    }
+    if (this._isPreferred(current)) return current; // sticky — stay cache-warm
     return this._selectNext();
   }
 
-  _isAvailable(account) {
-    if (!account) return false;
+  // ── D1DX patch: two-tier weekly-reserve selection ──────────────
+  // Tier 1 (preferred): weekly utilization below the time-decayed reserve cap.
+  // Tier 2 (reserve):   no preferred account left — dip into the reserve band
+  //                     (below the 0.98 hard ceiling) to KEEP WORKING.
+  // Tier 3 (fallback):  everything hard-capped/throttled — soonest reset / null.
+  // Grounding: accounts sit at 0.75–0.99 weekly almost always, so a
+  // hard reserve floor would refuse service constantly. The cap is a SOFT
+  // preference; switchThreshold (0.98) stays the hard ceiling.
 
-    // Check rate limit expiry
-    if (account.status === 'throttled' && account.rateLimitedUntil) {
-      if (Date.now() < account.rateLimitedUntil) return false;
-      account.status = 'active';
-      account.rateLimitedUntil = null;
-      console.log(`[TeamClaude] Account "${account.name}" rate limit expired, marking active`);
-    }
-
-    if (account.status === 'exhausted' || account.status === 'error') return false;
-    if (this._isNearQuota(account)) return false;
-
-    return true;
+  // Time-decayed weekly cap: hold the full reserve early in the week, release
+  // toward 1.0 as the account's 7d reset approaches (use-it-or-lose-it).
+  _effectiveWeeklyCap(account) {
+    const reset = account.quota.unified7dReset;
+    const tToReset = reset ? Math.max(0, reset - Date.now()) : WEEK_MS;
+    const frac = Math.min(1, tToReset / WEEK_MS);
+    return 1 - this.weeklyReserve * frac;
   }
 
-  _isNearQuota(account) {
+  // Below-cap weekly headroom per ms to reset — high = lots of soon-to-be-wasted
+  // weekly budget. Maximize to drain the most about-to-reset account first
+  // (operator's "percent ÷ time-left, prefer the one resetting soonest").
+  _weeklyUrgency(account) {
+    const u7d = account.quota.unified7d ?? 0;
+    const reset = account.quota.unified7dReset;
+    const tToReset = reset ? Math.max(1, reset - Date.now()) : WEEK_MS;
+    return Math.max(0, this._effectiveWeeklyCap(account) - u7d) / tToReset;
+  }
+
+  // Absolute weekly headroom to the hard ceiling (reserve-band tiebreak).
+  _weeklyRemaining(account) {
+    return 1 - (account.quota.unified7d ?? 0);
+  }
+
+  _clearExpiredQuotas(account) {
     const q = account.quota;
     const now = Date.now();
-
-    // Clear expired unified quotas
     if (q.unified5h != null && q.unified5hReset && now >= q.unified5hReset) {
       console.log(`[TeamClaude] Account "${account.name}" session quota reset`);
       q.unified5h = null;
@@ -86,8 +105,6 @@ export class AccountManager {
       q.unified7dReset = null;
       q.unifiedStatus = null;
     }
-
-    // Clear expired standard quotas
     if (q.resetsAt && now >= new Date(q.resetsAt).getTime()) {
       q.tokensRemaining = null;
       q.tokensLimit = null;
@@ -95,49 +112,102 @@ export class AccountManager {
       q.requestsLimit = null;
       q.resetsAt = null;
     }
+  }
 
-    // Unified quotas (Claude Max) — utilization is already 0-1
-    if (q.unified5h != null && q.unified5h >= this.switchThreshold) return true;
-    if (q.unified7d != null && q.unified7d >= this.switchThreshold) return true;
-
-    // Standard quotas (API key accounts)
-    if (q.tokensLimit != null && q.tokensRemaining != null) {
-      const used = 1 - (q.tokensRemaining / q.tokensLimit);
-      if (used >= this.switchThreshold) return true;
+  // Throttled / errored / exhausted — unusable regardless of quota band.
+  _isBlocked(account) {
+    if (!account) return true;
+    if (account.status === 'throttled' && account.rateLimitedUntil) {
+      if (Date.now() < account.rateLimitedUntil) return true;
+      account.status = 'active';
+      account.rateLimitedUntil = null;
+      console.log(`[TeamClaude] Account "${account.name}" rate limit expired, marking active`);
     }
-
-    if (q.requestsLimit != null && q.requestsRemaining != null) {
-      const used = 1 - (q.requestsRemaining / q.requestsLimit);
-      if (used >= this.switchThreshold) return true;
-    }
-
+    if (account.status === 'exhausted' || account.status === 'error') return true;
     return false;
   }
 
+  // Real hard limits — using past these risks an actual 429. unified-status
+  // `rejected` is the server telling us this account is over (allowed_warning
+  // is NOT a trigger — ~24% of normal requests carry it).
+  _atHardLimit(account) {
+    const q = account.quota;
+    if (q.unifiedStatus === 'rejected') return true;
+    if (q.unified5h != null && q.unified5h >= this.switchThreshold) return true;
+    if (q.unified7d != null && q.unified7d >= this.switchThreshold) return true;
+    if (q.tokensLimit != null && q.tokensRemaining != null &&
+        (1 - q.tokensRemaining / q.tokensLimit) >= this.switchThreshold) return true;
+    if (q.requestsLimit != null && q.requestsRemaining != null &&
+        (1 - q.requestsRemaining / q.requestsLimit) >= this.switchThreshold) return true;
+    return false;
+  }
+
+  // Tier 1 — usable AND weekly utilization below the time-decayed reserve cap.
+  _isPreferred(account) {
+    if (this._isBlocked(account)) return false;
+    this._clearExpiredQuotas(account);
+    if (this._atHardLimit(account)) return false;
+    const q = account.quota;
+    if (q.unified7d != null && q.unified7d >= this._effectiveWeeklyCap(account)) return false;
+    return true;
+  }
+
+  // Tier 2 — usable and below the hard ceiling (may be in the reserve band).
+  _isUsable(account) {
+    if (this._isBlocked(account)) return false;
+    this._clearExpiredQuotas(account);
+    return !this._atHardLimit(account);
+  }
+
+  // Back-compat shim: "near quota" === not in the preferred band (updateQuota's
+  // approaching-quota log line still calls this).
+  _isNearQuota(account) {
+    return !this._isPreferred(account);
+  }
+
+  _switchTo(account, reason) {
+    if (account.index !== this.currentIndex) {
+      console.log(`[TeamClaude] Switched to ${reason}`);
+    }
+    this.currentIndex = account.index;
+    return account;
+  }
+
   _selectNext() {
-    const startIndex = this.currentIndex;
-
-    for (let i = 1; i <= this.accounts.length; i++) {
-      const idx = (startIndex + i) % this.accounts.length;
-      const account = this.accounts[idx];
-
-      if (this._isAvailable(account)) {
-        this.currentIndex = idx;
-        console.log(`[TeamClaude] Switched to account "${account.name}"`);
-        return account;
+    // Tier 1 — preferred accounts (weekly utilization below the reserve cap).
+    const preferred = this.accounts.filter(a => this._isPreferred(a));
+    if (preferred.length > 0) {
+      // Return to a remembered home account if it's preferred again (cache-warm).
+      if (this.homeIndex != null) {
+        const home = preferred.find(a => a.index === this.homeIndex);
+        if (home) {
+          this.homeIndex = null;
+          return this._switchTo(home, `home account "${home.name}" (cleared, cache-warm)`);
+        }
       }
+      // Otherwise drain the most about-to-be-wasted weekly budget first.
+      const target = preferred.reduce((best, a) =>
+        this._weeklyUrgency(a) > this._weeklyUrgency(best) ? a : best);
+      return this._switchTo(target, `account "${target.name}" (max weekly urgency)`);
     }
 
-    // All accounts unavailable — find the one that resets soonest
+    // Tier 2 — reserve band: no preferred account, but keep work alive on the
+    // account with the most weekly headroom below the hard ceiling.
+    const usable = this.accounts.filter(a => this._isUsable(a));
+    if (usable.length > 0) {
+      const target = usable.reduce((best, a) =>
+        this._weeklyRemaining(a) > this._weeklyRemaining(best) ? a : best);
+      return this._switchTo(target, `account "${target.name}" (reserve band — keeping work alive)`);
+    }
+
+    // Tier 3 — everything hard-capped / throttled: take the soonest to reset.
     let soonestAccount = null;
     let soonestTime = Infinity;
-
     for (const account of this.accounts) {
       const resetTime = account.rateLimitedUntil
         || account.quota.unified5hReset
         || account.quota.unified7dReset
         || (account.quota.resetsAt ? new Date(account.quota.resetsAt).getTime() : null);
-
       if (resetTime && resetTime < soonestTime) {
         soonestTime = resetTime;
         soonestAccount = account;
@@ -224,6 +294,9 @@ export class AccountManager {
     if (!account) return;
     account.status = 'throttled';
     account.rateLimitedUntil = Date.now() + (retryAfterSeconds * 1000);
+    // D1DX patch: remember the displaced current account so selection
+    // prefers returning to it (cache-warm) at the next switch once it clears.
+    if (accountIndex === this.currentIndex) this.homeIndex = accountIndex;
     console.log(`[TeamClaude] Account "${account.name}" rate limited for ${retryAfterSeconds}s`);
   }
 
@@ -317,6 +390,7 @@ export class AccountManager {
    */
   removeAccount(index) {
     if (index < 0 || index >= this.accounts.length) return;
+    this.homeIndex = null; // indices shift on removal — drop any stale home pointer
     this.accounts.splice(index, 1);
     this.accounts.forEach((a, i) => a.index = i);
     if (this.currentIndex >= this.accounts.length) {
@@ -327,12 +401,56 @@ export class AccountManager {
   }
 
   /**
+   * D1DX patch: warm all accounts at startup. Refreshes each OAuth
+   * token, then fires one minimal request per account to anchor its 5h window
+   * and populate the unified-ratelimit headers so selection isn't blind on
+   * request #1. Startup-only — no timer, no background loop (operator constraint).
+   * Best-effort: a failed warm logs and is skipped; it never blocks boot.
+   */
+  async warmAll(upstream = 'https://api.anthropic.com') {
+    console.log(`[TeamClaude] Warming ${this.accounts.length} account(s) at startup...`);
+    await Promise.all(this.accounts.map(async (account) => {
+      try {
+        await this.ensureTokenFresh(account.index);
+        const isOAuth = account.type === 'oauth';
+        const headers = { 'content-type': 'application/json', 'anthropic-version': '2023-06-01' };
+        if (isOAuth) {
+          headers['authorization'] = `Bearer ${account.credential}`;
+          headers['anthropic-beta'] = 'oauth-2025-04-20';
+        } else {
+          headers['x-api-key'] = account.credential;
+        }
+        const res = await fetch(`${upstream}/v1/messages`, {
+          method: 'POST',
+          headers,
+          body: JSON.stringify({
+            model: 'claude-haiku-4-5-20251001',
+            max_tokens: 1,
+            messages: [{ role: 'user', content: 'hi' }],
+          }),
+        });
+        const rl = {};
+        for (const [k, v] of res.headers.entries()) {
+          if (k.startsWith('anthropic-ratelimit-')) rl[k] = v;
+        }
+        this.updateQuota(account.index, rl);
+        await res.body?.cancel?.();
+        const w = account.quota.unified7d != null ? `${(account.quota.unified7d * 100).toFixed(0)}%` : '?';
+        console.log(`[TeamClaude] Warmed "${account.name}" (HTTP ${res.status}, weekly ${w})`);
+      } catch (err) {
+        console.error(`[TeamClaude] Warm failed for "${account.name}": ${err.message}`);
+      }
+    }));
+  }
+
+  /**
    * Return a status summary of all accounts (safe to expose, no credentials).
    */
   getStatus() {
     return {
       currentAccount: this.accounts[this.currentIndex]?.name,
       switchThreshold: this.switchThreshold,
+      weeklyReserve: this.weeklyReserve,
       accounts: this.accounts.map(a => ({
         name: a.name,
         type: a.type,

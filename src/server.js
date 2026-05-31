@@ -194,11 +194,12 @@ async function forwardRequest(req, res, body, accountManager, upstream, retryCou
     headers[key] = value;
   }
 
-  // D1DX patch: defend against the claude-code OAuth-beta clobber regression.
+  // --- D1DX patch: defend against claude-code OAuth-beta clobber regression.
   // Claude Code 2.1.121+ intermittently drops `oauth-2025-04-20` from
-  // `anthropic-beta` when model-level betas are merged in, making upstream
-  // return 401 "OAuth authentication is currently not supported". Always
-  // ensure the gate is present on OAuth requests. Idempotent. (Upstream PR #3.)
+  // `anthropic-beta` when model-level betas are merged in (Object.assign
+  // source-order bug). Server returns 401 with misleading
+  // "OAuth authentication is currently not supported". Always ensure the
+  // gate is present on OAuth-account requests.
   if (isOAuth) {
     const REQUIRED_OAUTH_BETA = 'oauth-2025-04-20';
     const betaKey = Object.keys(headers).find(k => k.toLowerCase() === 'anthropic-beta');
@@ -208,6 +209,7 @@ async function forwardRequest(req, res, body, accountManager, upstream, retryCou
       headers[betaKey || 'anthropic-beta'] = existing.join(',');
     }
   }
+  // --- end D1DX patch ---
 
   if (isOAuth) {
     headers['authorization'] = `Bearer ${account.credential}`;
@@ -258,7 +260,7 @@ async function forwardRequest(req, res, body, accountManager, upstream, retryCou
     }
     accountManager.updateQuota(account.index, rateLimitHeaders);
 
-    // D1DX patch: 429 → immediate failover (upstream PR #13).
+    // --- D1DX patch: 429 → immediate failover (upstream PR #13).
     // A 429 means this account is rate-limited or out of quota. Mark it
     // unavailable for the retry-after window and immediately fail over to the
     // next available account, rather than holding the client connection open
@@ -299,15 +301,20 @@ async function forwardRequest(req, res, body, accountManager, upstream, retryCou
       }
       return;
     }
+    // --- end D1DX 429 patch ---
 
-    // D1DX patch: 529 Overloaded → hold-and-backoff.
-    // 529 is a transient, global Anthropic overload (not account-specific), so
-    // switching accounts does not help. Hold the client connection and retry
-    // the SAME account with exponential backoff (capped 60s/wait) for up to ~1h
-    // cumulative, then synthesize a 529 so the client can give up cleanly.
-    // retryCount is left untouched — 529 retries must not consume the
-    // account-failover budget used by the 429 path above.
-    if (upstreamRes.status === 529) {
+    // --- D1DX patch: server-side 5xx → hold-and-backoff.
+    // 529/500/502/503 are transient, (mostly) global Anthropic server-side
+    // errors, NOT account-specific — switching accounts does not help. Hold the
+    // client connection and retry the SAME account with exponential backoff
+    // (capped 60s/wait) for up to ~1h cumulative, then return the upstream
+    // status so the client can give up cleanly. retryCount is left untouched —
+    // these retries must not consume the account-failover budget used by the
+    // 429 path above. 500/502/503 folded in alongside 529 per operator
+    // decision (uniform server-error handling; volume is low — §3). Client
+    // disconnect / headersSent ends the loop early.
+    if ([500, 502, 503, 529].includes(upstreamRes.status)) {
+      const serverStatus = upstreamRes.status;
       await upstreamRes.body?.cancel();
       if (ctx.overloadStart == null) ctx.overloadStart = Date.now();
       ctx.overloadAttempts = (ctx.overloadAttempts || 0) + 1;
@@ -318,34 +325,35 @@ async function forwardRequest(req, res, body, accountManager, upstream, retryCou
 
       if (elapsed + backoff < OVERLOAD_BUDGET_MS && !res.headersSent && !res.destroyed) {
         if (logDir) {
-          logSections.push(`=== RESPONSE 529 — overloaded, retry ${ctx.overloadAttempts} after ${backoff}ms (elapsed ${Math.round(elapsed / 1000)}s) ===\n${formatHeaders(upstreamRes.headers)}`);
+          logSections.push(`=== RESPONSE ${serverStatus} — server error, retry ${ctx.overloadAttempts} after ${backoff}ms (elapsed ${Math.round(elapsed / 1000)}s) ===\n${formatHeaders(upstreamRes.headers)}`);
         }
-        console.log(`[TeamClaude] 529 overloaded on "${account.name}" — retry ${ctx.overloadAttempts} in ${Math.round(backoff / 1000)}s (elapsed ${Math.round(elapsed / 1000)}s/3600s)`);
+        console.log(`[TeamClaude] ${serverStatus} server error on "${account.name}" — retry ${ctx.overloadAttempts} in ${Math.round(backoff / 1000)}s (elapsed ${Math.round(elapsed / 1000)}s/3600s)`);
         await new Promise(resolve => setTimeout(resolve, backoff));
         // Client may have disconnected during the wait
         if (res.destroyed) return;
         return forwardRequest(req, res, body, accountManager, upstream, retryCount, hooks, reqId, ctx, logDir);
       }
 
-      // Budget exhausted (or client gone) — return the 529 to the client.
-      ctx.status = 529;
-      console.log(`[TeamClaude] 529 overloaded on "${account.name}" — giving up after ${Math.round(elapsed / 1000)}s, returning 529`);
+      // Budget exhausted (or client gone) — return the upstream status to the client.
+      ctx.status = serverStatus;
+      console.log(`[TeamClaude] ${serverStatus} server error on "${account.name}" — giving up after ${Math.round(elapsed / 1000)}s, returning ${serverStatus}`);
       if (logDir) {
-        logSections.push(`=== RESPONSE 529 — overload budget exhausted after ${Math.round(elapsed / 1000)}s ===\n${formatHeaders(upstreamRes.headers)}`);
+        logSections.push(`=== RESPONSE ${serverStatus} — server-error budget exhausted after ${Math.round(elapsed / 1000)}s ===\n${formatHeaders(upstreamRes.headers)}`);
         writeRequestLog(logDir, reqId, logSections);
       }
       if (!res.headersSent) {
-        res.writeHead(529, { 'Content-Type': 'application/json' });
+        res.writeHead(serverStatus, { 'Content-Type': 'application/json' });
         res.end(JSON.stringify({
           type: 'error',
           error: {
             type: 'overloaded_error',
-            message: 'Upstream overloaded (529) — retried with backoff for ~1h before giving up.',
+            message: `Upstream server error (${serverStatus}) — retried with backoff for ~1h before giving up.`,
           },
         }));
       }
       return;
     }
+    // --- end D1DX 5xx backoff patch ---
 
     // Log response headers
     if (logDir) {
