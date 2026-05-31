@@ -1,4 +1,5 @@
 import { importCredentials, fetchProfile } from './oauth.js';
+import { resolveLogDir, appendOpLog } from './oplog.js';
 
 // ── ANSI helpers ─────────────────────────────────────────────
 
@@ -134,6 +135,8 @@ export class TUI {
     this.timer = null;
     this._origLog = null;
     this._origErr = null;
+    // D-1680: durable sink for the operational stream (see oplog.js).
+    this.logDir = resolveLogDir(config);
   }
 
   // ── lifecycle ──────────────────────────────────────
@@ -195,6 +198,7 @@ export class TUI {
 
   _addLog(msg) {
     msg = msg.replace(/^\[TeamClaude\]\s*/, '');
+    appendOpLog(this.logDir, msg); // D-1680: persist to daily file — TUI-independent
     this.log.unshift({ t: timestamp(), msg });
     if (this.log.length > 200) this.log.length = 200;
     if (this.running) this.render();

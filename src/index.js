@@ -7,6 +7,7 @@ import { AccountManager } from './account-manager.js';
 import { createProxyServer } from './server.js';
 import { importCredentials, loginOAuth, fetchProfile, refreshAccessToken, isTokenExpiringSoon } from './oauth.js';
 import { TUI } from './tui.js';
+import { resolveLogDir, appendOpLog } from './oplog.js';
 
 const args = process.argv.slice(2);
 const command = args[0];
@@ -161,6 +162,20 @@ async function serverCommand() {
       onRequestRouted: (id, info) => tui.onRequestRouted(id, info),
       onRequestEnd: (id, info) => tui.onRequestEnd(id, info),
     };
+  }
+
+  // D-1680: tee the operational console stream to a daily file. Installed BEFORE
+  // warmAll so the startup-warm lines are captured in both modes. In headless
+  // mode this covers the whole process lifetime; in TUI mode tui.start() then
+  // redirects console to the in-memory pane and the _addLog patch (tui.js) takes
+  // over filing from there — so there is no double-write and no gap. The original
+  // stdout/stderr are preserved (headless visibility + the pre-TUI startup flash).
+  {
+    const opLogDir = resolveLogDir(config);
+    const origLog = console.log;
+    const origErr = console.error;
+    console.log = (...a) => { appendOpLog(opLogDir, a.join(' ')); origLog(...a); };
+    console.error = (...a) => { appendOpLog(opLogDir, a.join(' ')); origErr(...a); };
   }
 
   const server = createProxyServer(accountManager, config, hooks);
