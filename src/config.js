@@ -18,6 +18,8 @@ export function createDefaultConfig() {
     upstream: 'https://api.anthropic.com',
     switchThreshold: 0.98, // hard ceiling (5h axis + real weekly limit)
     weeklyReserve: 0.20,   // D1DX: soft weekly reserve floor, time-decayed
+    rerankEvery: 10,       // D1DX: re-rank cadence — calls between weekly-urgency re-checks
+    rerankMargin: 1.3,     // D1DX: re-rank switches only if another preferred acct's urgency > current x this
     warmOnStartup: true,   // D1DX: ping each account at boot to anchor windows
     accounts: [],
   };

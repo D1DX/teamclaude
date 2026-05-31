@@ -90,7 +90,10 @@ async function serverCommand() {
   const threshold = config.switchThreshold || 0.98;
   // D1DX: weeklyReserve defaults to 0.20 for configs predating the key.
   const weeklyReserve = config.weeklyReserve ?? 0.20;
-  const accountManager = new AccountManager(accounts, threshold, weeklyReserve);
+  // D1DX: periodic re-rank tunables (Responsive preset; defaults cover configs predating the keys).
+  const rerankEvery = config.rerankEvery ?? 10;
+  const rerankMargin = config.rerankMargin ?? 1.3;
+  const accountManager = new AccountManager(accounts, threshold, weeklyReserve, rerankEvery, rerankMargin);
 
   // Persist refreshed tokens back to config (re-read from disk to avoid clobbering
   // accounts added externally, e.g. by `teamclaude import` while server is running)

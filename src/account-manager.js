@@ -23,7 +23,7 @@ export class AccountManager {
   // D1DX patch: weeklyReserve drives the time-decayed weekly cap.
   // switchThreshold (0.98) stays the HARD ceiling on the 5h axis + the real
   // weekly limit; weeklyReserve (0.20) is the SOFT preference floor on 7d.
-  constructor(accounts, switchThreshold = 0.98, weeklyReserve = 0.20) {
+  constructor(accounts, switchThreshold = 0.98, weeklyReserve = 0.20, rerankEvery = 10, rerankMargin = 1.3) {
     this.accounts = accounts.map((acct, index) => ({
       index,
       name: acct.name,
@@ -45,6 +45,14 @@ export class AccountManager {
     this.currentIndex = 0;
     this.switchThreshold = switchThreshold;
     this.weeklyReserve = weeklyReserve;
+    // D1DX patch (§5.1): periodic re-rank. Every `rerankEvery` selections, move to a
+    // preferred account whose weekly-urgency exceeds current × `rerankMargin`. Keeps the
+    // sticky cache-locality win while preventing the selector from getting STUCK on a
+    // healthy-but-low-urgency account (use-it-or-lose-it). Tunable via config.
+    this.rerankEvery = rerankEvery;
+    this.rerankMargin = rerankMargin;
+    this._sinceRerank = 0;        // selections on `current` since the last re-rank check
+    this._didBootSelect = false;  // Fix C: first selection picks the best account, not config index 0
     this.homeIndex = null; // account to prefer returning to after a 429 failover (cache locality)
   }
 
@@ -66,7 +74,31 @@ export class AccountManager {
   getActiveAccount() {
     this._sweepAll();
     const current = this.accounts[this.currentIndex];
-    if (this._isPreferred(current)) return current; // sticky — stay cache-warm
+
+    // D1DX patch (Fix C — boot-select): the first-ever selection picks the best
+    // account by weekly-urgency rather than defaulting to config index 0.
+    if (!this._didBootSelect) {
+      this._didBootSelect = true;
+      return this._selectNext();
+    }
+
+    // D1DX patch (§5.1 — periodic re-rank): otherwise sticky (stay cache-warm on
+    // `current`), but `_selectNext`'s urgency ranker only runs at a FORCED switch —
+    // so without this it gets STUCK on a healthy-but-low-urgency account while a
+    // more about-to-be-wasted account goes undrained. Every `rerankEvery` calls,
+    // move to a preferred account whose weekly-urgency > current × `rerankMargin`.
+    // The margin keeps it from cache-churning on small urgency differences.
+    if (this._isPreferred(current)) {
+      if (++this._sinceRerank >= this.rerankEvery) {
+        this._sinceRerank = 0;
+        const best = this._bestPreferred();
+        if (best && best.index !== current.index &&
+            this._weeklyUrgency(best) > this._weeklyUrgency(current) * this.rerankMargin) {
+          return this._switchTo(best, `account "${best.name}" (periodic re-rank — higher weekly urgency)`);
+        }
+      }
+      return current; // sticky — stay cache-warm
+    }
     return this._selectNext();
   }
 
@@ -182,25 +214,36 @@ export class AccountManager {
       console.log(`[TeamClaude] Switched to ${reason}`);
     }
     this.currentIndex = account.index;
+    this._sinceRerank = 0; // D1DX: reset the re-rank counter on every (re)selection
     return account;
+  }
+
+  // D1DX patch (§5.1): the highest weekly-urgency preferred account, or null if
+  // none are preferred. Shared by _selectNext (forced switch) and the periodic
+  // re-rank in getActiveAccount so the ranking logic lives in exactly one place.
+  _bestPreferred() {
+    let best = null;
+    for (const a of this.accounts) {
+      if (!this._isPreferred(a)) continue;
+      if (best === null || this._weeklyUrgency(a) > this._weeklyUrgency(best)) best = a;
+    }
+    return best;
   }
 
   _selectNext() {
     // Tier 1 — preferred accounts (weekly utilization below the reserve cap).
-    const preferred = this.accounts.filter(a => this._isPreferred(a));
-    if (preferred.length > 0) {
+    const best = this._bestPreferred();
+    if (best) {
       // Return to a remembered home account if it's preferred again (cache-warm).
       if (this.homeIndex != null) {
-        const home = preferred.find(a => a.index === this.homeIndex);
-        if (home) {
+        const home = this.accounts[this.homeIndex];
+        if (home && this._isPreferred(home)) {
           this.homeIndex = null;
           return this._switchTo(home, `home account "${home.name}" (cleared, cache-warm)`);
         }
       }
       // Otherwise drain the most about-to-be-wasted weekly budget first.
-      const target = preferred.reduce((best, a) =>
-        this._weeklyUrgency(a) > this._weeklyUrgency(best) ? a : best);
-      return this._switchTo(target, `account "${target.name}" (max weekly urgency)`);
+      return this._switchTo(best, `account "${best.name}" (max weekly urgency)`);
     }
 
     // Tier 2 — reserve band: no preferred account, but keep work alive on the
