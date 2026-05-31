@@ -179,7 +179,10 @@ async function serverCommand() {
     clearTimeout(deadline);
   }
 
-  server.listen(port, () => {
+  // D-1644: bind loopback-only (::1) instead of the default 0.0.0.0/:: wildcard,
+  // so the proxy is reachable only from this host (not LAN/tailnet). localhost
+  // resolves to ::1 first on macOS, which is the path Claude Code already uses.
+  server.listen(port, '::1', () => {
     if (tui) {
       tui.start();
       console.log(`Listening on port ${port} with ${accounts.length} account(s)`);
