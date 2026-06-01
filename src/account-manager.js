@@ -23,7 +23,7 @@ export class AccountManager {
   // D1DX patch: weeklyReserve drives the time-decayed weekly cap.
   // switchThreshold (0.98) stays the HARD ceiling on the 5h axis + the real
   // weekly limit; weeklyReserve (0.20) is the SOFT preference floor on 7d.
-  constructor(accounts, switchThreshold = 0.98, weeklyReserve = 0.20, rerankEvery = 10, rerankMargin = 1.3) {
+  constructor(accounts, switchThreshold = 0.98, weeklyReserve = 0.20, rerankEvery = 10, rerankMargin = 1.3, opts = {}) {
     this.accounts = accounts.map((acct, index) => ({
       index,
       name: acct.name,
@@ -54,6 +54,21 @@ export class AccountManager {
     this._sinceRerank = 0;        // selections on `current` since the last re-rank check
     this._didBootSelect = false;  // Fix C: first selection picks the best account, not config index 0
     this.homeIndex = null; // account to prefer returning to after a 429 failover (cache locality)
+
+    // ── D1DX patch (D-1705): all-throttled backoff + de-synchronized recovery ──
+    // Tunables (defaults mirror config.js / index.js; config is never hand-edited).
+    this.allThrottledFloorSec = opts.allThrottledFloorSec ?? 60;   // min wait told to the client
+    this.allThrottledCapSec   = opts.allThrottledCapSec   ?? 600;  // max wait (client re-polls, self-correcting)
+    this.retryJitterPct       = opts.retryJitterPct       ?? 0.15; // UPWARD-only jitter on the client retry-after
+    this.recoveryStaggerSec   = opts.recoveryStaggerSec   ?? 5;    // per-account stagger added to rateLimitedUntil
+    this.recoveryGapSec       = opts.recoveryGapSec       ?? 20;   // half-open: min gap between account releases
+    this.escalationFactor     = opts.escalationFactor     ?? 1.5;  // floor *= factor^(streak-1) on repeat episodes
+    // Episode state. An "episode" = a run of all-throttled returns not yet ended
+    // by a success. Used for the escalating floor + the half-open release gate.
+    this._allThrottledStreak = 0;   // consecutive all-throttled episodes since the last success
+    this._lastAllThrottledAt = 0;   // ms — debounces concurrent 429s into one episode
+    this._lastBackoffMs = 0;        // ms — last computed backoff, the episode-debounce window
+    this._recoveryReleaseAt = 0;    // ms — half-open gate: next throttled account may release at/after this
   }
 
   // D1DX patch: actively sweep ALL accounts every request + on every status read,
@@ -163,8 +178,16 @@ export class AccountManager {
     if (!account) return true;
     if (account.status === 'throttled' && account.rateLimitedUntil) {
       if (Date.now() < account.rateLimitedUntil) return true;
+      // D1DX patch (D-1705 S3): half-open recovery. During an all-throttled
+      // episode, release at most ONE account per `recoveryGapSec` so the pool
+      // re-enters one at a time (the first proves healthy before the next
+      // rejoins) instead of the whole cluster flipping active in one sweep.
+      // Outside an episode (`_allThrottledStreak === 0`) release is immediate,
+      // exactly as before — normal 429-failover is unaffected.
+      if (this._allThrottledStreak > 0 && Date.now() < this._recoveryReleaseAt) return true;
       account.status = 'active';
       account.rateLimitedUntil = null;
+      if (this._allThrottledStreak > 0) this._recoveryReleaseAt = Date.now() + this.recoveryGapSec * 1000;
       console.log(`[TeamClaude] Account "${account.name}" rate limit expired, marking active`);
     }
     if (account.status === 'exhausted' || account.status === 'error') return true;
@@ -273,6 +296,9 @@ export class AccountManager {
       soonestAccount.status = 'active';
       soonestAccount.rateLimitedUntil = null;
       this.currentIndex = soonestAccount.index;
+      // D1DX patch (D-1705 S3): arm the half-open gate so a subsequent sweep
+      // doesn't flip the rest of the pool active at once — one re-entry at a time.
+      if (this._allThrottledStreak > 0) this._recoveryReleaseAt = Date.now() + this.recoveryGapSec * 1000;
       console.log(`[TeamClaude] Account "${soonestAccount.name}" reset, switching to it`);
       return soonestAccount;
     }
@@ -342,17 +368,109 @@ export class AccountManager {
   }
 
   /**
-   * Mark an account as rate-limited for a given duration.
+   * Mark an account as rate-limited.
+   *
+   * `retryAfterSeconds` is the upstream `retry-after` header value, or null/NaN
+   * when the 429 carried no header — in which case D1DX patch (D-1705 S1)
+   * derives the window from this account's own known unified resets instead of
+   * the old blind 60s. D1DX patch (D-1705 S2) then adds a small per-account
+   * stagger + jitter so accounts throttled in the same burst don't all expire
+   * at the same instant (de-synchronized recovery).
    */
   markRateLimited(accountIndex, retryAfterSeconds) {
     const account = this.accounts[accountIndex];
     if (!account) return;
+    const now = Date.now();
+
+    let windowMs;
+    if (retryAfterSeconds != null && !isNaN(retryAfterSeconds)) {
+      windowMs = retryAfterSeconds * 1000;
+    } else {
+      // No header — derive from this account's soonest genuine future reset.
+      const resets = [
+        account.quota.unified5hReset,
+        account.quota.unified7dReset,
+        account.quota.resetsAt ? new Date(account.quota.resetsAt).getTime() : null,
+      ].filter(t => t && t > now);
+      windowMs = resets.length ? Math.min(...resets) - now : this.allThrottledFloorSec * 1000;
+    }
+
+    // S2: per-account stagger (deterministic base by index) + jitter (tail), so
+    // a burst of 429s doesn't cluster every account's window on the same instant.
+    const staggerMs = account.index * this.recoveryStaggerSec * 1000
+      + Math.random() * this.recoveryStaggerSec * 1000;
+
     account.status = 'throttled';
-    account.rateLimitedUntil = Date.now() + (retryAfterSeconds * 1000);
+    account.rateLimitedUntil = now + windowMs + staggerMs;
     // D1DX patch: remember the displaced current account so selection
     // prefers returning to it (cache-warm) at the next switch once it clears.
     if (accountIndex === this.currentIndex) this.homeIndex = accountIndex;
-    console.log(`[TeamClaude] Account "${account.name}" rate limited for ${retryAfterSeconds}s`);
+    console.log(`[TeamClaude] Account "${account.name}" rate limited until +${Math.round((windowMs + staggerMs) / 1000)}s`);
+  }
+
+  /**
+   * D1DX patch (D-1705 S1+S3): the retry-after (seconds) to hand the client when
+   * EVERY account is throttled. Real-reset-aware (soonest genuine reset across
+   * the pool), clamped to [escalated floor, cap], with UPWARD-ONLY jitter so we
+   * never tell the client to retry *before* the real reset (which would just
+   * earn another 429). Also advances the episode streak (escalating floor on
+   * repeated back-to-back all-throttled states), debounced so concurrent 429s in
+   * one episode count once. Replaces the old free `computeRetryAfter` helper,
+   * which ignored the unified 5h/7d resets and used a blind 60s default.
+   */
+  allThrottledBackoff() {
+    const now = Date.now();
+
+    // Episode bookkeeping:
+    //  - a long quiet gap (> cap) since the last all-throttled → fresh episode (streak = 1);
+    //  - a return within the last backoff window → SAME episode (no double-count);
+    //  - a return after the backoff window but within cap → next back-to-back episode (escalate).
+    if (now - this._lastAllThrottledAt > this.allThrottledCapSec * 1000) {
+      this._allThrottledStreak = 1;
+    } else if (this._lastAllThrottledAt === 0 || now - this._lastAllThrottledAt > this._lastBackoffMs) {
+      this._allThrottledStreak += 1;
+    }
+    this._lastAllThrottledAt = now;
+
+    // Escalated floor, capped.
+    const floorSec = Math.min(
+      this.allThrottledCapSec,
+      this.allThrottledFloorSec * Math.pow(this.escalationFactor, Math.max(0, this._allThrottledStreak - 1)),
+    );
+
+    // Soonest genuine reset across the whole pool (ms timestamps, internal form).
+    let soonest = Infinity;
+    for (const a of this.accounts) {
+      const candidates = [
+        a.rateLimitedUntil,
+        a.quota.unified5hReset,
+        a.quota.unified7dReset,
+        a.quota.resetsAt ? new Date(a.quota.resetsAt).getTime() : null,
+      ];
+      for (const t of candidates) {
+        if (t && t > now && t < soonest) soonest = t;
+      }
+    }
+
+    let secs = soonest === Infinity ? floorSec : (soonest - now) / 1000;
+    secs = Math.max(floorSec, Math.min(this.allThrottledCapSec, secs));
+    secs += Math.random() * secs * this.retryJitterPct; // upward-only de-sync jitter
+    this._lastBackoffMs = Math.ceil(secs) * 1000;
+    return Math.max(1, Math.ceil(secs));
+  }
+
+  /**
+   * D1DX patch (D-1705 S3): a successful (<400) upstream response ends the
+   * all-throttled episode — open the half-open recovery gate (releases become
+   * immediate again) and reset the escalation streak.
+   */
+  noteSuccess() {
+    if (this._allThrottledStreak !== 0 || this._recoveryReleaseAt !== 0) {
+      this._allThrottledStreak = 0;
+      this._lastAllThrottledAt = 0;
+      this._lastBackoffMs = 0;
+      this._recoveryReleaseAt = 0;
+    }
   }
 
   /**

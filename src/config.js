@@ -21,6 +21,13 @@ export function createDefaultConfig() {
     rerankEvery: 10,       // D1DX: re-rank cadence — calls between weekly-urgency re-checks
     rerankMargin: 1.3,     // D1DX: re-rank switches only if another preferred acct's urgency > current x this
     warmOnStartup: true,   // D1DX: ping each account at boot to anchor windows
+    // D1DX (D-1705): all-throttled backoff + de-synchronized recovery
+    allThrottledFloorSec: 60,   // min retry-after told to the client when all accounts are throttled
+    allThrottledCapSec: 600,    // max retry-after (client re-polls, self-correcting as accounts free)
+    retryJitterPct: 0.15,       // upward-only jitter on the client retry-after (de-sync concurrent retries)
+    recoveryStaggerSec: 5,      // per-account stagger added to rateLimitedUntil (de-sync window expiry)
+    recoveryGapSec: 20,         // half-open recovery: min gap between account re-entries
+    escalationFactor: 1.5,      // floor *= factor^(streak-1) on repeated back-to-back all-throttled episodes
     accounts: [],
   };
 }

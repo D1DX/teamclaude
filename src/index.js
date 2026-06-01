@@ -93,7 +93,16 @@ async function serverCommand() {
   // D1DX: periodic re-rank tunables (Responsive preset; defaults cover configs predating the keys).
   const rerankEvery = config.rerankEvery ?? 10;
   const rerankMargin = config.rerankMargin ?? 1.3;
-  const accountManager = new AccountManager(accounts, threshold, weeklyReserve, rerankEvery, rerankMargin);
+  // D1DX (D-1705): all-throttled backoff + de-sync recovery tunables (defaults cover configs predating the keys).
+  const allThrottledOpts = {
+    allThrottledFloorSec: config.allThrottledFloorSec ?? 60,
+    allThrottledCapSec: config.allThrottledCapSec ?? 600,
+    retryJitterPct: config.retryJitterPct ?? 0.15,
+    recoveryStaggerSec: config.recoveryStaggerSec ?? 5,
+    recoveryGapSec: config.recoveryGapSec ?? 20,
+    escalationFactor: config.escalationFactor ?? 1.5,
+  };
+  const accountManager = new AccountManager(accounts, threshold, weeklyReserve, rerankEvery, rerankMargin, allThrottledOpts);
 
   // Persist refreshed tokens back to config (re-read from disk to avoid clobbering
   // accounts added externally, e.g. by `teamclaude import` while server is running)

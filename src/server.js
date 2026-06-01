@@ -155,8 +155,8 @@ async function forwardRequest(req, res, body, accountManager, upstream, retryCou
   if (!account) {
     ctx.status = 429;
     ctx.account = '(none available)';
-    const status = accountManager.getStatus();
-    const retryAfter = computeRetryAfter(status.accounts);
+    // D1DX patch (D-1705): real-reset-aware, escalating, jittered backoff.
+    const retryAfter = accountManager.allThrottledBackoff();
     res.writeHead(429, {
       'Content-Type': 'application/json',
       'retry-after': String(retryAfter),
@@ -197,7 +197,7 @@ async function forwardRequest(req, res, body, accountManager, upstream, retryCou
   // --- D1DX patch: defend against claude-code OAuth-beta clobber regression.
   // Claude Code 2.1.121+ intermittently drops `oauth-2025-04-20` from
   // `anthropic-beta` when model-level betas are merged in (Object.assign
-  // source-order bug). Server returns 401 with misleading
+  // source-order bug; OpenClaw #41444). Server returns 401 with misleading
   // "OAuth authentication is currently not supported". Always ensure the
   // gate is present on OAuth-account requests.
   if (isOAuth) {
@@ -260,7 +260,7 @@ async function forwardRequest(req, res, body, accountManager, upstream, retryCou
     }
     accountManager.updateQuota(account.index, rateLimitHeaders);
 
-    // --- D1DX patch: 429 → immediate failover (upstream PR #13).
+    // --- D1DX patch (D-1642): 429 → immediate failover (upstream PR #13).
     // A 429 means this account is rate-limited or out of quota. Mark it
     // unavailable for the retry-after window and immediately fail over to the
     // next available account, rather than holding the client connection open
@@ -268,15 +268,19 @@ async function forwardRequest(req, res, body, accountManager, upstream, retryCou
     // Once every account is throttled, getActiveAccount() returns null on the
     // next pass and the client gets a 429 with a proper retry-after to back off.
     if (upstreamRes.status === 429) {
-      const retryAfter = parseInt(upstreamRes.headers.get('retry-after'), 10) || 60;
+      // D1DX patch (D-1705 S1): pass the header through as-is (null when absent)
+      // so markRateLimited derives the real window from the unified resets
+      // instead of defaulting to a blind 60s.
+      const hdr = parseInt(upstreamRes.headers.get('retry-after'), 10);
+      const headerRetryAfter = isNaN(hdr) ? null : hdr;
       // Discard the 429 response body
       await upstreamRes.body?.cancel();
-      accountManager.markRateLimited(account.index, retryAfter);
+      accountManager.markRateLimited(account.index, headerRetryAfter);
 
       if (logDir) {
-        logSections.push(`=== RESPONSE 429 — "${account.name}" rate-limited ${retryAfter}s, failing over ===\n${formatHeaders(upstreamRes.headers)}`);
+        logSections.push(`=== RESPONSE 429 — "${account.name}" rate-limited (retry-after header: ${headerRetryAfter ?? 'none'}), failing over ===\n${formatHeaders(upstreamRes.headers)}`);
       }
-      console.log(`[TeamClaude] 429 on "${account.name}" — rate-limited ${retryAfter}s, failing over`);
+      console.log(`[TeamClaude] 429 on "${account.name}" — rate-limited (header: ${headerRetryAfter ?? 'none'}), failing over`);
 
       if (retryCount < maxRetries && !res.headersSent) {
         return forwardRequest(req, res, body, accountManager, upstream, retryCount + 1, hooks, reqId, ctx, logDir);
@@ -286,7 +290,7 @@ async function forwardRequest(req, res, body, accountManager, upstream, retryCou
       ctx.status = 429;
       if (logDir) writeRequestLog(logDir, reqId, logSections);
       if (!res.headersSent) {
-        const clientRetryAfter = computeRetryAfter(accountManager.getStatus().accounts);
+        const clientRetryAfter = accountManager.allThrottledBackoff();
         res.writeHead(429, {
           'Content-Type': 'application/json',
           'retry-after': String(clientRetryAfter),
@@ -303,14 +307,14 @@ async function forwardRequest(req, res, body, accountManager, upstream, retryCou
     }
     // --- end D1DX 429 patch ---
 
-    // --- D1DX patch: server-side 5xx → hold-and-backoff.
+    // --- D1DX patch (D-1642 + D-1647): server-side 5xx → hold-and-backoff.
     // 529/500/502/503 are transient, (mostly) global Anthropic server-side
     // errors, NOT account-specific — switching accounts does not help. Hold the
     // client connection and retry the SAME account with exponential backoff
     // (capped 60s/wait) for up to ~1h cumulative, then return the upstream
     // status so the client can give up cleanly. retryCount is left untouched —
     // these retries must not consume the account-failover budget used by the
-    // 429 path above. 500/502/503 folded in alongside 529 per operator
+    // 429 path above. D-1647: 500/502/503 folded in alongside 529 per operator
     // decision (uniform server-error handling; volume is low — §3). Client
     // disconnect / headersSent ends the loop early.
     if ([500, 502, 503, 529].includes(upstreamRes.status)) {
@@ -354,6 +358,10 @@ async function forwardRequest(req, res, body, accountManager, upstream, retryCou
       return;
     }
     // --- end D1DX 5xx backoff patch ---
+
+    // D1DX patch (D-1705 S3): a genuine success ends any all-throttled episode —
+    // reopen the half-open recovery gate + reset the escalation streak.
+    if (upstreamRes.status < 400) accountManager.noteSuccess();
 
     // Log response headers
     if (logDir) {
@@ -521,14 +529,6 @@ function extractUsageFromBody(buffer, accountIndex, accountManager) {
   }
 }
 
-function computeRetryAfter(accounts) {
-  let soonest = Infinity;
-  for (const acct of accounts) {
-    const reset = acct.rateLimitedUntil || acct.quota.resetsAt;
-    if (reset) {
-      const ms = new Date(reset).getTime() - Date.now();
-      if (ms < soonest) soonest = ms;
-    }
-  }
-  return soonest === Infinity ? 60 : Math.max(1, Math.ceil(soonest / 1000));
-}
+// D1DX patch (D-1705): the free `computeRetryAfter(accounts)` helper was removed.
+// Its job (the client retry-after when all accounts are throttled) now lives in
+// AccountManager.allThrottledBackoff() — real-reset-aware, escalating, jittered.
