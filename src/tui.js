@@ -280,6 +280,10 @@ export class TUI {
     }
     else if (k === 'a') { this.mode = 'add'; }
     else if (k === 'R') { this._doSync(); }
+    else if (k === 'b') { // D-1739: mute/unmute the alert bell (in-view flag stays)
+      this.bell = this.bell === false;
+      this._addLog('Alert bell ' + (this.bell === false ? 'muted' : 'on'));
+    }
   }
 
   _keySelect(k) {
@@ -443,52 +447,114 @@ export class TUI {
       lines.push(' ' + gray(`proxy ${sys.proxyRssMB}MB · up ${fmtDur(sys.proxyUptimeSec)}    host RAM ${gb(sys.usedMemMB)}/${gb(sys.totalMemMB)}GB (${sys.usedMemPct}%) · load ${sys.loadAvg[0]} · ${sys.cpuCount} cpus`));
     }
 
-    // ── Accounts
+    // ── Fleet control plane (D-1739): sessions grouped by account; each agent
+    // shows emoji + intent + alive/idle + issue status + $ burn. The presence
+    // registry is the spine (all live agents, incl. ones the proxy never routed);
+    // the proxy binding enriches with account + $ where it exists. All reads
+    // are local + credential-free + best-effort.
+    const binds = this.am.sessionBindingSummary ? this.am.sessionBindingSummary() : [];
+    const agg = this.am.sessionAggregate ? this.am.sessionAggregate() : null;
+    const fleet = this.am.fleetRows ? this.am.fleetRows() : [];
+
+    // bucket proxy-bound sessions by account; index the whole fleet for merge
+    const byAcct = new Map();
+    for (const b of binds) {
+      if (!byAcct.has(b.account)) byAcct.set(b.account, []);
+      byAcct.get(b.account).push(b);
+    }
+    const boundSids = new Set(binds.map(b => b.fullSid));
+    const unbound = fleet.filter(f => !boundSids.has(f.sid));
+
+    // collision = 2+ live agents pinned to the same issue (sibling-clobber risk)
+    const issueCount = new Map();
+    for (const f of fleet) { if (f.issue) issueCount.set(f.issue, (issueCount.get(f.issue) || 0) + 1); }
+    const collisionIssues = new Set([...issueCount].filter(([, n]) => n > 1).map(([k]) => k));
+    const needsYouRow = p => !!(p && (p.status === 'blocked' || p.status === 'in_review' || p.assigneeUserId));
+    const fleetNeedsYou = fleet.filter(f => needsYouRow(f.pin)).length;
+
+    // edge-fired alert bell (terminal bell + in-view flag only; never per-frame)
+    const alertKey = `${[...collisionIssues].sort().join(',')}|${fleetNeedsYou}`;
+    const hasAlert = collisionIssues.size > 0 || fleetNeedsYou > 0;
+    if (this.bell !== false && hasAlert && alertKey !== this._lastAlertKey) process.stdout.write('\x07');
+    this._lastAlertKey = hasAlert ? alertKey : '';
+
+    // status chip: abbreviated + colored issue status from the local pin overlay
+    const statusChip = st => {
+      if (!st) return rpad('', 5);
+      const m = {
+        in_progress: ['prog', green], blocked: ['blk', red], in_review: ['rev', yellow],
+        todo: ['todo', cyan], backlog: ['bklg', gray], done: ['done', dim], cancelled: ['canc', gray],
+      };
+      const [lbl, col] = m[st] || [st.slice(0, 4), gray];
+      return rpad(col(lbl), 5);
+    };
+    // one session row: needs-you mark | emoji+issue | collision | status | state | tok | $ | solo | intent
+    const sessRow = (b, bound) => {
+      const mark = needsYouRow({ status: b.status, assigneeUserId: b.assigneeUserId }) ? red('>') : ' ';
+      const who = (b.emoji || '.') + ' ' + (b.issue || b.sid8 || '--');
+      const coll = collisionIssues.has(b.issue) ? yellow('!') : ' ';
+      const state = bound ? (b.warm ? green('alive') : gray('idle ' + fmtDur(b.idleSec))) : gray('-');
+      const tok = bound ? fmtN(b.tokens) : '';
+      const cost = bound ? green('$' + this._cost(b.inputTokens, b.outputTokens).toFixed(1)) : '';
+      const solo = (b.intent && b.intent.startsWith('solo:')) ? cyan('@') : ' ';
+      let line = '  ' + mark + ' ' + rpad(who, 11) + coll + ' ' + statusChip(b.status)
+        + rpad(state, 9) + rpad(tok, 6) + rpad(cost, 7) + solo;
+      if (b.intent) {
+        const room = W - vw(line) - 4;
+        if (room > 6) line += ' ' + dim('> ' + b.intent.replace(/^solo:\s*/, '').slice(0, room));
+      }
+      return line;
+    };
+
     if (this.am.accounts.length === 0) {
       lines.push('');
       lines.push(yellow('  No accounts configured. Press [a] to add one.'));
     } else {
       lines.push('');
       const showBoth = W >= 70;
+      const aggCost = agg ? this._cost(agg.inputTokens, agg.outputTokens) : 0;
       const bw = showBoth
-        ? Math.max(5, Math.min(20, Math.floor((W - 56) / 2)))
-        : Math.max(5, Math.min(20, W - 45));
+        ? Math.max(5, Math.min(14, Math.floor((W - 64) / 2)))
+        : Math.max(5, Math.min(14, W - 50));
+
+      // Fleet header: the one-glance answer — alive | warm | needs-you | collisions | tok | $
+      const warm = agg ? agg.warm : 0;
+      let hL = ` Fleet  ${cyan(fleet.length + ' alive')} · ${warm} warm`;
+      if (fleetNeedsYou > 0) hL += ` · ${red(fleetNeedsYou + ' >')}`;
+      if (collisionIssues.size > 0) hL += ` · ${yellow(collisionIssues.size + ' !')}`;
+      const hR = agg ? `${fmtN(agg.tokens)} tok · ${green('$' + aggCost.toFixed(2))} ▲ ` : ' ';
+      lines.push(hL + ' '.repeat(Math.max(1, W - vw(hL) - vw(hR))) + hR);
+      lines.push(' ' + dim('─'.repeat(W - 2)));
 
       for (let i = 0; i < this.am.accounts.length; i++) {
-        lines.push(this._renderAcct(i, bw, showBoth));
+        const acct = this.am.accounts[i];
+        const sess = byAcct.get(acct.name) || [];
+        let rin = 0, rout = 0;
+        for (const s of sess) { rin += s.inputTokens || 0; rout += s.outputTokens || 0; }
+        const roll = sess.length
+          ? `${sess.length} sess · ${green('$' + this._cost(rin, rout).toFixed(1))}`
+          : gray('0 sess');
+        lines.push(this._renderAcctHeader(i, bw, showBoth, roll));
+        if (sess.length === 0) { lines.push('     ' + gray('(no live sessions)')); continue; }
+        for (const b of sess) lines.push(sessRow(b, true)); // ALL sessions — no cap (operator)
       }
-    }
 
-    // ── Sessions dashboard (D-1728): per-session cache-affinity + live usage,
-    // with a TOTAL across all sessions. Emoji + issue resolve from the D1DX
-    // presence registry (best-effort). Columns degrade gracefully when narrow.
-    const binds = this.am.sessionBindingSummary ? this.am.sessionBindingSummary() : [];
-    if (binds.length > 0) {
-      const agg = this.am.sessionAggregate ? this.am.sessionAggregate() : null;
-      lines.push('');
-      const sHdr = ` Sessions ${cyan(`${agg ? agg.warm : 0} warm`)}/${binds.length} `;
-      lines.push(sHdr + dim('─'.repeat(Math.max(1, W - vw(sHdr)))));
-      const wide = W >= 76;
-      const psMap = this._samplePs(binds.map(b => b.pid).filter(Boolean));
-      const row = (who, acct, el, msgs, tok, avg, tpm, mem, state) =>
-        '   ' + rpad(who, 13) + rpad(acct, 8) + rpad(el, 7) + rpad(msgs, 6)
-        + rpad(tok, 8) + (wide ? rpad(avg, 8) + rpad(tpm, 8) : '') + rpad(mem, 8) + state;
-      lines.push(dim(row('session', 'acct', 'elapsed', 'msgs', 'tokens', 'avg/m', 'tok/min', 'mem/cpu', 'state')));
-      const maxRows = 12;
-      let pm = 0;
-      for (const b of binds.slice(0, maxRows)) {
-        const who = (b.emoji ? b.emoji + ' ' : '') + (b.issue || b.sid8);
-        const state = b.warm ? green('warm') : gray('idle ' + fmtDur(b.idleSec));
-        const ps = psMap[b.pid] || {};
-        if (ps.rssMB) pm += ps.rssMB;
-        const mem = ps.rssMB != null ? `${ps.rssMB}M/${ps.cpu}%` : '-';
-        lines.push(row(who, b.account, fmtDur(b.elapsedSec), String(b.requests),
-          fmtN(b.tokens), fmtN(b.avgTokensPerMsg), fmtN(b.tokensPerMin), mem, state));
+      // single aggregate TOTAL across all proxy-bound sessions
+      if (agg && binds.length > 0) {
+        lines.push('  ' + bold(rpad('   TOTAL', 29)) + bold(rpad(fmtN(agg.tokens), 6))
+          + bold(green('$' + aggCost.toFixed(2))));
       }
-      if (binds.length > maxRows) lines.push('   ' + gray(`… +${binds.length - maxRows} more`));
-      if (agg) {
-        lines.push(bold(row('TOTAL', '', fmtDur(agg.elapsedSec), String(agg.requests),
-          fmtN(agg.tokens), fmtN(agg.avgTokensPerMsg), fmtN(agg.tokensPerMin), pm ? pm + 'M' : '-', '')));
+
+      // light whole-fleet: registry agents the proxy hasn't routed (still alive)
+      if (unbound.length > 0) {
+        lines.push(' ' + gray('◆ ') + gray(rpad('Registered', 12)) + gray('(no proxy traffic)')
+          + '  ' + gray(unbound.length + ' sess'));
+        for (const f of unbound) {
+          lines.push(sessRow({
+            emoji: f.emoji, issue: f.issue, sid8: String(f.sid).replace(/^cc-/, '').slice(0, 8),
+            intent: f.intent, status: f.pin?.status || null, assigneeUserId: f.pin?.assigneeUserId || null,
+          }, false));
+        }
       }
     }
 
@@ -604,10 +670,65 @@ export class TUI {
     return line;
   }
 
+  // D-1739 S1: account as a group header — glyph(type) + name + status +
+  // quota bars + per-account roll-up (sess · $). Sessions render indented below.
+  _renderAcctHeader(idx, bw, showBoth, roll) {
+    const a = this.am.accounts[idx];
+    const isCur = idx === this.am.currentIndex;
+    const isSel = this.mode === 'select' && idx === this.selIdx;
+    const sel = isSel ? cyan('>') : ' ';
+    const glyph = this._acctGlyph(a.type);
+
+    const rawName = a.name.slice(0, 12).padEnd(12);
+    const name = isSel ? bold(rawName) : (isCur ? bold(rawName) : rawName);
+
+    let status;
+    switch (a.status) {
+      case 'active':    status = green('active'); break;
+      case 'throttled': status = yellow('throttled'); break;
+      case 'exhausted': status = red('exhausted'); break;
+      case 'error':     status = red('error'); break;
+      default:          status = a.status || 'ready';
+    }
+    status = rpad(status, 10);
+
+    // Quota ratios — prefer unified (Claude Max), fall back to standard (API key)
+    const q = a.quota;
+    let r1 = null, r2 = null, l1 = 'Ses', l2 = 'Wk', t1 = null, t2 = null;
+    if (q.unified5h != null || q.unified7d != null) {
+      r1 = q.unified5h; r2 = q.unified7d; t1 = q.unified5hReset; t2 = q.unified7dReset;
+    } else {
+      l1 = 'Tok'; l2 = 'Req';
+      r1 = (q.tokensLimit != null && q.tokensRemaining != null)
+        ? 1 - q.tokensRemaining / q.tokensLimit : null;
+      r2 = (q.requestsLimit != null && q.requestsRemaining != null)
+        ? 1 - q.requestsRemaining / q.requestsLimit : null;
+      t1 = q.resetsAt ? new Date(q.resetsAt).getTime() : null; t2 = t1;
+    }
+
+    let line = ` ${sel}${glyph} ${name} ${status} ${l1}${bar(r1, bw, t1)}`;
+    if (showBoth) line += ` ${l2}${bar(r2, bw, t2)}`;
+    line += `  ${roll}`;
+    return line;
+  }
+
+  _acctGlyph(type) {
+    return type === 'apikey' ? cyan('◇') : cyan('◆');
+  }
+
+  // D-1739 S4: API-equivalent $ burn — what these tokens would cost pay-as-you-go
+  // on the Anthropic API. Default Sonnet-4.x rate ($3/Mtok in, $15/Mtok out);
+  // override via config.pricing.{inPerMtok,outPerMtok}. Display-only (Max is flat-fee).
+  _cost(inTok, outTok) {
+    const pin = this.config.pricing?.inPerMtok ?? 3;
+    const pout = this.config.pricing?.outPerMtok ?? 15;
+    return ((inTok || 0) / 1e6) * pin + ((outTok || 0) / 1e6) * pout;
+  }
+
   _renderFooter() {
     switch (this.mode) {
       case 'normal':
-        return ` ${bold('s')}witch  ${bold('a')}dd  ${bold('r')}emove  ${bold('R')}eload  ${bold('q')}uit`;
+        return ` ${bold('s')}witch  ${bold('a')}dd  ${bold('r')}emove  ${bold('R')}eload  ${bold('b')}ell${this.bell === false ? gray('·muted') : ''}  ${bold('q')}uit`;
       case 'select': {
         const act = this.selAction === 'switch' ? 'switch' : 'remove';
         return ` ${dim('↑↓')} select  ${bold('Enter')} ${act}  ${bold('Esc')} cancel`;

@@ -318,6 +318,48 @@ export class AccountManager {
     return rows;
   }
 
+  // D-1739: read a session's local Paperclip pin overlay (title/status), written
+  // by /task + `pc-current --set`. Credential-free — the proxy never calls
+  // Paperclip. Best-effort, cached ~5s; missing/partial → null (never throws).
+  // `status` is the agent's LAST-CLAIMED snapshot, not live server truth.
+  _sessionPin(fullSid) {
+    if (!fullSid) return null;
+    this._pinCache ??= new Map();
+    const now = Date.now();
+    const c = this._pinCache.get(fullSid);
+    if (c && now - c.at < 5000) return c.data;
+    let data = null;
+    try {
+      const p = join(homedir(), '.claude', 'state', 'sessions', fullSid, 'pin.json');
+      const j = JSON.parse(readFileSync(p, 'utf-8'));
+      data = {
+        title: j.title ?? null,
+        status: j.status ?? null,
+        assigneeUserId: j.assigneeUserId ?? null,
+        lastCommentAt: j.lastCommentAt ?? null,
+      };
+    } catch { data = null; }
+    this._pinCache.set(fullSid, { at: now, data });
+    return data;
+  }
+
+  // D-1739: every live presence-registry row enriched with its local pin
+  // overlay — the whole-fleet spine for Deck (includes agents the proxy has
+  // never routed). Best-effort + credential-free; empty array if unreadable.
+  fleetRows() {
+    const rows = this._readSessionsRegistry() || [];
+    return rows.map(r => ({
+      sid: r.sid,
+      emoji: r.emoji || null,
+      pid: r.pid ?? null,
+      intent: r.intent || null,
+      issue: r.pinned_issue || null,
+      started: r.started || null,
+      lastHeartbeat: r.last_heartbeat || null,
+      pin: this._sessionPin(r.sid),
+    }));
+  }
+
   // Process + system resource snapshot for the dashboard (D-1728 S8). Cheap —
   // os + process only, no `ps` (per-instance mem/cpu is resolved by the caller
   // from each session's pid, since that needs a shell-out we keep off this path).
@@ -345,6 +387,7 @@ export class AccountManager {
       const acct = this.accounts[b.index];
       if (!acct) continue;
       const row = this._sessionRow(sid);
+      const pin = row ? this._sessionPin(row.sid) : null; // D-1739: local issue title/status overlay
       const tokens = (b.inputTokens || 0) + (b.outputTokens || 0);
       const reqs = b.requests || 0;
       const elapsedSec = Math.max(1, Math.round((now - (b.firstSeenAt ?? now)) / 1000));
@@ -353,6 +396,11 @@ export class AccountManager {
         sid8: String(sid).slice(0, 8),
         emoji: row?.emoji || null,
         issue: row?.pinned_issue || null,
+        intent: row?.intent || null,                              // D-1739: agent activity line
+        fullSid: row?.sid || ('cc-' + sid),                       // D-1739: registry sid (whole-fleet merge key)
+        title: pin?.title || null,                                // D-1739: local pin.json overlay
+        status: pin?.status || null,                              // D-1739: agent's last-claimed issue status
+        needsYou: !!(pin && (pin.status === 'blocked' || pin.status === 'in_review' || pin.assigneeUserId)),
         pid: row?.pid ?? null, // D-1728 S8: Claude Code process pid for per-instance mem/cpu
         tag: this._sessionTag(sid),
         account: acct.name,
