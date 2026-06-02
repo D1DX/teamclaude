@@ -1,6 +1,13 @@
 import { refreshAccessToken, isTokenExpiringSoon } from './oauth.js';
+import { readFileSync } from 'node:fs';
+import { homedir } from 'node:os';
+import { join } from 'node:path';
 
 const WEEK_MS = 7 * 24 * 60 * 60 * 1000;
+const HOUR_MS = 60 * 60 * 1000;
+// D1DX (D-1728): D1DX session presence registry — used only to resolve a
+// session emoji for log/TUI display. Best-effort; never load-bearing for routing.
+const SESSIONS_REGISTRY = join(homedir(), '.claude', 'state', 'sessions.json');
 
 function emptyQuota() {
   return {
@@ -69,6 +76,26 @@ export class AccountManager {
     this._lastAllThrottledAt = 0;   // ms — debounces concurrent 429s into one episode
     this._lastBackoffMs = 0;        // ms — last computed backoff, the episode-debounce window
     this._recoveryReleaseAt = 0;    // ms — half-open gate: next throttled account may release at/after this
+
+    // ── D1DX patch (D-1728): per-session cache-affinity routing ──
+    // Anthropic prompt cache is 5-min TTL + per-account, so each Claude Code
+    // session (keyed on the x-claude-code-session-id header) binds to ONE
+    // account and stays cache-warm on it; it only switches on a blocker
+    // (immediate) or after the cache window lapses (free rebalance). Non-urgent
+    // weekly-urgency balancing never cuts a warm session mid-window.
+    this.sessionBindings = new Map(); // sid -> { index, lastUsedAt, boundAt }
+    this.cacheAffinityWindowMs = (opts.cacheAffinityWindowSec ?? 300) * 1000; // warm-stick window
+    this.bindingEvictMs        = (opts.bindingEvictSec        ?? 1800) * 1000; // drop idle bindings
+    this.bindingBoostBaseHours = opts.bindingBoostBaseHours    ?? 48;          // reset-proximity boost knee
+    this.bindingMaxBoost       = opts.bindingMaxBoost          ?? this.accounts.length; // cap the boost
+    // Per-account bounded backoff (D-1728): replaces the D-1705 "derive the full
+    // 5h reset on a headerless 429" over-bench. A 429 benches the account for a
+    // bounded escalating window (floor × factor^streak), not hours — so a
+    // transient/rolling-window 429 re-probes in ~60s and "all exhausted" stays real.
+    this.perAccountBackoffFloorSec = opts.perAccountBackoffFloorSec ?? 60;
+    this.perAccountBackoffCapSec   = opts.perAccountBackoffCapSec   ?? 600;
+    this.perAccountBackoffFactor   = opts.perAccountBackoffFactor   ?? 1.5;
+    this._sessionTagCache = { at: 0, rows: null }; // cached sessions.json read for emoji tags
   }
 
   // D1DX patch: actively sweep ALL accounts every request + on every status read,
@@ -115,6 +142,177 @@ export class AccountManager {
       return current; // sticky — stay cache-warm
     }
     return this._selectNext();
+  }
+
+  // ── D1DX patch (D-1728): per-session cache-affinity routing ─────
+  /**
+   * Pick the account to serve a request for a specific Claude Code session
+   * (the x-claude-code-session-id header). A warm binding stays put (cache
+   * locality); a switch happens ONLY on a blocker (bound account throttled /
+   * hard-capped → immediate) or after the cache window lapses (idle ≥ window →
+   * free to rebalance). Non-urgent weekly-urgency balancing never cuts a warm
+   * session. Falls back to the global getActiveAccount() when there is no
+   * session id (warmer / health checks / non-Claude-Code clients).
+   * Returns null only when the pool is genuinely exhausted.
+   */
+  getAccountForSession(sessionId) {
+    this._sweepAll();
+    this._evictStaleBindings();
+    if (!sessionId) return this.getActiveAccount();
+
+    const now = Date.now();
+    const b = this.sessionBindings.get(sessionId);
+    if (b) {
+      const acct = this.accounts[b.index];
+      const warm = now - b.lastUsedAt < this.cacheAffinityWindowMs;
+      // Warm + usable → stay put (the whole point: don't churn the cache).
+      if (acct && warm && !this._isBlocked(acct) && !this._atHardLimit(acct)) {
+        b.lastUsedAt = now;
+        return acct;
+      }
+    }
+
+    // (Re)bind: no binding, window lapsed, or the bound account is blocked/capped.
+    const chosen = this._pickAccountForBinding();
+    if (!chosen) return null; // genuinely exhausted — server returns an honest 429
+
+    const prevIdx = b?.index;
+    const reason = !b ? 'new session'
+      : (now - b.lastUsedAt < this.cacheAffinityWindowMs) ? 'blocker'   // was warm; bound acct blocked/capped
+      : 'window lapsed';
+    this.sessionBindings.set(sessionId, { index: chosen.index, lastUsedAt: now, boundAt: now });
+    this.currentIndex = chosen.index; // keep TUI "active account" + homeIndex logic meaningful
+    if (prevIdx !== chosen.index) {
+      console.log(`[TeamClaude] Session ${this._sessionTag(sessionId)} → "${chosen.name}" (${reason})`);
+    }
+    return chosen;
+  }
+
+  // Per-account count of sessions whose binding is still warm (within the cache
+  // window) — drives the parallel-spread load cap. Returns { counts, active }.
+  _activeSessionCounts() {
+    const now = Date.now();
+    const counts = new Array(this.accounts.length).fill(0);
+    let active = 0;
+    for (const b of this.sessionBindings.values()) {
+      if (now - b.lastUsedAt < this.cacheAffinityWindowMs && b.index < counts.length) {
+        counts[b.index]++;
+        active++;
+      }
+    }
+    return { counts, active };
+  }
+
+  // Reset-proximity boost (operator D-1728): an account with weekly headroom and
+  // an imminent 7d reset should absorb progressively more sessions (use-it-or-
+  // lose-it). ~1 at ≥48h, ~2 at 24h, ~4 at 12h, ~8 at 6h, capped at bindingMaxBoost.
+  _resetProximityBoost(account) {
+    if (this._weeklyRemaining(account) <= 0) return 1;
+    const reset = account.quota.unified7dReset;
+    if (!reset) return 1;
+    const tToResetH = Math.max(0.5, (reset - Date.now()) / HOUR_MS);
+    const boost = Math.round(this.bindingBoostBaseHours / tToResetH);
+    return Math.min(this.bindingMaxBoost, Math.max(1, boost));
+  }
+
+  /**
+   * Pick the best account to (re)bind a session to (pure — no global-sticky side
+   * effects). Spreads sessions across accounts for parallel throughput (load
+   * cap = ceil((active+1)/usable)), drains the highest weekly-urgency account
+   * first, and loosens the cap by the reset-proximity boost so soon-to-reset
+   * budget is drained aggressively. The 5h hard ceiling (_isUsable) + 429
+   * failover bound over-stacking. Returns null only when the pool is exhausted.
+   */
+  _pickAccountForBinding() {
+    const usable = this.accounts.filter(a => this._isUsable(a));
+    if (usable.length === 0) return this._soonestUsableOrNull();
+
+    const { counts, active } = this._activeSessionCounts();
+    const baseCap = Math.max(1, Math.ceil((active + 1) / usable.length));
+    const ranked = usable.slice().sort((a, c) => this._weeklyUrgency(c) - this._weeklyUrgency(a));
+
+    for (const a of ranked) {
+      const cap = baseCap * this._resetProximityBoost(a);
+      if (counts[a.index] < cap) return a;
+    }
+    // Every usable account is at its (boosted) cap — least-loaded among the
+    // highest-urgency ranking still keeps work flowing.
+    return ranked.reduce((best, a) => (counts[a.index] < counts[best.index] ? a : best), ranked[0]);
+  }
+
+  // Tier-3 fallback (pure): the soonest-to-reset account, reactivated only if its
+  // reset has actually passed; else null (= genuinely exhausted → honest 429).
+  _soonestUsableOrNull() {
+    let soonest = null, soonestTime = Infinity;
+    for (const a of this.accounts) {
+      const t = a.rateLimitedUntil || a.quota.unified5hReset || a.quota.unified7dReset
+        || (a.quota.resetsAt ? new Date(a.quota.resetsAt).getTime() : null);
+      if (t && t < soonestTime) { soonestTime = t; soonest = a; }
+    }
+    if (soonest && soonestTime <= Date.now()) {
+      soonest.status = 'active';
+      soonest.rateLimitedUntil = null;
+      if (this._allThrottledStreak > 0) this._recoveryReleaseAt = Date.now() + this.recoveryGapSec * 1000;
+      return soonest;
+    }
+    return null;
+  }
+
+  _evictStaleBindings() {
+    const now = Date.now();
+    for (const [sid, b] of this.sessionBindings) {
+      if (now - b.lastUsedAt > this.bindingEvictMs) this.sessionBindings.delete(sid);
+    }
+  }
+
+  // Resolve a session's emoji from the D1DX presence registry (or null).
+  // Best-effort, cached ~5s. The x-claude-code-session-id header equals the
+  // registry SID minus the `cc-` prefix.
+  _sessionEmoji(sessionId) {
+    const rows = this._readSessionsRegistry();
+    if (!rows) return null;
+    const row = rows.find(r => r && typeof r.sid === 'string'
+      && (r.sid === 'cc-' + sessionId || r.sid.endsWith(sessionId)));
+    return (row && row.emoji) || null;
+  }
+
+  // Short display tag (emoji + short sid) for log lines; falls back to the sid.
+  _sessionTag(sessionId) {
+    const short = String(sessionId).slice(0, 8);
+    const emoji = this._sessionEmoji(sessionId);
+    return emoji ? `${emoji} ${short}` : short;
+  }
+
+  _readSessionsRegistry() {
+    const now = Date.now();
+    if (now - this._sessionTagCache.at < 5000) return this._sessionTagCache.rows;
+    let rows = null;
+    try {
+      rows = JSON.parse(readFileSync(SESSIONS_REGISTRY, 'utf-8'));
+      if (!Array.isArray(rows)) rows = rows?.sessions ?? null;
+    } catch { rows = null; }
+    this._sessionTagCache = { at: now, rows };
+    return rows;
+  }
+
+  // Snapshot of live session→account bindings for the TUI / status (D-1728).
+  sessionBindingSummary() {
+    const now = Date.now();
+    const out = [];
+    for (const [sid, b] of this.sessionBindings) {
+      const acct = this.accounts[b.index];
+      if (!acct) continue;
+      out.push({
+        sid,
+        sid8: String(sid).slice(0, 8),
+        emoji: this._sessionEmoji(sid),
+        tag: this._sessionTag(sid),
+        account: acct.name,
+        warm: now - b.lastUsedAt < this.cacheAffinityWindowMs,
+        idleSec: Math.round((now - b.lastUsedAt) / 1000),
+      });
+    }
+    return out.sort((a, c) => a.account.localeCompare(c.account));
   }
 
   // ── D1DX patch: two-tier weekly-reserve selection ──────────────
@@ -370,29 +568,43 @@ export class AccountManager {
   /**
    * Mark an account as rate-limited.
    *
-   * `retryAfterSeconds` is the upstream `retry-after` header value, or null/NaN
-   * when the 429 carried no header — in which case D1DX patch (D-1705 S1)
-   * derives the window from this account's own known unified resets instead of
-   * the old blind 60s. D1DX patch (D-1705 S2) then adds a small per-account
-   * stagger + jitter so accounts throttled in the same burst don't all expire
-   * at the same instant (de-synchronized recovery).
+   * D1DX patch (D-1728): BOUNDED per-account backoff. A 429 benches this account
+   * for `floor × factor^(streak-1)` seconds (consecutive same-account 429s
+   * escalate), capped at `perAccountBackoffCapSec` — NOT the full unified 5h/7d
+   * reset. Anthropic's 5h limit is a rolling window, so a transient/burst 429
+   * recovers usable headroom long before the nominal reset; benching to the full
+   * reset (the old D-1705 S1 behavior) starved the highest-weekly-urgency account
+   * for hours and made the pool look "exhausted" when it wasn't. A genuinely
+   * capped account is still excluded honestly by `_atHardLimit` (its 429 response
+   * carries unified-5h ≈ 1.0 / status `rejected`), so the short re-probe doesn't
+   * hammer it — it just keeps "all exhausted" REAL. An explicit upstream
+   * `retry-after` is honored but clamped to the same cap for the same reason.
+   * D-1705 S2 per-account stagger + jitter (de-synchronized recovery) is kept.
    */
   markRateLimited(accountIndex, retryAfterSeconds) {
     const account = this.accounts[accountIndex];
     if (!account) return;
     const now = Date.now();
 
+    // Per-account 429 streak: a fresh 429 after a long quiet gap (> cap) resets it.
+    if (now - (account._rl429At || 0) > this.perAccountBackoffCapSec * 1000) {
+      account._rl429Streak = 0;
+    }
+    account._rl429Streak = (account._rl429Streak || 0) + 1;
+    account._rl429At = now;
+
+    const capMs = this.perAccountBackoffCapSec * 1000;
     let windowMs;
     if (retryAfterSeconds != null && !isNaN(retryAfterSeconds)) {
-      windowMs = retryAfterSeconds * 1000;
+      // Honor an explicit header, but never bench beyond the bounded cap.
+      windowMs = Math.min(retryAfterSeconds * 1000, capMs);
     } else {
-      // No header — derive from this account's soonest genuine future reset.
-      const resets = [
-        account.quota.unified5hReset,
-        account.quota.unified7dReset,
-        account.quota.resetsAt ? new Date(account.quota.resetsAt).getTime() : null,
-      ].filter(t => t && t > now);
-      windowMs = resets.length ? Math.min(...resets) - now : this.allThrottledFloorSec * 1000;
+      // No header — bounded escalating backoff (floor × factor^(streak-1)).
+      const sec = Math.min(
+        this.perAccountBackoffCapSec,
+        this.perAccountBackoffFloorSec * Math.pow(this.perAccountBackoffFactor, account._rl429Streak - 1),
+      );
+      windowMs = sec * 1000;
     }
 
     // S2: per-account stagger (deterministic base by index) + jitter (tail), so
@@ -405,7 +617,18 @@ export class AccountManager {
     // D1DX patch: remember the displaced current account so selection
     // prefers returning to it (cache-warm) at the next switch once it clears.
     if (accountIndex === this.currentIndex) this.homeIndex = accountIndex;
-    console.log(`[TeamClaude] Account "${account.name}" rate limited until +${Math.round((windowMs + staggerMs) / 1000)}s`);
+    console.log(`[TeamClaude] Account "${account.name}" rate limited until +${Math.round((windowMs + staggerMs) / 1000)}s (429 streak ${account._rl429Streak})`);
+  }
+
+  /**
+   * D1DX patch (D-1728): a successful (<400) response on an account clears its
+   * per-account 429 backoff streak, so the next isolated 429 starts again at the
+   * floor instead of an inflated escalated window.
+   */
+  noteAccountSuccess(accountIndex) {
+    const account = this.accounts[accountIndex];
+    if (!account) return;
+    if (account._rl429Streak) account._rl429Streak = 0;
   }
 
   /**
@@ -625,6 +848,7 @@ export class AccountManager {
       currentAccount: this.accounts[this.currentIndex]?.name,
       switchThreshold: this.switchThreshold,
       weeklyReserve: this.weeklyReserve,
+      sessionBindings: this.sessionBindingSummary(), // D1DX (D-1728): live session→account map
       accounts: this.accounts.map(a => ({
         name: a.name,
         type: a.type,

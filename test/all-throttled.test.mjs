@@ -34,12 +34,16 @@ const throttleAll = (am, untilMs) => {
   const secs = am.allThrottledBackoff(); // floor 100, upward jitter up to +15%
   ok('S1 jitter is upward-only (>= floor, <= floor*(1+pct))', secs >= 100 && secs <= 116); }
 
-{ const am = mk();
+{ const am = mk({ perAccountBackoffFloorSec: 60, recoveryStaggerSec: 5 });
   const now = Date.now();
-  am.accounts[1].quota.unified5hReset = now + 200000; // 200s out
+  am.accounts[1].quota.unified5hReset = now + 200000; // 200s out — D-1728 must IGNORE this
   am.markRateLimited(1, null);                          // 429 with NO retry-after header
   const remaining = am.accounts[1].rateLimitedUntil - now;
-  ok('S1 markRateLimited(null header) derives the window from unified5hReset', remaining >= 200000 && remaining < 220000); }
+  // D-1728 supersedes D-1705 S1 for a SINGLE account: a headerless 429 uses the
+  // bounded per-account backoff (floor 60s + index stagger), NOT the full 5h
+  // reset (200s). The rolling 5h window recovers long before the nominal reset.
+  ok('D-1728 markRateLimited(null header) = bounded backoff (~60s), not the full 5h reset (200s)',
+     remaining >= 60000 && remaining < 80000); }
 
 // ── S2: de-synchronized recovery (per-account stagger) ─────────────────────
 { const am = mk({ recoveryStaggerSec: 5 });

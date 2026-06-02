@@ -410,6 +410,27 @@ export class TUI {
       }
     }
 
+    // ── Sessions (D-1728): live per-session cache-affinity bindings, grouped by
+    // account. Emoji clusters come from the D1DX presence registry (best-effort).
+    const binds = this.am.sessionBindingSummary ? this.am.sessionBindingSummary() : [];
+    if (binds.length > 0) {
+      lines.push('');
+      const warmN = binds.filter(b => b.warm).length;
+      const sHdr = ` Sessions ${cyan(`${warmN} warm`)}/${binds.length} `;
+      lines.push(sHdr + dim('─'.repeat(Math.max(1, W - vw(sHdr)))));
+      const byAcct = new Map();
+      for (const b of binds) {
+        if (!byAcct.has(b.account)) byAcct.set(b.account, []);
+        byAcct.get(b.account).push(b);
+      }
+      for (const [acct, list] of byAcct) {
+        const cluster = list.map(b => b.emoji || gray('·')).join('');
+        const warmList = list.filter(b => b.warm).length;
+        const tail = gray(`${list.length} sess${warmList < list.length ? `, ${warmList} warm` : ''}`);
+        lines.push(`   ${rpad(acct, 12)} ${cluster}  ${tail}`);
+      }
+    }
+
     // ── Activity header
     lines.push('');
     const ac = this.active.size;

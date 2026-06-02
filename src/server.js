@@ -150,8 +150,13 @@ function formatHeaders(headers) {
 async function forwardRequest(req, res, body, accountManager, upstream, retryCount, hooks, reqId, ctx, logDir) {
   const maxRetries = accountManager.accounts.length;
 
-  // Select account
-  const account = accountManager.getActiveAccount();
+  // Select account — per-session cache-affinity routing (D-1728). The
+  // x-claude-code-session-id header is stable per Claude Code session; a warm
+  // session sticks to its bound account, switching only on a blocker or after
+  // the cache window lapses. No header (warmer / health / non-CC) → global
+  // getActiveAccount() fallback (unchanged behavior).
+  const sessionId = req.headers['x-claude-code-session-id'] || null;
+  const account = accountManager.getAccountForSession(sessionId);
   if (!account) {
     ctx.status = 429;
     ctx.account = '(none available)';
@@ -361,7 +366,11 @@ async function forwardRequest(req, res, body, accountManager, upstream, retryCou
 
     // D1DX patch (D-1705 S3): a genuine success ends any all-throttled episode —
     // reopen the half-open recovery gate + reset the escalation streak.
-    if (upstreamRes.status < 400) accountManager.noteSuccess();
+    // D-1728: also clear this account's per-account 429 backoff streak.
+    if (upstreamRes.status < 400) {
+      accountManager.noteSuccess();
+      accountManager.noteAccountSuccess(account.index);
+    }
 
     // Log response headers
     if (logDir) {

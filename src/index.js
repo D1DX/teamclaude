@@ -101,6 +101,15 @@ async function serverCommand() {
     recoveryStaggerSec: config.recoveryStaggerSec ?? 5,
     recoveryGapSec: config.recoveryGapSec ?? 20,
     escalationFactor: config.escalationFactor ?? 1.5,
+    // D1DX (D-1728): per-session cache-affinity routing + bounded per-account backoff
+    // (defaults cover configs predating the keys; bindingMaxBoost null → account count).
+    cacheAffinityWindowSec: config.cacheAffinityWindowSec ?? 300,
+    bindingEvictSec: config.bindingEvictSec ?? 1800,
+    bindingBoostBaseHours: config.bindingBoostBaseHours ?? 48,
+    bindingMaxBoost: config.bindingMaxBoost ?? null,
+    perAccountBackoffFloorSec: config.perAccountBackoffFloorSec ?? 60,
+    perAccountBackoffCapSec: config.perAccountBackoffCapSec ?? 600,
+    perAccountBackoffFactor: config.perAccountBackoffFactor ?? 1.5,
   };
   const accountManager = new AccountManager(accounts, threshold, weeklyReserve, rerankEvery, rerankMargin, allThrottledOpts);
 
@@ -441,6 +450,18 @@ async function statusCommand() {
 
       console.log(`    Total:    ${acct.usage.totalInputTokens + acct.usage.totalOutputTokens} tokens, ${acct.usage.totalRequests} requests`);
       if (acct.rateLimitedUntil) console.log(`    Throttled until: ${acct.rateLimitedUntil}`);
+      console.log('');
+    }
+
+    // D1DX (D-1728): live per-session cache-affinity bindings.
+    const binds = data.sessionBindings || [];
+    if (binds.length > 0) {
+      const warmN = binds.filter(b => b.warm).length;
+      console.log(`Sessions: ${binds.length} bound (${warmN} warm)`);
+      for (const b of binds) {
+        const state = b.warm ? 'warm' : `idle ${b.idleSec}s`;
+        console.log(`  ${b.emoji ? b.emoji + ' ' : ''}${b.sid8} → ${b.account}  (${state})`);
+      }
       console.log('');
     }
   } catch {

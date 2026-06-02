@@ -28,6 +28,14 @@ export function createDefaultConfig() {
     recoveryStaggerSec: 5,      // per-account stagger added to rateLimitedUntil (de-sync window expiry)
     recoveryGapSec: 20,         // half-open recovery: min gap between account re-entries
     escalationFactor: 1.5,      // floor *= factor^(streak-1) on repeated back-to-back all-throttled episodes
+    // D1DX (D-1728): per-session cache-affinity routing + bounded per-account backoff
+    cacheAffinityWindowSec: 300,   // warm-stick window (Anthropic prompt cache TTL — same account while warm)
+    bindingEvictSec: 1800,         // drop a session binding after it's idle this long
+    bindingBoostBaseHours: 48,     // reset-proximity boost knee: boost ≈ base / hours-to-7d-reset
+    bindingMaxBoost: null,         // cap on the reset-proximity boost (null → number of accounts)
+    perAccountBackoffFloorSec: 60, // bounded per-account 429 backoff floor (replaces full-5h over-bench)
+    perAccountBackoffCapSec: 600,  // bounded per-account 429 backoff cap
+    perAccountBackoffFactor: 1.5,  // escalation per consecutive same-account 429
     accounts: [],
   };
 }
