@@ -1,6 +1,6 @@
 import { refreshAccessToken, isTokenExpiringSoon } from './oauth.js';
 import { readFileSync, writeFileSync, renameSync } from 'node:fs';
-import { homedir } from 'node:os';
+import { homedir, totalmem, freemem, loadavg, cpus } from 'node:os';
 import { join } from 'node:path';
 
 const WEEK_MS = 7 * 24 * 60 * 60 * 1000;
@@ -318,6 +318,23 @@ export class AccountManager {
     return rows;
   }
 
+  // Process + system resource snapshot for the dashboard (D-1728 S8). Cheap —
+  // os + process only, no `ps` (per-instance mem/cpu is resolved by the caller
+  // from each session's pid, since that needs a shell-out we keep off this path).
+  systemSnapshot() {
+    const mu = process.memoryUsage();
+    const total = totalmem(), free = freemem();
+    return {
+      proxyRssMB: Math.round(mu.rss / 1048576),
+      proxyUptimeSec: Math.round(process.uptime()),
+      totalMemMB: Math.round(total / 1048576),
+      usedMemMB: Math.round((total - free) / 1048576),
+      usedMemPct: Math.round((1 - free / total) * 100),
+      loadAvg: loadavg().map(n => Math.round(n * 100) / 100),
+      cpuCount: cpus().length,
+    };
+  }
+
   // Snapshot of live session→account bindings + per-session usage for the
   // dashboard (D-1728). tokens = input + output; avgTokensPerMsg = tokens /
   // messages; tokensPerMin = throughput over the session's elapsed time.
@@ -336,6 +353,7 @@ export class AccountManager {
         sid8: String(sid).slice(0, 8),
         emoji: row?.emoji || null,
         issue: row?.pinned_issue || null,
+        pid: row?.pid ?? null, // D-1728 S8: Claude Code process pid for per-instance mem/cpu
         tag: this._sessionTag(sid),
         account: acct.name,
         warm: now - b.lastUsedAt < this.cacheAffinityWindowMs,
@@ -1001,6 +1019,7 @@ export class AccountManager {
       currentAccount: this.accounts[this.currentIndex]?.name,
       switchThreshold: this.switchThreshold,
       weeklyReserve: this.weeklyReserve,
+      system: this.systemSnapshot(),                 // D1DX (D-1728 S8): proxy + host resources
       sessionBindings: this.sessionBindingSummary(), // D1DX (D-1728): live session→account map
       sessionAggregate: this.sessionAggregate(),     // D1DX (D-1728): live dashboard TOTAL
       usageByIssue: this.ledgerByIssue(),            // D1DX (D-1728 S6): durable per-issue rollup

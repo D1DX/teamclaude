@@ -1,6 +1,8 @@
 #!/usr/bin/env node
 
-import { spawnSync } from 'node:child_process';
+import { spawnSync, execSync } from 'node:child_process';
+import { readFileSync } from 'node:fs';
+import { homedir } from 'node:os';
 import { createInterface } from 'node:readline';
 import { loadOrCreateConfig, loadConfig, saveConfig, atomicConfigUpdate, getConfigPath } from './config.js';
 import { AccountManager } from './account-manager.js';
@@ -444,6 +446,26 @@ async function statusCommand() {
     const res = await fetch(url, { headers: { 'x-api-key': config.proxy.apiKey } });
     const data = await res.json();
 
+    // D1DX (D-1728): dashboard formatters (shared by every section below).
+    const fmtN = n => n == null ? '-' : n >= 1e6 ? (n / 1e6).toFixed(1) + 'M' : n >= 1e3 ? (n / 1e3).toFixed(1) + 'k' : String(n);
+    const fmtDur = s => { if (s == null) return '-'; if (s < 60) return s + 's'; const m = Math.floor(s / 60); if (m < 60) return m + 'm'; const h = Math.floor(m / 60), rm = m % 60; if (h < 24) return rm ? `${h}h${rm}m` : `${h}h`; const d = Math.floor(h / 24); return `${d}d${h % 24}h`; };
+    const pad = (s, w) => String(s).padEnd(w);
+
+    // D1DX (D-1728 S8): health + host resources up top.
+    const sys = data.system || {};
+    let wired = 'unknown';
+    try {
+      const st = JSON.parse(readFileSync(join(homedir(), '.claude', 'settings.json'), 'utf-8'));
+      wired = (st.env?.ANTHROPIC_BASE_URL === `http://localhost:${config.proxy.port}` && st.apiKeyHelper)
+        ? 'wired (ANTHROPIC_BASE_URL + apiKeyHelper)'
+        : 'NOT fully wired — run scripts/teamclaude-proxy-enable.sh';
+    } catch { /* settings.json unreadable */ }
+    const gb = mb => mb == null ? '?' : (mb / 1024).toFixed(1);
+    console.log(`Proxy:    UP · port ${config.proxy.port} · up ${fmtDur(sys.proxyUptimeSec)} · proxy RSS ${sys.proxyRssMB ?? '?'}MB`);
+    console.log(`Routing:  ${wired}`);
+    console.log(`System:   RAM ${gb(sys.usedMemMB)}/${gb(sys.totalMemMB)}GB (${sys.usedMemPct ?? '?'}%) · load ${(sys.loadAvg || []).join(' ')} · ${sys.cpuCount ?? '?'} cpus`);
+    console.log('');
+
     console.log(`Active account: ${data.currentAccount}`);
     console.log(`Switch at:      ${(data.switchThreshold * 100).toFixed(0)}% usage\n`);
 
@@ -469,23 +491,35 @@ async function statusCommand() {
       console.log('');
     }
 
-    // D1DX (D-1728): dashboard formatters (shared by the live + per-issue views).
-    const fmtN = n => n == null ? '-' : n >= 1e6 ? (n / 1e6).toFixed(1) + 'M' : n >= 1e3 ? (n / 1e3).toFixed(1) + 'k' : String(n);
-    const fmtDur = s => { if (s < 60) return s + 's'; const m = Math.floor(s / 60); if (m < 60) return m + 'm'; const h = Math.floor(m / 60), rm = m % 60; if (h < 24) return rm ? `${h}h${rm}m` : `${h}h`; const d = Math.floor(h / 24); return `${d}d${h % 24}h`; };
-    const pad = (s, w) => String(s).padEnd(w);
-
-    // D1DX (D-1728): live per-session cache-affinity dashboard + TOTAL.
+    // D1DX (D-1728): live per-session cache-affinity dashboard + per-instance
+    // mem/CPU (resolved locally via `ps` on each session's Claude pid) + TOTAL.
     const binds = data.sessionBindings || [];
     const agg = data.sessionAggregate;
     if (binds.length > 0) {
+      const pids = binds.map(b => b.pid).filter(Boolean);
+      const psMap = {};
+      if (pids.length) {
+        try {
+          const out = execSync(`ps -o pid=,rss=,pcpu= -p ${pids.join(',')}`, { encoding: 'utf-8' });
+          for (const ln of out.trim().split('\n')) {
+            const m = ln.trim().split(/\s+/);
+            if (m.length >= 3) psMap[m[0]] = { rssMB: Math.round(+m[1] / 1024), cpu: +m[2] };
+          }
+        } catch { /* ps unavailable */ }
+      }
       console.log(`Sessions: ${binds.length} bound (${agg ? agg.warm : 0} warm)`);
-      console.log('  ' + pad('session', 14) + pad('acct', 9) + pad('elapsed', 8) + pad('msgs', 6) + pad('tokens', 8) + pad('avg/m', 8) + pad('tok/min', 8) + 'state');
+      console.log('  ' + pad('session', 14) + pad('acct', 9) + pad('elapsed', 8) + pad('msgs', 6) + pad('tokens', 8) + pad('avg/m', 8) + pad('tok/min', 8) + pad('mem', 7) + pad('cpu', 6) + 'state');
+      let pm = 0;
       for (const b of binds) {
         const who = (b.emoji ? b.emoji + ' ' : '') + (b.issue || b.sid8);
         const state = b.warm ? 'warm' : `idle ${fmtDur(b.idleSec)}`;
-        console.log('  ' + pad(who, 14) + pad(b.account, 9) + pad(fmtDur(b.elapsedSec), 8) + pad(b.requests, 6) + pad(fmtN(b.tokens), 8) + pad(fmtN(b.avgTokensPerMsg), 8) + pad(fmtN(b.tokensPerMin), 8) + state);
+        const ps = psMap[b.pid] || {};
+        if (ps.rssMB) pm += ps.rssMB;
+        const mem = ps.rssMB != null ? ps.rssMB + 'MB' : '-';
+        const cpu = ps.cpu != null ? ps.cpu + '%' : '-';
+        console.log('  ' + pad(who, 14) + pad(b.account, 9) + pad(fmtDur(b.elapsedSec), 8) + pad(b.requests, 6) + pad(fmtN(b.tokens), 8) + pad(fmtN(b.avgTokensPerMsg), 8) + pad(fmtN(b.tokensPerMin), 8) + pad(mem, 7) + pad(cpu, 6) + state);
       }
-      if (agg) console.log('  ' + pad('TOTAL', 14) + pad('', 9) + pad(fmtDur(agg.elapsedSec), 8) + pad(agg.requests, 6) + pad(fmtN(agg.tokens), 8) + pad(fmtN(agg.avgTokensPerMsg), 8) + pad(fmtN(agg.tokensPerMin), 8));
+      if (agg) console.log('  ' + pad('TOTAL', 14) + pad('', 9) + pad(fmtDur(agg.elapsedSec), 8) + pad(agg.requests, 6) + pad(fmtN(agg.tokens), 8) + pad(fmtN(agg.avgTokensPerMsg), 8) + pad(fmtN(agg.tokensPerMin), 8) + pad(pm ? pm + 'MB' : '-', 7));
       console.log('');
     }
 

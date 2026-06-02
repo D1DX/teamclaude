@@ -1,5 +1,6 @@
 import { importCredentials, fetchProfile } from './oauth.js';
 import { resolveLogDir, appendOpLog } from './oplog.js';
+import { execSync } from 'node:child_process';
 
 // ── ANSI helpers ─────────────────────────────────────────────
 
@@ -155,6 +156,27 @@ export class TUI {
     this._origErr = null;
     // D-1680: durable sink for the operational stream (see oplog.js).
     this.logDir = resolveLogDir(config);
+    // D-1728 S8: throttled per-instance mem/cpu sampler (ps on session pids).
+    this._psAt = 0;
+    this._psMap = {};
+  }
+
+  // D-1728 S8: sample per-process RSS + CPU for the given pids, at most every 3s
+  // (the render loop runs every 500ms — ps must not run on every frame).
+  _samplePs(pids) {
+    const now = Date.now();
+    if (now - this._psAt < 3000 || pids.length === 0) return this._psMap;
+    this._psAt = now;
+    const map = {};
+    try {
+      const out = execSync(`ps -o pid=,rss=,pcpu= -p ${pids.join(',')}`, { encoding: 'utf-8', timeout: 1000 });
+      for (const ln of out.trim().split('\n')) {
+        const m = ln.trim().split(/\s+/);
+        if (m.length >= 3) map[m[0]] = { rssMB: Math.round(+m[1] / 1024), cpu: +m[2] };
+      }
+    } catch { /* ps unavailable */ }
+    this._psMap = map;
+    return map;
   }
 
   // ── lifecycle ──────────────────────────────────────
@@ -414,6 +436,13 @@ export class TUI {
     lines.push(left + ' '.repeat(Math.max(1, W - vw(left) - vw(right))) + right);
     lines.push(' ' + dim('─'.repeat(W - 2)));
 
+    // D-1728 S8: system resource line (proxy + host).
+    const sys = this.am.systemSnapshot ? this.am.systemSnapshot() : null;
+    if (sys) {
+      const gb = mb => (mb / 1024).toFixed(1);
+      lines.push(' ' + gray(`proxy ${sys.proxyRssMB}MB · up ${fmtDur(sys.proxyUptimeSec)}    host RAM ${gb(sys.usedMemMB)}/${gb(sys.totalMemMB)}GB (${sys.usedMemPct}%) · load ${sys.loadAvg[0]} · ${sys.cpuCount} cpus`));
+    }
+
     // ── Accounts
     if (this.am.accounts.length === 0) {
       lines.push('');
@@ -440,21 +469,26 @@ export class TUI {
       const sHdr = ` Sessions ${cyan(`${agg ? agg.warm : 0} warm`)}/${binds.length} `;
       lines.push(sHdr + dim('─'.repeat(Math.max(1, W - vw(sHdr)))));
       const wide = W >= 76;
-      const row = (who, acct, el, msgs, tok, avg, tpm, state) =>
+      const psMap = this._samplePs(binds.map(b => b.pid).filter(Boolean));
+      const row = (who, acct, el, msgs, tok, avg, tpm, mem, state) =>
         '   ' + rpad(who, 13) + rpad(acct, 8) + rpad(el, 7) + rpad(msgs, 6)
-        + rpad(tok, 8) + (wide ? rpad(avg, 8) + rpad(tpm, 8) : '') + state;
-      lines.push(dim(row('session', 'acct', 'elapsed', 'msgs', 'tokens', 'avg/m', 'tok/min', 'state')));
+        + rpad(tok, 8) + (wide ? rpad(avg, 8) + rpad(tpm, 8) : '') + rpad(mem, 8) + state;
+      lines.push(dim(row('session', 'acct', 'elapsed', 'msgs', 'tokens', 'avg/m', 'tok/min', 'mem/cpu', 'state')));
       const maxRows = 12;
+      let pm = 0;
       for (const b of binds.slice(0, maxRows)) {
         const who = (b.emoji ? b.emoji + ' ' : '') + (b.issue || b.sid8);
         const state = b.warm ? green('warm') : gray('idle ' + fmtDur(b.idleSec));
+        const ps = psMap[b.pid] || {};
+        if (ps.rssMB) pm += ps.rssMB;
+        const mem = ps.rssMB != null ? `${ps.rssMB}M/${ps.cpu}%` : '-';
         lines.push(row(who, b.account, fmtDur(b.elapsedSec), String(b.requests),
-          fmtN(b.tokens), fmtN(b.avgTokensPerMsg), fmtN(b.tokensPerMin), state));
+          fmtN(b.tokens), fmtN(b.avgTokensPerMsg), fmtN(b.tokensPerMin), mem, state));
       }
       if (binds.length > maxRows) lines.push('   ' + gray(`… +${binds.length - maxRows} more`));
       if (agg) {
         lines.push(bold(row('TOTAL', '', fmtDur(agg.elapsedSec), String(agg.requests),
-          fmtN(agg.tokens), fmtN(agg.avgTokensPerMsg), fmtN(agg.tokensPerMin), '')));
+          fmtN(agg.tokens), fmtN(agg.avgTokensPerMsg), fmtN(agg.tokensPerMin), pm ? pm + 'M' : '-', '')));
       }
     }
 
