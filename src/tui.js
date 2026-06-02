@@ -211,12 +211,14 @@ export class TUI {
     this.active.delete(id);
     const dur = r ? ((Date.now() - r.started) / 1000).toFixed(1) : '?';
     const acct = info.account || r?.account || '?';
-    this._addLog(`${info.method} ${info.path} → ${acct} (${info.status}, ${dur}s)`);
+    // D1DX (D-1728): routine 2xx request lines stay in the live Activity pane only;
+    // only non-2xx (errors / 429) persist to the daily log. Keeps the file minimal.
+    this._addLog(`${info.method} ${info.path} → ${acct} (${info.status}, ${dur}s)`, info.status >= 400);
   }
 
-  _addLog(msg) {
+  _addLog(msg, persist = true) {
     msg = msg.replace(/^\[TeamClaude\]\s*/, '');
-    appendOpLog(this.logDir, msg); // D-1680: persist to daily file — TUI-independent
+    if (persist) appendOpLog(this.logDir, msg); // D-1680: durable daily file; D-1728: signal-only
     this.log.unshift({ t: timestamp(), msg });
     if (this.log.length > 200) this.log.length = 200;
     if (this.running) this.render();

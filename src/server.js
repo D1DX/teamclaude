@@ -11,7 +11,12 @@ const HOP_BY_HOP_HEADERS = new Set([
 export function createProxyServer(accountManager, config, hooks = {}) {
   const upstream = config.upstream || 'https://api.anthropic.com';
   const proxyApiKey = config.proxy?.apiKey;
-  const logDir = config.logDir || null;
+  // D1DX (D-1728): per-request full-body dumps are OFF unless `logRequests` is
+  // explicitly true. This nulls the dump dir, so all the per-request log-section
+  // building + writeRequestLog calls below short-circuit on `if (logDir)`. The
+  // daily operational log (switches/throttles/binds/errors) is written separately
+  // via the console tee in index.js (resolveLogDir) and is unaffected.
+  const logDir = (config.logRequests === true && config.logDir) ? config.logDir : null;
   let requestCounter = 0;
 
   if (logDir) {

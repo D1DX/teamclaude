@@ -7,7 +7,7 @@ import { AccountManager } from './account-manager.js';
 import { createProxyServer } from './server.js';
 import { importCredentials, loginOAuth, fetchProfile, refreshAccessToken, isTokenExpiringSoon } from './oauth.js';
 import { TUI } from './tui.js';
-import { resolveLogDir, appendOpLog } from './oplog.js';
+import { resolveLogDir, appendOpLog, pruneOldLogs, setLogRetentionHours } from './oplog.js';
 
 const args = process.argv.slice(2);
 const command = args[0];
@@ -193,6 +193,11 @@ async function serverCommand() {
   // stdout/stderr are preserved (headless visibility + the pre-TUI startup flash).
   {
     const opLogDir = resolveLogDir(config);
+    // D1DX (D-1728): 24h log retention — set the window + prune once at startup
+    // (the opportunistic hourly prune in appendOpLog covers long-running uptime).
+    setLogRetentionHours(config.logRetentionHours ?? 24);
+    const pruned = pruneOldLogs(opLogDir);
+    if (pruned > 0) console.log(`[TeamClaude] Pruned ${pruned} log file(s) older than ${config.logRetentionHours ?? 24}h`);
     const origLog = console.log;
     const origErr = console.error;
     console.log = (...a) => { appendOpLog(opLogDir, a.join(' ')); origLog(...a); };

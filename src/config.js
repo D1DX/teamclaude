@@ -36,6 +36,11 @@ export function createDefaultConfig() {
     perAccountBackoffFloorSec: 60, // bounded per-account 429 backoff floor (replaces full-5h over-bench)
     perAccountBackoffCapSec: 600,  // bounded per-account 429 backoff cap
     perAccountBackoffFactor: 1.5,  // escalation per consecutive same-account 429
+    // D1DX (D-1728): minimal logs + auto-prune. Per-request full-body dumps are
+    // OFF by default (the daily operational log keeps the signal); flip to true
+    // only for deep debugging. Logs older than logRetentionHours are auto-deleted.
+    logRequests: false,            // write per-request full request/response dumps (verbose, ~MB each)
+    logRetentionHours: 24,         // auto-delete log files older than this (0 = never)
     accounts: [],
   };
 }
