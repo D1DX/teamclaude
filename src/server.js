@@ -8,6 +8,12 @@ const HOP_BY_HOP_HEADERS = new Set([
   'te', 'trailer', 'upgrade', 'proxy-authorization', 'proxy-authenticate',
 ]);
 
+// D1DX patch (D-1741): all-throttled HOLD-and-wait config. Set once in
+// createProxyServer from config; defaults cover configs predating the keys.
+// (Lives here, not on AccountManager, because D-1741 shares account-manager.js
+// with a live sibling session — see the D-1741 issue thread.)
+let HOLD = { budgetSec: 1800, pollSec: 5 };
+
 export function createProxyServer(accountManager, config, hooks = {}) {
   const upstream = config.upstream || 'https://api.anthropic.com';
   const proxyApiKey = config.proxy?.apiKey;
@@ -18,6 +24,12 @@ export function createProxyServer(accountManager, config, hooks = {}) {
   // via the console tee in index.js (resolveLogDir) and is unaffected.
   const logDir = (config.logRequests === true && config.logDir) ? config.logDir : null;
   let requestCounter = 0;
+
+  // D1DX patch (D-1741): resolve the all-throttled hold knobs once.
+  HOLD = {
+    budgetSec: Number.isFinite(config.allThrottledHoldBudgetSec) ? config.allThrottledHoldBudgetSec : 1800,
+    pollSec:   Number.isFinite(config.holdPollSec) ? config.holdPollSec : 5,
+  };
 
   if (logDir) {
     mkdir(logDir, { recursive: true }).catch(() => {});
@@ -163,22 +175,11 @@ async function forwardRequest(req, res, body, accountManager, upstream, retryCou
   const sessionId = req.headers['x-claude-code-session-id'] || null;
   const account = accountManager.getAccountForSession(sessionId);
   if (!account) {
-    ctx.status = 429;
-    ctx.account = '(none available)';
-    // D1DX patch (D-1705): real-reset-aware, escalating, jittered backoff.
-    const retryAfter = accountManager.allThrottledBackoff();
-    res.writeHead(429, {
-      'Content-Type': 'application/json',
-      'retry-after': String(retryAfter),
-    });
-    res.end(JSON.stringify({
-      type: 'error',
-      error: {
-        type: 'rate_limit_error',
-        message: `All ${accountManager.accounts.length} accounts exhausted. Retry in ${retryAfter}s.`,
-      },
-    }));
-    return;
+    // D1DX patch (D-1741): all accounts throttled at selection time — HOLD the
+    // inference request and poll for one to free up, instead of returning a 429
+    // that aborts the agent. (Was: immediate 429 with a real-reset-aware
+    // retry-after — that path still fires as the last-resort give-up below.)
+    return holdForThrottle(req, res, body, accountManager, upstream, hooks, reqId, ctx, logDir);
   }
 
   // Track which account handles this request
@@ -296,24 +297,12 @@ async function forwardRequest(req, res, body, accountManager, upstream, retryCou
         return forwardRequest(req, res, body, accountManager, upstream, retryCount + 1, hooks, reqId, ctx, logDir);
       }
 
-      // Retries exhausted — every account is throttled; tell the client to back off.
-      ctx.status = 429;
+      // D1DX patch (D-1741): every account 429'd this failover pass — HOLD the
+      // inference request and poll, instead of returning a 429 that aborts the
+      // agent. Under heavy parallel load this is almost always a cluster of
+      // transient header-less 429s that clear in ~60-140s.
       if (logDir) writeRequestLog(logDir, reqId, logSections);
-      if (!res.headersSent) {
-        const clientRetryAfter = accountManager.allThrottledBackoff();
-        res.writeHead(429, {
-          'Content-Type': 'application/json',
-          'retry-after': String(clientRetryAfter),
-        });
-        res.end(JSON.stringify({
-          type: 'error',
-          error: {
-            type: 'rate_limit_error',
-            message: `All ${accountManager.accounts.length} accounts rate-limited. Retry in ${clientRetryAfter}s.`,
-          },
-        }));
-      }
-      return;
+      return holdForThrottle(req, res, body, accountManager, upstream, hooks, reqId, ctx, logDir);
     }
     // --- end D1DX 429 patch ---
 
@@ -459,6 +448,101 @@ async function forwardRequest(req, res, body, accountManager, upstream, retryCou
       }));
     }
   }
+}
+
+/**
+ * D1DX patch (D-1741): all accounts throttled → HOLD the client and poll for an
+ * account to free up, instead of returning a 429 that aborts the agent. Under
+ * heavy parallel load the all-throttled state is almost always a cluster of
+ * transient header-less 429s that clear in ~60-140s (D-1728 bounded per-account
+ * backoff), so a held request becomes slower-but-successful. Mirrors the 5xx
+ * hold-and-backoff already in forwardRequest.
+ *
+ *  - Only inference (/v1/messages) is held; health / warmer / non-Claude-Code
+ *    traffic keeps the original immediate 429.
+ *  - Last-resort 429 is returned when the hold budget is spent, the client
+ *    disconnects, or EVERY account is genuinely hard-capped (real weekly/5h
+ *    exhaustion — holding would be pointless; resets are hours out).
+ *  - The hold budget (ctx.throttleHoldStart) is cumulative across both
+ *    all-throttled sites and across failover recursions for one client request.
+ */
+async function holdForThrottle(req, res, body, accountManager, upstream, hooks, reqId, ctx, logDir) {
+  ctx.account = ctx.account || '(none available)';
+
+  // Only hold inference. Health probes / warmer / non-CC clients get the fast 429.
+  const isInference = typeof req.url === 'string' && req.url.startsWith('/v1/messages');
+  if (!isInference) return sendAllThrottled429(res, accountManager, ctx);
+
+  if (ctx.throttleHoldStart == null) ctx.throttleHoldStart = Date.now();
+  const budgetMs = HOLD.budgetSec * 1000;
+  const elapsedMs = Date.now() - ctx.throttleHoldStart;
+  const remainingMs = budgetMs - elapsedMs;
+
+  // Give up: budget spent, client gone, or genuine exhaustion. allHardCapped is
+  // the real-vs-transient discriminator — a transiently-benched account is NOT
+  // hard-capped (its quota has headroom), so it is held for; a genuinely capped
+  // pool (quota ≥ ceiling / status rejected) resets hours out, so holding the
+  // full budget would just hang the agent before erroring anyway.
+  if (remainingMs <= 0 || res.destroyed || allHardCapped(accountManager)) {
+    if (res.destroyed) return;
+    return sendAllThrottled429(res, accountManager, ctx);
+  }
+
+  // Poll: short, anti-herd jitter, never past the remaining budget.
+  const baseMs = HOLD.pollSec * 1000;
+  const waitMs = Math.min(remainingMs, baseMs + Math.floor(Math.random() * baseMs));
+
+  ctx.throttleHolds = (ctx.throttleHolds || 0) + 1;
+  if (ctx.throttleHolds === 1 || ctx.throttleHolds % 6 === 0) {
+    console.log(`[TeamClaude] all accounts throttled — holding request ${reqId} (waited ${Math.round(elapsedMs / 1000)}s/${HOLD.budgetSec}s)`);
+  }
+  await new Promise(resolve => setTimeout(resolve, waitMs));
+  if (res.destroyed) return;
+
+  // Re-attempt from a clean failover budget — pool state changed during the wait.
+  return forwardRequest(req, res, body, accountManager, upstream, 0, hooks, reqId, ctx, logDir);
+}
+
+// D1DX patch (D-1741): true when EVERY account is at a genuine hard limit (real
+// quota exhaustion, not a transient bounded backoff). Read-only over public quota
+// fields — deliberately a local copy of AccountManager._atHardLimit, NOT an edit
+// to account-manager.js, because D-1741 shares that file with a live sibling
+// session (D-1739). Fold into an AccountManager.allHardCapped() method once the
+// sibling work lands (see the D-1741 issue thread).
+function allHardCapped(accountManager) {
+  const accounts = accountManager.accounts;
+  if (!accounts || accounts.length === 0) return false;
+  const thr = accountManager.switchThreshold ?? 0.98;
+  return accounts.every(a => {
+    const q = a.quota || {};
+    if (q.unifiedStatus === 'rejected') return true;
+    if (q.unified5h != null && q.unified5h >= thr) return true;
+    if (q.unified7d != null && q.unified7d >= thr) return true;
+    if (q.tokensLimit != null && q.tokensRemaining != null &&
+        (1 - q.tokensRemaining / q.tokensLimit) >= thr) return true;
+    if (q.requestsLimit != null && q.requestsRemaining != null &&
+        (1 - q.requestsRemaining / q.requestsLimit) >= thr) return true;
+    return false;
+  });
+}
+
+// The last-resort all-throttled 429 (unchanged behavior — real-reset-aware
+// retry-after via AccountManager.allThrottledBackoff()).
+function sendAllThrottled429(res, accountManager, ctx) {
+  ctx.status = 429;
+  if (res.headersSent) return;
+  const retryAfter = accountManager.allThrottledBackoff();
+  res.writeHead(429, {
+    'Content-Type': 'application/json',
+    'retry-after': String(retryAfter),
+  });
+  res.end(JSON.stringify({
+    type: 'error',
+    error: {
+      type: 'rate_limit_error',
+      message: `All ${accountManager.accounts.length} accounts throttled. Retry in ${retryAfter}s.`,
+    },
+  }));
 }
 
 /**
