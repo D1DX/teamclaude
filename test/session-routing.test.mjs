@@ -1,4 +1,7 @@
 import { AccountManager } from '../src/account-manager.js';
+import { mkdtempSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 
 // D1DX (D-1728): per-session cache-affinity routing + bounded per-account
 // backoff. No network — drives getAccountForSession / _pickAccountForBinding /
@@ -140,6 +143,46 @@ const H = 3600 * 1000, D = 24 * H;
   const agg = am.sessionAggregate();
   ok('aggregate sums sessions / messages / tokens across all bindings',
      agg.sessions === 2 && agg.requests === 2 && agg.tokens === 2000 && agg.avgTokensPerMsg === 1000); }
+
+// ── durable ledger (D-1728 S6): survives eviction, groups by issue ───────────
+{ const am = mk();
+  am._sessionRow = () => ({ pinned_issue: 'D-100' });  // stub registry
+  const acct = am.getAccountForSession('S1');
+  am.updateUsage(acct.index, 1000, 200, 'S1');          // 1 msg, 1200 tok
+  am.sessionBindings.delete('S1');                       // simulate idle-eviction
+  const bi = am.ledgerByIssue();
+  ok('ledger survives binding eviction (durable)',
+     bi.length === 1 && bi[0].issue === 'D-100' && bi[0].messages === 1 && bi[0].tokens === 1200); }
+
+{ const am = mk();
+  am._sessionRow = sid => ({ pinned_issue: sid === 'S3' ? 'D-200' : 'D-100' });
+  for (const s of ['S1', 'S2', 'S3']) { const a = am.getAccountForSession(s); am.updateUsage(a.index, 1000, 0, s); }
+  const bi = am.ledgerByIssue();
+  const d100 = bi.find(g => g.issue === 'D-100');
+  ok('per-issue rollup sums sessions sharing an issue',
+     bi.length === 2 && d100.sessions === 2 && d100.tokens === 2000); }
+
+{ const am = mk();
+  let issue = 'D-100';
+  am._sessionRow = () => ({ pinned_issue: issue });
+  const a = am.getAccountForSession('S1');
+  am.updateUsage(a.index, 1000, 0, 'S1');               // on D-100
+  issue = 'D-200';                                       // session re-pins mid-life
+  am.updateUsage(a.index, 500, 0, 'S1');                 // on D-200
+  const bi = am.ledgerByIssue();
+  ok('re-pin splits per-session usage cleanly by issue',
+     bi.length === 2 && bi.find(g => g.issue === 'D-100').tokens === 1000 && bi.find(g => g.issue === 'D-200').tokens === 500); }
+
+{ const dir = mkdtempSync(join(tmpdir(), 'tc-ledger-'));
+  const p = join(dir, 'usage-ledger.json');
+  const am = mk(); am._sessionRow = () => ({ pinned_issue: 'D-100' }); am.setLedgerPath(p);
+  const a = am.getAccountForSession('S1'); am.updateUsage(a.index, 1000, 200, 'S1');
+  am.saveLedger();
+  const am2 = mk(); am2.setLedgerPath(p); am2.loadLedger();   // restart simulation
+  const bi = am2.ledgerByIssue();
+  ok('ledger save/load round-trips across a restart',
+     bi.length === 1 && bi[0].issue === 'D-100' && bi[0].tokens === 1200 && bi[0].messages === 1);
+  rmSync(dir, { recursive: true, force: true }); }
 
 console.log(`\n${pass} passed, ${fail} failed`);
 process.exit(fail === 0 ? 0 : 1);

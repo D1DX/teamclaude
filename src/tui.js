@@ -458,6 +458,23 @@ export class TUI {
       }
     }
 
+    // ── By issue (D-1728 S6): durable per-issue usage rollup (ALL sessions,
+    // survives idle-eviction + restart). The operator's "all usage on the issue".
+    const byIssue = this.am.ledgerByIssue ? this.am.ledgerByIssue() : [];
+    if (byIssue.length > 0) {
+      lines.push('');
+      const iHdr = ` By issue ${cyan(byIssue.length)} `;
+      lines.push(iHdr + dim('─'.repeat(Math.max(1, W - vw(iHdr)))));
+      const irow = (a, b, c, d, e) => '   ' + rpad(a, 14) + rpad(b, 6) + rpad(c, 7) + rpad(d, 9) + e;
+      lines.push(dim(irow('issue', 'sess', 'msgs', 'tokens', 'avg/m')));
+      const tot = byIssue.reduce((a, g) => ({ s: a.s + g.sessions, m: a.m + g.messages, t: a.t + g.tokens }), { s: 0, m: 0, t: 0 });
+      for (const g of byIssue.slice(0, 8)) {
+        lines.push(irow(g.issue, String(g.sessions), String(g.messages), fmtN(g.tokens), fmtN(g.avgTokensPerMsg)));
+      }
+      if (byIssue.length > 8) lines.push('   ' + gray(`… +${byIssue.length - 8} more`));
+      lines.push(bold(irow('TOTAL', String(tot.s), String(tot.m), fmtN(tot.t), fmtN(tot.m ? Math.round(tot.t / tot.m) : 0))));
+    }
+
     // ── Activity header
     lines.push('');
     const ac = this.active.size;

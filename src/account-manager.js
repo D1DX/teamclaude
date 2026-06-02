@@ -1,5 +1,5 @@
 import { refreshAccessToken, isTokenExpiringSoon } from './oauth.js';
-import { readFileSync } from 'node:fs';
+import { readFileSync, writeFileSync, renameSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
 
@@ -96,6 +96,18 @@ export class AccountManager {
     this.perAccountBackoffCapSec   = opts.perAccountBackoffCapSec   ?? 600;
     this.perAccountBackoffFactor   = opts.perAccountBackoffFactor   ?? 1.5;
     this._sessionTagCache = { at: 0, rows: null }; // cached sessions.json read for emoji tags
+
+    // ── D1DX patch (D-1728 S6): durable per-issue usage ledger ──
+    // Survives idle-eviction AND proxy restart (unlike the live sessionBindings).
+    // Keyed by `sid::issue` so a session that re-pins to another issue splits
+    // cleanly. The source of truth for the per-issue dashboard + the Paperclip
+    // rollup (S7). Persisted to ~/teamclaude-logs/usage-ledger.json (debounced).
+    this.usageLedger = new Map(); // "sid::issue" -> { sid, issue, account, messages, inputTokens, outputTokens, firstSeenAt, lastActiveAt }
+    this.ledgerPath = null;       // set by setLedgerPath() at startup
+    this.ledgerRetentionMs = (opts.ledgerRetentionHours ?? 168) * 60 * 60 * 1000; // 7d default
+    this.ledgerSaveMs = (opts.ledgerSaveSec ?? 10) * 1000; // debounce window for disk writes
+    this._ledgerDirty = false;
+    this._ledgerLastSaveAt = 0;
   }
 
   // D1DX patch: actively sweep ALL accounts every request + on every status read,
@@ -361,6 +373,88 @@ export class AccountManager {
     };
   }
 
+  // ── D1DX patch (D-1728 S6): durable usage ledger ───────────────
+  setLedgerPath(p) { this.ledgerPath = p || null; }
+
+  // Load the ledger from disk at startup (best-effort) + prune stale entries.
+  loadLedger() {
+    if (!this.ledgerPath) return;
+    try {
+      const data = JSON.parse(readFileSync(this.ledgerPath, 'utf-8'));
+      const entries = Array.isArray(data?.entries) ? data.entries : [];
+      for (const e of entries) {
+        if (e && e.sid != null) this.usageLedger.set(`${e.sid}::${e.issue || ''}`, e);
+      }
+    } catch { /* missing/corrupt → start empty */ }
+    this._pruneLedger();
+  }
+
+  // Atomic save (tmp + rename) so a crash mid-write can't corrupt the ledger.
+  saveLedger() {
+    if (!this.ledgerPath) return;
+    try {
+      const entries = [...this.usageLedger.values()];
+      const tmp = this.ledgerPath + '.tmp';
+      writeFileSync(tmp, JSON.stringify({ version: 1, savedAt: Date.now(), entries }), { mode: 0o600 });
+      renameSync(tmp, this.ledgerPath);
+      this._ledgerDirty = false;
+      this._ledgerLastSaveAt = Date.now();
+    } catch { /* best-effort */ }
+  }
+
+  _pruneLedger() {
+    if (!this.ledgerRetentionMs) return;
+    const cutoff = Date.now() - this.ledgerRetentionMs;
+    for (const [k, e] of this.usageLedger) {
+      if ((e.lastActiveAt || 0) < cutoff) this.usageLedger.delete(k);
+    }
+  }
+
+  // Attribute one message's usage to the durable ledger (keyed by sid::issue).
+  _ledgerTouch(sessionId, accountName, inputTokens, outputTokens) {
+    if (!sessionId) return;
+    const issue = this._sessionRow(sessionId)?.pinned_issue || '';
+    const key = `${sessionId}::${issue}`;
+    let e = this.usageLedger.get(key);
+    const now = Date.now();
+    if (!e) {
+      e = { sid: sessionId, issue, account: accountName, messages: 0, inputTokens: 0, outputTokens: 0, firstSeenAt: now, lastActiveAt: now };
+      this.usageLedger.set(key, e);
+    }
+    e.account = accountName;
+    if (inputTokens) { e.messages++; e.inputTokens += inputTokens; }
+    if (outputTokens) e.outputTokens += outputTokens;
+    e.lastActiveAt = now;
+    this._ledgerDirty = true;
+  }
+
+  // Debounced disk write — called from the hot path; writes at most every ledgerSaveMs.
+  _maybeSaveLedger() {
+    if (!this.ledgerPath || !this._ledgerDirty) return;
+    if (Date.now() - this._ledgerLastSaveAt < this.ledgerSaveMs) return;
+    this.saveLedger();
+  }
+
+  // Per-issue rollup across ALL ledger entries (durable, all sessions). The
+  // operator's "all usage on the issue across all sessions" view.
+  ledgerByIssue() {
+    const byIssue = new Map();
+    for (const e of this.usageLedger.values()) {
+      const k = e.issue || '(unassigned)';
+      let g = byIssue.get(k);
+      if (!g) { g = { issue: k, sessions: 0, messages: 0, inputTokens: 0, outputTokens: 0, lastActiveAt: 0 }; byIssue.set(k, g); }
+      g.sessions++;
+      g.messages += e.messages || 0;
+      g.inputTokens += e.inputTokens || 0;
+      g.outputTokens += e.outputTokens || 0;
+      if ((e.lastActiveAt || 0) > g.lastActiveAt) g.lastActiveAt = e.lastActiveAt;
+    }
+    return [...byIssue.values()].map(g => {
+      const tokens = g.inputTokens + g.outputTokens;
+      return { ...g, tokens, avgTokensPerMsg: g.messages ? Math.round(tokens / g.messages) : 0 };
+    }).sort((a, c) => c.tokens - a.tokens);
+  }
+
   // ── D1DX patch: two-tier weekly-reserve selection ──────────────
   // Tier 1 (preferred): weekly utilization below the time-decayed reserve cap.
   // Tier 2 (reserve):   no preferred account left — dip into the reserve band
@@ -618,6 +712,9 @@ export class AccountManager {
         if (inputTokens) { sb.requests++; sb.inputTokens += inputTokens; }
         if (outputTokens) sb.outputTokens += outputTokens;
       }
+      // D-1728 S6: durable ledger (survives idle-eviction + restart).
+      this._ledgerTouch(sessionId, account.name, inputTokens, outputTokens);
+      this._maybeSaveLedger();
     }
   }
 
@@ -905,7 +1002,8 @@ export class AccountManager {
       switchThreshold: this.switchThreshold,
       weeklyReserve: this.weeklyReserve,
       sessionBindings: this.sessionBindingSummary(), // D1DX (D-1728): live session→account map
-      sessionAggregate: this.sessionAggregate(),     // D1DX (D-1728): dashboard TOTAL
+      sessionAggregate: this.sessionAggregate(),     // D1DX (D-1728): live dashboard TOTAL
+      usageByIssue: this.ledgerByIssue(),            // D1DX (D-1728 S6): durable per-issue rollup
       accounts: this.accounts.map(a => ({
         name: a.name,
         type: a.type,

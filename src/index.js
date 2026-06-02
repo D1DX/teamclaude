@@ -8,6 +8,7 @@ import { createProxyServer } from './server.js';
 import { importCredentials, loginOAuth, fetchProfile, refreshAccessToken, isTokenExpiringSoon } from './oauth.js';
 import { TUI } from './tui.js';
 import { resolveLogDir, appendOpLog, pruneOldLogs, setLogRetentionHours } from './oplog.js';
+import { join } from 'node:path';
 
 const args = process.argv.slice(2);
 const command = args[0];
@@ -110,8 +111,16 @@ async function serverCommand() {
     perAccountBackoffFloorSec: config.perAccountBackoffFloorSec ?? 60,
     perAccountBackoffCapSec: config.perAccountBackoffCapSec ?? 600,
     perAccountBackoffFactor: config.perAccountBackoffFactor ?? 1.5,
+    // D1DX (D-1728 S6): durable usage ledger tunables.
+    ledgerRetentionHours: config.ledgerRetentionHours ?? 168,
+    ledgerSaveSec: config.ledgerSaveSec ?? 10,
   };
   const accountManager = new AccountManager(accounts, threshold, weeklyReserve, rerankEvery, rerankMargin, allThrottledOpts);
+
+  // D1DX (D-1728 S6): durable per-issue usage ledger — load at startup so totals
+  // survive a restart; saved debounced on the hot path + on shutdown below.
+  accountManager.setLedgerPath(join(resolveLogDir(config), 'usage-ledger.json'));
+  accountManager.loadLedger();
 
   // Persist refreshed tokens back to config (re-read from disk to avoid clobbering
   // accounts added externally, e.g. by `teamclaude import` while server is running)
@@ -176,7 +185,7 @@ async function serverCommand() {
         if (!diskConfig) return 0;
         return syncAccountsFromDisk(diskConfig, config, accountManager);
       },
-      onQuit: () => { server.close(() => process.exit(0)); },
+      onQuit: () => { accountManager.saveLedger(); server.close(() => process.exit(0)); },
     });
     hooks = {
       onRequestStart: (id, info) => tui.onRequestStart(id, info),
@@ -252,10 +261,12 @@ async function serverCommand() {
   if (!tui) {
     process.on('SIGINT', () => {
       console.log('\n[TeamClaude] Shutting down...');
+      accountManager.saveLedger();
       server.close(() => process.exit(0));
     });
     process.on('SIGTERM', () => {
       console.log('\n[TeamClaude] Shutting down...');
+      accountManager.saveLedger();
       server.close(() => process.exit(0));
     });
   }
@@ -458,13 +469,15 @@ async function statusCommand() {
       console.log('');
     }
 
+    // D1DX (D-1728): dashboard formatters (shared by the live + per-issue views).
+    const fmtN = n => n == null ? '-' : n >= 1e6 ? (n / 1e6).toFixed(1) + 'M' : n >= 1e3 ? (n / 1e3).toFixed(1) + 'k' : String(n);
+    const fmtDur = s => { if (s < 60) return s + 's'; const m = Math.floor(s / 60); if (m < 60) return m + 'm'; const h = Math.floor(m / 60), rm = m % 60; if (h < 24) return rm ? `${h}h${rm}m` : `${h}h`; const d = Math.floor(h / 24); return `${d}d${h % 24}h`; };
+    const pad = (s, w) => String(s).padEnd(w);
+
     // D1DX (D-1728): live per-session cache-affinity dashboard + TOTAL.
     const binds = data.sessionBindings || [];
     const agg = data.sessionAggregate;
     if (binds.length > 0) {
-      const fmtN = n => n == null ? '-' : n >= 1e6 ? (n / 1e6).toFixed(1) + 'M' : n >= 1e3 ? (n / 1e3).toFixed(1) + 'k' : String(n);
-      const fmtDur = s => { if (s < 60) return s + 's'; const m = Math.floor(s / 60); if (m < 60) return m + 'm'; const h = Math.floor(m / 60), rm = m % 60; if (h < 24) return rm ? `${h}h${rm}m` : `${h}h`; const d = Math.floor(h / 24); return `${d}d${h % 24}h`; };
-      const pad = (s, w) => String(s).padEnd(w);
       console.log(`Sessions: ${binds.length} bound (${agg ? agg.warm : 0} warm)`);
       console.log('  ' + pad('session', 14) + pad('acct', 9) + pad('elapsed', 8) + pad('msgs', 6) + pad('tokens', 8) + pad('avg/m', 8) + pad('tok/min', 8) + 'state');
       for (const b of binds) {
@@ -473,6 +486,19 @@ async function statusCommand() {
         console.log('  ' + pad(who, 14) + pad(b.account, 9) + pad(fmtDur(b.elapsedSec), 8) + pad(b.requests, 6) + pad(fmtN(b.tokens), 8) + pad(fmtN(b.avgTokensPerMsg), 8) + pad(fmtN(b.tokensPerMin), 8) + state);
       }
       if (agg) console.log('  ' + pad('TOTAL', 14) + pad('', 9) + pad(fmtDur(agg.elapsedSec), 8) + pad(agg.requests, 6) + pad(fmtN(agg.tokens), 8) + pad(fmtN(agg.avgTokensPerMsg), 8) + pad(fmtN(agg.tokensPerMin), 8));
+      console.log('');
+    }
+
+    // D1DX (D-1728 S6): durable per-issue usage rollup (all sessions, survives restart).
+    const byIssue = data.usageByIssue || [];
+    if (byIssue.length > 0) {
+      console.log(`By issue: ${byIssue.length}`);
+      console.log('  ' + pad('issue', 14) + pad('sess', 6) + pad('msgs', 7) + pad('tokens', 9) + 'avg/m');
+      const tot = byIssue.reduce((a, g) => ({ s: a.s + g.sessions, m: a.m + g.messages, t: a.t + g.tokens }), { s: 0, m: 0, t: 0 });
+      for (const g of byIssue) {
+        console.log('  ' + pad(g.issue, 14) + pad(g.sessions, 6) + pad(g.messages, 7) + pad(fmtN(g.tokens), 9) + fmtN(g.avgTokensPerMsg));
+      }
+      console.log('  ' + pad('TOTAL', 14) + pad(tot.s, 6) + pad(tot.m, 7) + pad(fmtN(tot.t), 9) + fmtN(tot.m ? Math.round(tot.t / tot.m) : 0));
       console.log('');
     }
   } catch {

@@ -41,6 +41,9 @@ export function createDefaultConfig() {
     // only for deep debugging. Logs older than logRetentionHours are auto-deleted.
     logRequests: false,            // write per-request full request/response dumps (verbose, ~MB each)
     logRetentionHours: 24,         // auto-delete log files older than this (0 = never)
+    // D1DX (D-1728 S6): durable per-issue usage ledger.
+    ledgerRetentionHours: 168,     // keep ledger entries this long after last activity (7d)
+    ledgerSaveSec: 10,             // debounce window for ledger disk writes
     accounts: [],
   };
 }
