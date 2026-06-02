@@ -112,6 +112,24 @@ function timestamp() {
   return new Date().toLocaleTimeString('en-US', { hour12: false });
 }
 
+// D-1728 dashboard formatters.
+function fmtN(n) {
+  if (n == null) return '-';
+  if (n >= 1e6) return (n / 1e6).toFixed(n >= 1e7 ? 0 : 1) + 'M';
+  if (n >= 1e3) return (n / 1e3).toFixed(n >= 1e4 ? 0 : 1) + 'k';
+  return String(n);
+}
+function fmtDur(sec) {
+  if (sec == null) return '-';
+  if (sec < 60) return `${sec}s`;
+  const m = Math.floor(sec / 60);
+  if (m < 60) return `${m}m`;
+  const h = Math.floor(m / 60), rm = m % 60;
+  if (h < 24) return rm ? `${h}h${rm}m` : `${h}h`;
+  const d = Math.floor(h / 24);
+  return `${d}d${h % 24}h`;
+}
+
 // ── TUI class ────────────────────────────────────────────────
 
 export class TUI {
@@ -410,24 +428,31 @@ export class TUI {
       }
     }
 
-    // ── Sessions (D-1728): live per-session cache-affinity bindings, grouped by
-    // account. Emoji clusters come from the D1DX presence registry (best-effort).
+    // ── Sessions dashboard (D-1728): per-session cache-affinity + live usage,
+    // with a TOTAL across all sessions. Emoji + issue resolve from the D1DX
+    // presence registry (best-effort). Columns degrade gracefully when narrow.
     const binds = this.am.sessionBindingSummary ? this.am.sessionBindingSummary() : [];
     if (binds.length > 0) {
+      const agg = this.am.sessionAggregate ? this.am.sessionAggregate() : null;
       lines.push('');
-      const warmN = binds.filter(b => b.warm).length;
-      const sHdr = ` Sessions ${cyan(`${warmN} warm`)}/${binds.length} `;
+      const sHdr = ` Sessions ${cyan(`${agg ? agg.warm : 0} warm`)}/${binds.length} `;
       lines.push(sHdr + dim('─'.repeat(Math.max(1, W - vw(sHdr)))));
-      const byAcct = new Map();
-      for (const b of binds) {
-        if (!byAcct.has(b.account)) byAcct.set(b.account, []);
-        byAcct.get(b.account).push(b);
+      const wide = W >= 76;
+      const row = (who, acct, el, msgs, tok, avg, tpm, state) =>
+        '   ' + rpad(who, 13) + rpad(acct, 8) + rpad(el, 7) + rpad(msgs, 6)
+        + rpad(tok, 8) + (wide ? rpad(avg, 8) + rpad(tpm, 8) : '') + state;
+      lines.push(dim(row('session', 'acct', 'elapsed', 'msgs', 'tokens', 'avg/m', 'tok/min', 'state')));
+      const maxRows = 12;
+      for (const b of binds.slice(0, maxRows)) {
+        const who = (b.emoji ? b.emoji + ' ' : '') + (b.issue || b.sid8);
+        const state = b.warm ? green('warm') : gray('idle ' + fmtDur(b.idleSec));
+        lines.push(row(who, b.account, fmtDur(b.elapsedSec), String(b.requests),
+          fmtN(b.tokens), fmtN(b.avgTokensPerMsg), fmtN(b.tokensPerMin), state));
       }
-      for (const [acct, list] of byAcct) {
-        const cluster = list.map(b => b.emoji || gray('·')).join('');
-        const warmList = list.filter(b => b.warm).length;
-        const tail = gray(`${list.length} sess${warmList < list.length ? `, ${warmList} warm` : ''}`);
-        lines.push(`   ${rpad(acct, 12)} ${cluster}  ${tail}`);
+      if (binds.length > maxRows) lines.push('   ' + gray(`… +${binds.length - maxRows} more`));
+      if (agg) {
+        lines.push(bold(row('TOTAL', '', fmtDur(agg.elapsedSec), String(agg.requests),
+          fmtN(agg.tokens), fmtN(agg.avgTokensPerMsg), fmtN(agg.tokensPerMin), '')));
       }
     }
 

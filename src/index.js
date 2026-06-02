@@ -453,15 +453,21 @@ async function statusCommand() {
       console.log('');
     }
 
-    // D1DX (D-1728): live per-session cache-affinity bindings.
+    // D1DX (D-1728): live per-session cache-affinity dashboard + TOTAL.
     const binds = data.sessionBindings || [];
+    const agg = data.sessionAggregate;
     if (binds.length > 0) {
-      const warmN = binds.filter(b => b.warm).length;
-      console.log(`Sessions: ${binds.length} bound (${warmN} warm)`);
+      const fmtN = n => n == null ? '-' : n >= 1e6 ? (n / 1e6).toFixed(1) + 'M' : n >= 1e3 ? (n / 1e3).toFixed(1) + 'k' : String(n);
+      const fmtDur = s => { if (s < 60) return s + 's'; const m = Math.floor(s / 60); if (m < 60) return m + 'm'; const h = Math.floor(m / 60), rm = m % 60; if (h < 24) return rm ? `${h}h${rm}m` : `${h}h`; const d = Math.floor(h / 24); return `${d}d${h % 24}h`; };
+      const pad = (s, w) => String(s).padEnd(w);
+      console.log(`Sessions: ${binds.length} bound (${agg ? agg.warm : 0} warm)`);
+      console.log('  ' + pad('session', 14) + pad('acct', 9) + pad('elapsed', 8) + pad('msgs', 6) + pad('tokens', 8) + pad('avg/m', 8) + pad('tok/min', 8) + 'state');
       for (const b of binds) {
-        const state = b.warm ? 'warm' : `idle ${b.idleSec}s`;
-        console.log(`  ${b.emoji ? b.emoji + ' ' : ''}${b.sid8} → ${b.account}  (${state})`);
+        const who = (b.emoji ? b.emoji + ' ' : '') + (b.issue || b.sid8);
+        const state = b.warm ? 'warm' : `idle ${fmtDur(b.idleSec)}`;
+        console.log('  ' + pad(who, 14) + pad(b.account, 9) + pad(fmtDur(b.elapsedSec), 8) + pad(b.requests, 6) + pad(fmtN(b.tokens), 8) + pad(fmtN(b.avgTokensPerMsg), 8) + pad(fmtN(b.tokensPerMin), 8) + state);
       }
+      if (agg) console.log('  ' + pad('TOTAL', 14) + pad('', 9) + pad(fmtDur(agg.elapsedSec), 8) + pad(agg.requests, 6) + pad(fmtN(agg.tokens), 8) + pad(fmtN(agg.avgTokensPerMsg), 8) + pad(fmtN(agg.tokensPerMin), 8));
       console.log('');
     }
   } catch {

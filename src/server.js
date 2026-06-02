@@ -403,14 +403,14 @@ async function forwardRequest(req, res, body, accountManager, upstream, retryCou
 
     if (isStreaming) {
       const streamLog = logDir ? [] : null;
-      await streamResponse(upstreamRes.body, res, account.index, accountManager, streamLog);
+      await streamResponse(upstreamRes.body, res, account.index, accountManager, streamLog, sessionId);
       if (logDir) {
         logSections.push(`=== RESPONSE BODY (streamed) ===\n${streamLog.join('')}`);
         writeRequestLog(logDir, reqId, logSections);
       }
     } else {
       const buf = Buffer.from(await upstreamRes.arrayBuffer());
-      extractUsageFromBody(buf, account.index, accountManager);
+      extractUsageFromBody(buf, account.index, accountManager, sessionId);
       if (logDir) {
         try {
           logSections.push(`=== RESPONSE BODY ===\n${JSON.stringify(JSON.parse(buf.toString()), null, 2)}`);
@@ -459,7 +459,7 @@ async function forwardRequest(req, res, body, accountManager, upstream, retryCou
 /**
  * Stream an SSE response to the client, parsing usage data along the way.
  */
-async function streamResponse(webStream, res, accountIndex, accountManager, streamLog) {
+async function streamResponse(webStream, res, accountIndex, accountManager, streamLog, sessionId = null) {
   const reader = webStream.getReader();
   const decoder = new TextDecoder();
   let sseBuffer = '';
@@ -486,7 +486,7 @@ async function streamResponse(webStream, res, accountIndex, accountManager, stre
       sseBuffer = events.pop(); // keep incomplete event
 
       for (const event of events) {
-        parseSSEUsage(event, accountIndex, accountManager);
+        parseSSEUsage(event, accountIndex, accountManager, sessionId);
       }
 
       // Handle backpressure — also bail out if client disconnects,
@@ -502,7 +502,7 @@ async function streamResponse(webStream, res, accountIndex, accountManager, stre
 
     // Parse any remaining buffer
     if (sseBuffer.trim()) {
-      parseSSEUsage(sseBuffer, accountIndex, accountManager);
+      parseSSEUsage(sseBuffer, accountIndex, accountManager, sessionId);
     }
   } finally {
     // Cancel upstream reader to stop consuming data nobody needs
@@ -511,27 +511,27 @@ async function streamResponse(webStream, res, accountIndex, accountManager, stre
   }
 }
 
-function parseSSEUsage(event, accountIndex, accountManager) {
+function parseSSEUsage(event, accountIndex, accountManager, sessionId = null) {
   const dataLine = event.split('\n').find(l => l.startsWith('data: '));
   if (!dataLine) return;
 
   try {
     const data = JSON.parse(dataLine.slice(6));
     if (data.type === 'message_start' && data.message?.usage) {
-      accountManager.updateUsage(accountIndex, data.message.usage.input_tokens, 0);
+      accountManager.updateUsage(accountIndex, data.message.usage.input_tokens, 0, sessionId);
     } else if (data.type === 'message_delta' && data.usage) {
-      accountManager.updateUsage(accountIndex, 0, data.usage.output_tokens);
+      accountManager.updateUsage(accountIndex, 0, data.usage.output_tokens, sessionId);
     }
   } catch {
     // not valid JSON, skip
   }
 }
 
-function extractUsageFromBody(buffer, accountIndex, accountManager) {
+function extractUsageFromBody(buffer, accountIndex, accountManager, sessionId = null) {
   try {
     const json = JSON.parse(buffer.toString());
     if (json.usage) {
-      accountManager.updateUsage(accountIndex, json.usage.input_tokens, json.usage.output_tokens);
+      accountManager.updateUsage(accountIndex, json.usage.input_tokens, json.usage.output_tokens, sessionId);
     }
   } catch {
     // not JSON or no usage

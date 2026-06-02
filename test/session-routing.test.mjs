@@ -109,5 +109,37 @@ const H = 3600 * 1000, D = 24 * H;
   const a = am.getAccountForSession('S1');
   ok('an expired bench re-enters the pool (not falsely exhausted)', a != null); }
 
+// ── dashboard: per-session usage attribution ─────────────────────────────────
+{ const am = mk();
+  const acct = am.getAccountForSession('S1');
+  am.updateUsage(acct.index, 1000, 0, 'S1');   // message_start: 1 message, 1000 input
+  am.updateUsage(acct.index, 0, 200, 'S1');    // message_delta: 200 output
+  am.updateUsage(acct.index, 500, 0, 'S1');    // a 2nd message
+  am.updateUsage(acct.index, 0, 100, 'S1');
+  const row = am.sessionBindingSummary().find(b => b.sid === 'S1');
+  ok('per-session usage: 2 messages, 1800 tokens, avg 900/msg',
+     row.requests === 2 && row.tokens === 1800 && row.avgTokensPerMsg === 900);
+  // account totals updated too (no double-count regression)
+  ok('account usage still tracked alongside session usage',
+     am.accounts[acct.index].usage.totalInputTokens === 1500 && am.accounts[acct.index].usage.totalOutputTokens === 300); }
+
+// stats persist across a rebind (a session's work spans its account switches).
+{ const am = mk();
+  const acct = am.getAccountForSession('S1');
+  am.updateUsage(acct.index, 800, 100, 'S1');  // 1 msg, 900 tokens on the first account
+  am.markRateLimited(acct.index, 300);          // blocker → next call rebinds
+  const re = am.getAccountForSession('S1');
+  ok('rebind keeps the session on a different account', re.name !== acct.name);
+  const row = am.sessionBindingSummary().find(b => b.sid === 'S1');
+  ok('per-session stats persist across the rebind', row.requests === 1 && row.tokens === 900); }
+
+// ── dashboard: aggregate across all sessions ─────────────────────────────────
+{ const am = mk();
+  const a1 = am.getAccountForSession('S1'); am.updateUsage(a1.index, 1000, 200, 'S1');
+  const a2 = am.getAccountForSession('S2'); am.updateUsage(a2.index, 500, 300, 'S2');
+  const agg = am.sessionAggregate();
+  ok('aggregate sums sessions / messages / tokens across all bindings',
+     agg.sessions === 2 && agg.requests === 2 && agg.tokens === 2000 && agg.avgTokensPerMsg === 1000); }
+
 console.log(`\n${pass} passed, ${fail} failed`);
 process.exit(fail === 0 ? 0 : 1);

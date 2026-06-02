@@ -180,7 +180,15 @@ export class AccountManager {
     const reason = !b ? 'new session'
       : (now - b.lastUsedAt < this.cacheAffinityWindowMs) ? 'blocker'   // was warm; bound acct blocked/capped
       : 'window lapsed';
-    this.sessionBindings.set(sessionId, { index: chosen.index, lastUsedAt: now, boundAt: now });
+    // Preserve per-session stats across a rebind — a session's work spans its
+    // account switches (firstSeenAt = the session's true start, not the latest bind).
+    this.sessionBindings.set(sessionId, {
+      index: chosen.index, lastUsedAt: now, boundAt: now,
+      firstSeenAt: b?.firstSeenAt ?? now,
+      requests: b?.requests ?? 0,
+      inputTokens: b?.inputTokens ?? 0,
+      outputTokens: b?.outputTokens ?? 0,
+    });
     this.currentIndex = chosen.index; // keep TUI "active account" + homeIndex logic meaningful
     if (prevIdx !== chosen.index) {
       console.log(`[TeamClaude] Session ${this._sessionTag(sessionId)} → "${chosen.name}" (${reason})`);
@@ -265,15 +273,18 @@ export class AccountManager {
     }
   }
 
-  // Resolve a session's emoji from the D1DX presence registry (or null).
-  // Best-effort, cached ~5s. The x-claude-code-session-id header equals the
-  // registry SID minus the `cc-` prefix.
-  _sessionEmoji(sessionId) {
+  // Resolve a session's D1DX presence-registry row (or null). Best-effort,
+  // cached ~5s. The x-claude-code-session-id header equals the registry SID
+  // minus the `cc-` prefix.
+  _sessionRow(sessionId) {
     const rows = this._readSessionsRegistry();
     if (!rows) return null;
-    const row = rows.find(r => r && typeof r.sid === 'string'
-      && (r.sid === 'cc-' + sessionId || r.sid.endsWith(sessionId)));
-    return (row && row.emoji) || null;
+    return rows.find(r => r && typeof r.sid === 'string'
+      && (r.sid === 'cc-' + sessionId || r.sid.endsWith(sessionId))) || null;
+  }
+
+  _sessionEmoji(sessionId) {
+    return this._sessionRow(sessionId)?.emoji || null;
   }
 
   // Short display tag (emoji + short sid) for log lines; falls back to the sid.
@@ -295,24 +306,59 @@ export class AccountManager {
     return rows;
   }
 
-  // Snapshot of live session→account bindings for the TUI / status (D-1728).
+  // Snapshot of live session→account bindings + per-session usage for the
+  // dashboard (D-1728). tokens = input + output; avgTokensPerMsg = tokens /
+  // messages; tokensPerMin = throughput over the session's elapsed time.
   sessionBindingSummary() {
     const now = Date.now();
     const out = [];
     for (const [sid, b] of this.sessionBindings) {
       const acct = this.accounts[b.index];
       if (!acct) continue;
+      const row = this._sessionRow(sid);
+      const tokens = (b.inputTokens || 0) + (b.outputTokens || 0);
+      const reqs = b.requests || 0;
+      const elapsedSec = Math.max(1, Math.round((now - (b.firstSeenAt ?? now)) / 1000));
       out.push({
         sid,
         sid8: String(sid).slice(0, 8),
-        emoji: this._sessionEmoji(sid),
+        emoji: row?.emoji || null,
+        issue: row?.pinned_issue || null,
         tag: this._sessionTag(sid),
         account: acct.name,
         warm: now - b.lastUsedAt < this.cacheAffinityWindowMs,
         idleSec: Math.round((now - b.lastUsedAt) / 1000),
+        elapsedSec,
+        requests: reqs,
+        inputTokens: b.inputTokens || 0,
+        outputTokens: b.outputTokens || 0,
+        tokens,
+        avgTokensPerMsg: reqs ? Math.round(tokens / reqs) : 0,
+        tokensPerMin: Math.round(tokens / (elapsedSec / 60)),
       });
     }
-    return out.sort((a, c) => a.account.localeCompare(c.account));
+    return out.sort((a, c) => a.account.localeCompare(c.account) || c.tokens - a.tokens);
+  }
+
+  // Aggregate across all live sessions for the dashboard TOTAL (D-1728).
+  sessionAggregate() {
+    const now = Date.now();
+    let sessions = 0, warm = 0, requests = 0, inputTokens = 0, outputTokens = 0, earliest = now;
+    for (const b of this.sessionBindings.values()) {
+      sessions++;
+      if (now - b.lastUsedAt < this.cacheAffinityWindowMs) warm++;
+      requests += b.requests || 0;
+      inputTokens += b.inputTokens || 0;
+      outputTokens += b.outputTokens || 0;
+      if (b.firstSeenAt && b.firstSeenAt < earliest) earliest = b.firstSeenAt;
+    }
+    const tokens = inputTokens + outputTokens;
+    const elapsedSec = Math.max(1, Math.round((now - earliest) / 1000));
+    return {
+      sessions, warm, requests, inputTokens, outputTokens, tokens, elapsedSec,
+      avgTokensPerMsg: requests ? Math.round(tokens / requests) : 0,
+      tokensPerMin: Math.round(tokens / (elapsedSec / 60)),
+    };
   }
 
   // ── D1DX patch: two-tier weekly-reserve selection ──────────────
@@ -558,11 +604,21 @@ export class AccountManager {
   /**
    * Update cumulative token usage from response body data.
    */
-  updateUsage(accountIndex, inputTokens, outputTokens) {
+  updateUsage(accountIndex, inputTokens, outputTokens, sessionId = null) {
     const account = this.accounts[accountIndex];
     if (!account) return;
     if (inputTokens) account.usage.totalInputTokens += inputTokens;
     if (outputTokens) account.usage.totalOutputTokens += outputTokens;
+    // D-1728: per-session attribution for the live dashboard. message_start
+    // carries input_tokens (one per message → counts a "message"); message_delta
+    // carries output_tokens. Only attributes when the session still has a binding.
+    if (sessionId) {
+      const sb = this.sessionBindings.get(sessionId);
+      if (sb) {
+        if (inputTokens) { sb.requests++; sb.inputTokens += inputTokens; }
+        if (outputTokens) sb.outputTokens += outputTokens;
+      }
+    }
   }
 
   /**
@@ -849,6 +905,7 @@ export class AccountManager {
       switchThreshold: this.switchThreshold,
       weeklyReserve: this.weeklyReserve,
       sessionBindings: this.sessionBindingSummary(), // D1DX (D-1728): live session→account map
+      sessionAggregate: this.sessionAggregate(),     // D1DX (D-1728): dashboard TOTAL
       accounts: this.accounts.map(a => ({
         name: a.name,
         type: a.type,
