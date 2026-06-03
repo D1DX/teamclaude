@@ -1035,41 +1035,97 @@ export class AccountManager {
    * D1DX patch: warm all accounts at startup. Refreshes each OAuth
    * token, then fires one minimal request per account to anchor its 5h window
    * and populate the unified-ratelimit headers so selection isn't blind on
-   * request #1. Startup-only — no timer, no background loop (operator constraint).
-   * Best-effort: a failed warm logs and is skipped; it never blocks boot.
+   * request #1.
+   *
+   * D1DX (D-1763): the first pass is awaited (boot timing unchanged — still
+   * bounded by index.js's 15s deadline). Any account that fails on a NETWORK
+   * error (the proxy booted before Wi-Fi/VPN was up — `fetch failed`,
+   * ECONNREFUSED, ENOTFOUND, ETIMEDOUT) is retried by a BOUNDED, TERMINATING
+   * background pass (`_rewarmFailed`) that self-heals within ~75s and then
+   * stops. This is NOT a perpetual re-warm timer — it fires only after a failed
+   * boot-warm and exits once every account is anchored or its attempts are spent.
+   * An account that REACHED the API (any HTTP status, incl. 429) is considered
+   * anchored and is never retried.
+   * Best-effort throughout: nothing here ever blocks boot.
    */
   async warmAll(upstream = 'https://api.anthropic.com') {
     console.log(`[TeamClaude] Warming ${this.accounts.length} account(s) at startup...`);
+    const failed = [];
     await Promise.all(this.accounts.map(async (account) => {
       try {
-        await this.ensureTokenFresh(account.index);
-        const isOAuth = account.type === 'oauth';
-        const headers = { 'content-type': 'application/json', 'anthropic-version': '2023-06-01' };
-        if (isOAuth) {
-          headers['authorization'] = `Bearer ${account.credential}`;
-          headers['anthropic-beta'] = 'oauth-2025-04-20';
-        } else {
-          headers['x-api-key'] = account.credential;
-        }
-        const res = await fetch(`${upstream}/v1/messages`, {
-          method: 'POST',
-          headers,
-          body: JSON.stringify({
-            model: 'claude-haiku-4-5-20251001',
-            max_tokens: 1,
-            messages: [{ role: 'user', content: 'hi' }],
-          }),
-        });
-        const rl = {};
-        for (const [k, v] of res.headers.entries()) {
-          if (k.startsWith('anthropic-ratelimit-')) rl[k] = v;
-        }
-        this.updateQuota(account.index, rl);
-        await res.body?.cancel?.();
-        const w = account.quota.unified7d != null ? `${(account.quota.unified7d * 100).toFixed(0)}%` : '?';
-        console.log(`[TeamClaude] Warmed "${account.name}" (HTTP ${res.status}, weekly ${w})`);
+        await this.warmOne(account, upstream);
       } catch (err) {
         console.error(`[TeamClaude] Warm failed for "${account.name}": ${err.message}`);
+        failed.push(account.index);
+      }
+    }));
+    // D-1763: self-heal a cold-network boot. Detached (not awaited) so it outlives
+    // the index.js 15s boot deadline; bounded + terminating so it isn't a timer.
+    if (failed.length > 0) {
+      this._rewarmFailed(failed, upstream).catch(() => {});
+    }
+  }
+
+  /**
+   * Single warm attempt for one account. Refreshes the token, fires the minimal
+   * request, folds the rate-limit headers into quota. Resolves once the API was
+   * REACHED (returns the HTTP status — any status anchors the window); throws on
+   * a network/token error so the caller can decide whether to retry. (D-1763)
+   */
+  async warmOne(account, upstream = 'https://api.anthropic.com') {
+    await this.ensureTokenFresh(account.index);
+    const isOAuth = account.type === 'oauth';
+    const headers = { 'content-type': 'application/json', 'anthropic-version': '2023-06-01' };
+    if (isOAuth) {
+      headers['authorization'] = `Bearer ${account.credential}`;
+      headers['anthropic-beta'] = 'oauth-2025-04-20';
+    } else {
+      headers['x-api-key'] = account.credential;
+    }
+    const res = await fetch(`${upstream}/v1/messages`, {
+      method: 'POST',
+      headers,
+      body: JSON.stringify({
+        model: 'claude-haiku-4-5-20251001',
+        max_tokens: 1,
+        messages: [{ role: 'user', content: 'hi' }],
+      }),
+    });
+    const rl = {};
+    for (const [k, v] of res.headers.entries()) {
+      if (k.startsWith('anthropic-ratelimit-')) rl[k] = v;
+    }
+    this.updateQuota(account.index, rl);
+    await res.body?.cancel?.();
+    const w = account.quota.unified7d != null ? `${(account.quota.unified7d * 100).toFixed(0)}%` : '?';
+    console.log(`[TeamClaude] Warmed "${account.name}" (HTTP ${res.status}, weekly ${w})`);
+    return res.status;
+  }
+
+  /**
+   * D-1763: bounded background re-warm for accounts whose boot-warm failed on a
+   * network error. Per account, retry on a fixed backoff schedule until the API
+   * is reached or attempts are exhausted, then STOP. Terminating by construction
+   * — no timer, no perpetual loop. Each account is retried independently so a
+   * single still-dead account doesn't hold up the others.
+   */
+  async _rewarmFailed(indices, upstream, backoffsSec = [5, 10, 20, 40]) {
+    const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+    console.log(`[TeamClaude] Scheduling background re-warm for ${indices.length} account(s) that failed at boot (network not ready).`);
+    await Promise.all(indices.map(async (index) => {
+      const account = this.accounts[index];
+      if (!account) return;
+      for (let attempt = 0; attempt < backoffsSec.length; attempt++) {
+        await sleep(backoffsSec[attempt] * 1000);
+        try {
+          await this.warmOne(account, upstream);
+          console.log(`[TeamClaude] Late-warmed "${account.name}" on retry ${attempt + 1}/${backoffsSec.length}.`);
+          return; // reached the API — anchored, done
+        } catch (err) {
+          if (attempt === backoffsSec.length - 1) {
+            console.error(`[TeamClaude] Re-warm gave up for "${account.name}" after ${backoffsSec.length} retries: ${err.message}`);
+          }
+        }
       }
     }));
   }
