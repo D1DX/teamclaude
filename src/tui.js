@@ -546,8 +546,8 @@ export class TUI {
         const who = padW((a.emoji || '·') + ' ' + (a.issue || a.sid8 || '—'), 13);
         const chip = padW(a.status ? statusChip(a.status) : gray('·'), 8);
         const state = padW(a.bound ? (a.warm ? green('live') : gray('idle')) : gray('—'), 6);
-        const cost = padW(a.bound ? green('$' + this._cost(a.inTok, a.outTok).toFixed(1)) : gray('—'), 7);
-        let line = '     ' + mark + ' ' + who + chip + state + cost;
+        const tok = padW(a.bound ? green(fmtN(a.tokens)) : gray('—'), 7);
+        let line = '     ' + mark + ' ' + who + chip + state + tok;
         const intent = a.intent ? a.intent.replace(/^solo:\s*/, '') : '';
         if (intent) {
           const tag = (a.intent && a.intent.startsWith('solo:')) ? cyan('solo ') : '';
@@ -564,7 +564,7 @@ export class TUI {
         let rin = 0, rout = 0, live = 0;
         for (const a of list) { rin += a.inTok; rout += a.outTok; if (a.warm) live++; }
         const roll = list.length
-          ? `${cyan(list.length + (list.length === 1 ? ' agent' : ' agents'))}${live ? ' · ' + green(live + ' live') : ''} · ${green('$' + this._cost(rin, rout).toFixed(1))}`
+          ? `${cyan(list.length + (list.length === 1 ? ' agent' : ' agents'))}${live ? ' · ' + green(live + ' live') : ''} · ${green(fmtN(rin + rout) + ' tok')}`
           : gray('· no agents ·');
         lines.push('');
         lines.push(this._renderAcctHeader(i, bw, showBoth, roll));
@@ -730,7 +730,7 @@ export class TUI {
     }
 
     let line = ` ${sel}${glyph} ${name} ${status} ${l1}${bar(r1, bw, t1)}`;
-    if (showBoth) line += ` ${l2}${bar(r2, bw, t2)}`;
+    if (showBoth) line += `   ${l2}${bar(r2, bw, t2)}`;
     line += `  ${roll}`;
     return line;
   }
