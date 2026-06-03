@@ -23,6 +23,23 @@ const ANSI_RE = /\x1b\[[0-9;]*m/g;
 const strip = s => s.replace(ANSI_RE, '');
 const vw = s => strip(s).length;
 
+// D-1739: true display width — emojis + CJK occupy TWO terminal cells, so
+// counting them as 1 (string length) is exactly what makes emoji columns ragged.
+// Strip ANSI, then sum cell widths; combining marks / VS16 / ZWJ contribute 0.
+const WIDE_RE = /[\u{1100}-\u{115F}\u{2E80}-\u{303E}\u{3041}-\u{33FF}\u{3400}-\u{4DBF}\u{4E00}-\u{9FFF}\u{A000}-\u{A4CF}\u{AC00}-\u{D7A3}\u{F900}-\u{FAFF}\u{FE30}-\u{FE6F}\u{FF00}-\u{FF60}\u{FFE0}-\u{FFE6}\u{1F000}-\u{1FAFF}\u{2600}-\u{26FF}\u{2700}-\u{27BF}\u{2B00}-\u{2BFF}\u{1F1E6}-\u{1F1FF}]/u;
+function dw(s) {
+  let w = 0;
+  for (const ch of strip(s)) {
+    const cp = ch.codePointAt(0);
+    if (cp === 0xFE0F || cp === 0x200D || (cp >= 0x0300 && cp <= 0x036F)) continue;
+    w += WIDE_RE.test(ch) ? 2 : 1;
+  }
+  return w;
+}
+// right-pad / left-pad (right-align) to a display width measured in cells
+function padW(s, w) { const g = w - dw(s); return g > 0 ? s + ' '.repeat(g) : s; }
+function lpadW(s, w) { const g = w - dw(s); return g > 0 ? ' '.repeat(g) + s : s; }
+
 function rpad(s, w) {
   const gap = w - vw(s);
   return gap > 0 ? s + ' '.repeat(gap) : s;
@@ -447,114 +464,120 @@ export class TUI {
       lines.push(' ' + gray(`proxy ${sys.proxyRssMB}MB · up ${fmtDur(sys.proxyUptimeSec)}    host RAM ${gb(sys.usedMemMB)}/${gb(sys.totalMemMB)}GB (${sys.usedMemPct}%) · load ${sys.loadAvg[0]} · ${sys.cpuCount} cpus`));
     }
 
-    // ── Fleet control plane (D-1739): sessions grouped by account; each agent
-    // shows emoji + intent + alive/idle + issue status + $ burn. The presence
-    // registry is the spine (all live agents, incl. ones the proxy never routed);
-    // the proxy binding enriches with account + $ where it exists. All reads
-    // are local + credential-free + best-effort.
+    // ── Fleet control plane (D-1739): every live agent clustered UNDER its
+    // account — current binding OR last-known account from the durable ledger —
+    // shown with its emoji + a status word + $ burn + activity. The registry is
+    // the spine; binding + ledger enrich. Local, credential-free, best-effort.
     const binds = this.am.sessionBindingSummary ? this.am.sessionBindingSummary() : [];
     const agg = this.am.sessionAggregate ? this.am.sessionAggregate() : null;
     const fleet = this.am.fleetRows ? this.am.fleetRows() : [];
+    const lastAcct = this.am.ledgerBySid ? this.am.ledgerBySid() : new Map();
+    const bareOf = sid => String(sid).replace(/^cc-/, '');
+    const bindByBare = new Map(binds.map(b => [bareOf(b.fullSid), b]));
+    const needsYouP = p => !!(p && (p.status === 'blocked' || p.status === 'in_review' || p.assigneeUserId));
 
-    // bucket proxy-bound sessions by account; index the whole fleet for merge
-    const byAcct = new Map();
-    for (const b of binds) {
-      if (!byAcct.has(b.account)) byAcct.set(b.account, []);
-      byAcct.get(b.account).push(b);
-    }
-    const boundSids = new Set(binds.map(b => b.fullSid));
-    const unbound = fleet.filter(f => !boundSids.has(f.sid));
+    // resolve every registry agent → account (current OR last-known) + live data
+    const agents = fleet.map(f => {
+      const bare = bareOf(f.sid);
+      const b = bindByBare.get(bare) || null;
+      return {
+        emoji: f.emoji, issue: f.issue, intent: f.intent, sid8: bare.slice(0, 8),
+        status: f.pin?.status || null, needsYou: needsYouP(f.pin),
+        account: b?.account || lastAcct.get(bare)?.account || null,
+        bound: !!b, warm: b?.warm || false, idleSec: b?.idleSec ?? null,
+        tokens: b?.tokens || 0, inTok: b?.inputTokens || 0, outTok: b?.outputTokens || 0,
+      };
+    });
 
-    // collision = 2+ live agents pinned to the same issue (sibling-clobber risk)
+    // collisions + attention counts across the whole fleet
     const issueCount = new Map();
-    for (const f of fleet) { if (f.issue) issueCount.set(f.issue, (issueCount.get(f.issue) || 0) + 1); }
-    const collisionIssues = new Set([...issueCount].filter(([, n]) => n > 1).map(([k]) => k));
-    const needsYouRow = p => !!(p && (p.status === 'blocked' || p.status === 'in_review' || p.assigneeUserId));
-    const fleetNeedsYou = fleet.filter(f => needsYouRow(f.pin)).length;
+    for (const a of agents) if (a.issue) issueCount.set(a.issue, (issueCount.get(a.issue) || 0) + 1);
+    const collide = new Set([...issueCount].filter(([, n]) => n > 1).map(([k]) => k));
+    const fleetNeedsYou = agents.filter(a => a.needsYou).length;
+    const warmCount = agents.filter(a => a.warm).length;
 
     // edge-fired alert bell (terminal bell + in-view flag only; never per-frame)
-    const alertKey = `${[...collisionIssues].sort().join(',')}|${fleetNeedsYou}`;
-    const hasAlert = collisionIssues.size > 0 || fleetNeedsYou > 0;
+    const alertKey = `${[...collide].sort().join(',')}|${fleetNeedsYou}`;
+    const hasAlert = collide.size > 0 || fleetNeedsYou > 0;
     if (this.bell !== false && hasAlert && alertKey !== this._lastAlertKey) process.stdout.write('\x07');
     this._lastAlertKey = hasAlert ? alertKey : '';
 
-    // status chip: abbreviated + colored issue status from the local pin overlay
+    // bucket agents under their resolved account; the rest into an unrouted tail
+    const byAcct = new Map();
+    const unrouted = [];
+    for (const a of agents) {
+      if (a.account) { if (!byAcct.has(a.account)) byAcct.set(a.account, []); byAcct.get(a.account).push(a); }
+      else unrouted.push(a);
+    }
+
+    // status chip — short colored word from the local pin status (60-30-10:
+    // color does the work). Empty for unknown/no-pin.
     const statusChip = st => {
-      if (!st) return rpad('', 5);
       const m = {
-        in_progress: ['prog', green], blocked: ['blk', red], in_review: ['rev', yellow],
-        todo: ['todo', cyan], backlog: ['bklg', gray], done: ['done', dim], cancelled: ['canc', gray],
+        in_progress: [green, 'work'], blocked: [red, 'block'], in_review: [yellow, 'review'],
+        todo: [cyan, 'todo'], backlog: [gray, 'queued'], done: [dim, 'done'], cancelled: [gray, 'cancel'],
       };
-      const [lbl, col] = m[st] || [st.slice(0, 4), gray];
-      return rpad(col(lbl), 5);
-    };
-    // one session row: needs-you mark | emoji+issue | collision | status | state | tok | $ | solo | intent
-    const sessRow = (b, bound) => {
-      const mark = needsYouRow({ status: b.status, assigneeUserId: b.assigneeUserId }) ? red('>') : ' ';
-      const who = (b.emoji || '.') + ' ' + (b.issue || b.sid8 || '--');
-      const coll = collisionIssues.has(b.issue) ? yellow('!') : ' ';
-      const state = bound ? (b.warm ? green('alive') : gray('idle ' + fmtDur(b.idleSec))) : gray('-');
-      const tok = bound ? fmtN(b.tokens) : '';
-      const cost = bound ? green('$' + this._cost(b.inputTokens, b.outputTokens).toFixed(1)) : '';
-      const solo = (b.intent && b.intent.startsWith('solo:')) ? cyan('@') : ' ';
-      let line = '  ' + mark + ' ' + rpad(who, 11) + coll + ' ' + statusChip(b.status)
-        + rpad(state, 9) + rpad(tok, 6) + rpad(cost, 7) + solo;
-      if (b.intent) {
-        const room = W - vw(line) - 4;
-        if (room > 6) line += ' ' + dim('> ' + b.intent.replace(/^solo:\s*/, '').slice(0, room));
-      }
-      return line;
+      const e = m[st];
+      return e ? e[0](e[1]) : '';
     };
 
+    // ══ Accounts — each account, with the agents using it clustered below ══
     if (this.am.accounts.length === 0) {
       lines.push('');
       lines.push(yellow('  No accounts configured. Press [a] to add one.'));
     } else {
-      lines.push('');
       const showBoth = W >= 70;
       const aggCost = agg ? this._cost(agg.inputTokens, agg.outputTokens) : 0;
       const bw = showBoth
-        ? Math.max(5, Math.min(14, Math.floor((W - 64) / 2)))
-        : Math.max(5, Math.min(14, W - 50));
+        ? Math.max(5, Math.min(16, Math.floor((W - 60) / 2)))
+        : Math.max(5, Math.min(16, W - 48));
 
-      // Fleet header: the one-glance answer — alive | warm | needs-you | collisions | tok | $
-      const warm = agg ? agg.warm : 0;
-      let hL = ` Fleet  ${cyan(fleet.length + ' alive')} · ${warm} warm`;
-      if (fleetNeedsYou > 0) hL += ` · ${red(fleetNeedsYou + ' >')}`;
-      if (collisionIssues.size > 0) hL += ` · ${yellow(collisionIssues.size + ' !')}`;
-      const hR = agg ? `${fmtN(agg.tokens)} tok · ${green('$' + aggCost.toFixed(2))} ▲ ` : ' ';
-      lines.push(hL + ' '.repeat(Math.max(1, W - vw(hL) - vw(hR))) + hR);
-      lines.push(' ' + dim('─'.repeat(W - 2)));
+      // fleet one-glance summary
+      let sH = ` Fleet  ${cyan(agents.length + ' agents')} · ${green(warmCount + ' warm')}`;
+      if (fleetNeedsYou > 0) sH += ` · ${red(fleetNeedsYou + ' needs-you')}`;
+      if (collide.size > 0) sH += ` · ${yellow(collide.size + ' collide')}`;
+      const sHR = `${fmtN(agg ? agg.tokens : 0)} tok · ${green('$' + aggCost.toFixed(2))} ▲ `;
+      lines.push('');
+      lines.push(sH + ' '.repeat(Math.max(1, W - dw(sH) - dw(sHR))) + sHR);
 
+      // one agent row, indented under its account
+      const agentRow = a => {
+        const mark = a.needsYou ? red('►') : (collide.has(a.issue) ? yellow('◆') : ' ');
+        const who = padW((a.emoji || '·') + ' ' + (a.issue || a.sid8 || '—'), 13);
+        const chip = padW(a.status ? statusChip(a.status) : gray('·'), 8);
+        const state = padW(a.bound ? (a.warm ? green('live') : gray('idle')) : gray('—'), 6);
+        const cost = padW(a.bound ? green('$' + this._cost(a.inTok, a.outTok).toFixed(1)) : gray('—'), 7);
+        let line = '     ' + mark + ' ' + who + chip + state + cost;
+        const intent = a.intent ? a.intent.replace(/^solo:\s*/, '') : '';
+        if (intent) {
+          const tag = (a.intent && a.intent.startsWith('solo:')) ? cyan('solo ') : '';
+          const room = W - dw(line) - 2 - dw(tag);
+          if (room > 8) line += tag + dim(intent.slice(0, room));
+        }
+        return line;
+      };
+
+      // each account header, then the agents using it (attention-first)
       for (let i = 0; i < this.am.accounts.length; i++) {
         const acct = this.am.accounts[i];
-        const sess = byAcct.get(acct.name) || [];
-        let rin = 0, rout = 0;
-        for (const s of sess) { rin += s.inputTokens || 0; rout += s.outputTokens || 0; }
-        const roll = sess.length
-          ? `${sess.length} sess · ${green('$' + this._cost(rin, rout).toFixed(1))}`
-          : gray('0 sess');
+        const list = byAcct.get(acct.name) || [];
+        let rin = 0, rout = 0, live = 0;
+        for (const a of list) { rin += a.inTok; rout += a.outTok; if (a.warm) live++; }
+        const roll = list.length
+          ? `${cyan(list.length + (list.length === 1 ? ' agent' : ' agents'))}${live ? ' · ' + green(live + ' live') : ''} · ${green('$' + this._cost(rin, rout).toFixed(1))}`
+          : gray('· no agents ·');
+        lines.push('');
         lines.push(this._renderAcctHeader(i, bw, showBoth, roll));
-        if (sess.length === 0) { lines.push('     ' + gray('(no live sessions)')); continue; }
-        for (const b of sess) lines.push(sessRow(b, true)); // ALL sessions — no cap (operator)
+        if (!list.length) continue;
+        list.sort((x, y) => (Number(y.needsYou) - Number(x.needsYou)) || (Number(y.warm) - Number(x.warm)) || (y.tokens - x.tokens));
+        for (const a of list) lines.push(agentRow(a));
       }
 
-      // single aggregate TOTAL across all proxy-bound sessions
-      if (agg && binds.length > 0) {
-        lines.push('  ' + bold(rpad('   TOTAL', 29)) + bold(rpad(fmtN(agg.tokens), 6))
-          + bold(green('$' + aggCost.toFixed(2))));
-      }
-
-      // light whole-fleet: registry agents the proxy hasn't routed (still alive)
-      if (unbound.length > 0) {
-        lines.push(' ' + gray('◆ ') + gray(rpad('Registered', 12)) + gray('(no proxy traffic)')
-          + '  ' + gray(unbound.length + ' sess'));
-        for (const f of unbound) {
-          lines.push(sessRow({
-            emoji: f.emoji, issue: f.issue, sid8: String(f.sid).replace(/^cc-/, '').slice(0, 8),
-            intent: f.intent, status: f.pin?.status || null, assigneeUserId: f.pin?.assigneeUserId || null,
-          }, false));
-        }
+      // agents with no account history (never routed through the proxy)
+      if (unrouted.length > 0) {
+        lines.push('');
+        lines.push('  ' + dim('· no account history ·') + '  ' + gray(unrouted.length));
+        for (const a of unrouted) lines.push(agentRow(a));
       }
     }
 

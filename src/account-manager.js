@@ -360,6 +360,22 @@ export class AccountManager {
     }));
   }
 
+  // D-1739: bare-sid → last-known account name, from the durable ledger (survives
+  // restart + idle eviction). Lets the Deck cluster a registry agent UNDER the
+  // account that last served it even with no current binding — so idle / just-
+  // restarted agents still group by account instead of floating in a flat list.
+  ledgerBySid() {
+    const bySid = new Map();
+    for (const e of this.usageLedger.values()) {
+      if (!e.sid || !e.account) continue;
+      const prev = bySid.get(e.sid);
+      if (!prev || (e.lastActiveAt || 0) > prev.lastActiveAt) {
+        bySid.set(e.sid, { account: e.account, lastActiveAt: e.lastActiveAt || 0 });
+      }
+    }
+    return bySid; // Map<bareSid, { account, lastActiveAt }>
+  }
+
   // Process + system resource snapshot for the dashboard (D-1728 S8). Cheap —
   // os + process only, no `ps` (per-instance mem/cpu is resolved by the caller
   // from each session's pid, since that needs a shell-out we keep off this path).
