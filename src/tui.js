@@ -489,6 +489,7 @@ export class TUI {
       return {
         emoji: f.emoji, issue: f.issue, intent: f.intent, sid8: bare.slice(0, 8),
         status: f.pin?.status || null, needsYou: needsYouP(f.pin),
+        inflight: !!f.inflight, // D-1739: a tool is executing right now
         account: b?.account || lastAcct.get(bare)?.account || null,
         bound: !!b, warm: b?.warm || false, idleSec: b?.idleSec ?? null,
         tokens: b?.tokens || 0, inTok: b?.inputTokens || 0, outTok: b?.outputTokens || 0,
@@ -552,8 +553,10 @@ export class TUI {
         const who = padW((a.emoji || '·') + ' ' + (a.issue || a.sid8 || '—'), 13);
         const chip = padW(a.status ? statusChip(a.status) : gray('·'), 8);
         const state = padW(a.bound ? (a.warm ? green('live') : gray('idle')) : gray('—'), 6);
+        // D-1739: activity glyph — ⚙ tool executing, ~ LLM responding/active, blank idle.
+        const act = padW(a.inflight ? cyan('⚙') : (a.warm ? dim('~') : ' '), 3);
         const tok = padW(a.bound ? green(fmtN(a.tokens)) : gray('—'), 7);
-        let line = '     ' + mark + ' ' + who + chip + state + tok;
+        let line = '     ' + mark + ' ' + who + chip + state + act + tok;
         const intent = a.intent ? a.intent.replace(/^solo:\s*/, '') : '';
         if (intent) {
           const tag = (a.intent && a.intent.startsWith('solo:')) ? cyan('solo ') : '';
@@ -594,16 +597,22 @@ export class TUI {
 
     // ── By issue (D-1728 S6): durable per-issue usage rollup (ALL sessions,
     // survives idle-eviction + restart). The operator's "all usage on the issue".
-    const byIssue = this.am.ledgerByIssue ? this.am.ledgerByIssue() : [];
+    // D-1739: issue → live session emoji(s) + the set of issues with a live
+    // session. By-issue shows ONLY active issues (operator: history is in
+    // Paperclip); ledger-only issues with no live session are dropped entirely.
+    const emojiByIssue = new Map();
+    const liveIssues = new Set();
+    for (const a of agents) {
+      if (!a.issue) continue;
+      liveIssues.add(a.issue);
+      if (!a.emoji) continue;
+      const cur = emojiByIssue.get(a.issue) || [];
+      if (!cur.includes(a.emoji)) cur.push(a.emoji);
+      emojiByIssue.set(a.issue, cur);
+    }
+    const byIssue = (this.am.ledgerByIssue ? this.am.ledgerByIssue() : [])
+      .filter(g => liveIssues.has(g.issue));
     if (byIssue.length > 0) {
-      // D-1739: issue → live session emoji(s). Up to 2 (collisions) keep the cell narrow.
-      const emojiByIssue = new Map();
-      for (const a of agents) {
-        if (!a.issue || !a.emoji) continue;
-        const cur = emojiByIssue.get(a.issue) || [];
-        if (!cur.includes(a.emoji)) cur.push(a.emoji);
-        emojiByIssue.set(a.issue, cur);
-      }
       const issueLabel = iss => {
         const e = emojiByIssue.get(iss);
         return e && e.length ? e.slice(0, 2).join('') + ' ' + iss : iss;

@@ -357,7 +357,23 @@ export class AccountManager {
       started: r.started || null,
       lastHeartbeat: r.last_heartbeat || null,
       pin: this._sessionPin(r.sid),
+      inflight: this._sessionInflight(r.sid), // D-1739: ⚙ a tool is executing right now (D-1749 marker)
     }));
+  }
+
+  // D-1739: is a tool currently executing in this session? Reads the D-1749
+  // `tool-inflight` marker (written by pre-tool-inflight.sh, cleared by the
+  // post hook). Fresh-guarded (≤120s) so a marker orphaned by a crashed session
+  // doesn't show ⚙ forever. Best-effort, never throws.
+  _sessionInflight(fullSid) {
+    if (!fullSid) return false;
+    try {
+      const p = join(homedir(), '.claude', 'state', 'sessions', fullSid, 'tool-inflight');
+      const raw = readFileSync(p, 'utf-8').trim();
+      const epoch = parseInt(raw.split(/\s+/)[0], 10);
+      if (!Number.isFinite(epoch)) return false;
+      return (Date.now() / 1000 - epoch) < 120;
+    } catch { return false; }
   }
 
   // D-1739: bare-sid → last-known account name, from the durable ledger (survives
