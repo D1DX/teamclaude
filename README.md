@@ -91,6 +91,7 @@ teamclaude server
 ```
 
 When running from a TTY, shows an interactive **fleet control plane** (the "Deck"):
+- **Umbrella → children tree** (top section, above the account groups) — when one live session's pinned issue is the *parent* of another live session's issue, the umbrella lead is shown with a `☂` glyph + its issue + status + title, and its children are indented beneath with `├─`/`└─` tree connectors and their per-session emoji. Built entirely in-memory from each session's local `~/.claude/state/sessions/<sid>/pin.json` (`issueId` = a session's own pinned-issue UUID; `parentId` = its umbrella's issue UUID) — **no extra API or DB calls**. Only umbrellas whose lead is itself a live session render here; orphan children (lead not live / wrapped) and parentless sessions fall through to the account groups below, unchanged.
 - **Sessions grouped by account** — each agent clustered under the Max account serving it, with the account header carrying status + quota bars + a per-account roll-up (`N agents · M live · tokens`). Accounts ordered by total token burn.
 - **Per-session row** — emoji · pinned issue (or sid) · issue-status chip (`work`/`todo`/`queued`/`block`/`review`) · live/idle · **activity glyph** (`⚙` a tool is executing, `~` the session is live/LLM responding, blank idle) · token burn · `$` cost · activity/intent line. `►` marks sessions that need the operator (blocked / in-review). All rows sorted by token count descending.
 - **Fleet header** — one-glance `N agents · M warm · K needs-you · total tokens · $burn`.

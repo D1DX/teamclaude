@@ -493,6 +493,10 @@ export class TUI {
         account: b?.account || lastAcct.get(bare)?.account || null,
         bound: !!b, warm: b?.warm || false, idleSec: b?.idleSec ?? null,
         tokens: b?.tokens || 0, inTok: b?.inputTokens || 0, outTok: b?.outputTokens || 0,
+        // D-1798: umbrella→children tree linkage (from pin.json, via fleetRows).
+        issueId: f.issueId || f.pin?.issueId || null, // own pinned-issue UUID
+        parentId: f.parentId || f.pin?.parentId || null, // umbrella issue UUID
+        title: f.pin?.title || null, // issue title — umbrella header label
       };
     });
 
@@ -565,6 +569,66 @@ export class TUI {
         }
         return line;
       };
+
+      // ══ Umbrella → children tree (D-1798) ══════════════════════════════
+      // A structural overlay ABOVE the account groups. A session is a CHILD
+      // when its pin carries parentId; its umbrella is the LIVE session whose
+      // issueId equals that parentId. Built entirely in-memory from pin.json
+      // (no API/DB calls). Only umbrellas whose lead is a live session render
+      // here — orphan children (lead not live / wrapped) are left to the
+      // account groups below, exactly as today. Parentless sessions untouched.
+      const agentByIssueUuid = new Map();
+      for (const a of agents) if (a.issueId) agentByIssueUuid.set(a.issueId, a);
+      const kidsByParent = new Map();
+      for (const a of agents) {
+        if (!a.parentId || !agentByIssueUuid.has(a.parentId)) continue; // skip orphans
+        if (!kidsByParent.has(a.parentId)) kidsByParent.set(a.parentId, []);
+        kidsByParent.get(a.parentId).push(a);
+      }
+      if (kidsByParent.size > 0) {
+        const totalKids = [...kidsByParent.values()].reduce((s, l) => s + l.length, 0);
+        const treeWord = kidsByParent.size === 1 ? ' umbrella' : ' umbrellas';
+        const uHdr = ` Umbrellas  ${cyan(kidsByParent.size + treeWord)} · ${gray(totalKids + (totalKids === 1 ? ' child' : ' children'))} `;
+        lines.push('');
+        lines.push(uHdr + dim('─'.repeat(Math.max(1, W - dw(uHdr)))));
+
+        // one child row — indented under its umbrella with a tree connector,
+        // columns aligned to the account-group agentRow (who/chip/state/act/tok).
+        const childRow = (a, last) => {
+          const conn = gray(last ? '└─' : '├─');
+          const mark = a.needsYou ? red('►') : (collide.has(a.issue) ? yellow('◆') : ' ');
+          const who = padW((a.emoji || '·') + ' ' + (a.issue || a.sid8 || '—'), 13);
+          const chip = padW(a.status ? statusChip(a.status) : gray('·'), 8);
+          const state = padW(a.bound ? (a.warm ? green('live') : gray('idle')) : gray('—'), 6);
+          const act = padW(a.inflight ? cyan('⚙') : (a.warm ? dim('~') : ' '), 3);
+          const tok = padW(a.bound ? green(fmtN(a.tokens)) : gray('—'), 7);
+          let line = '   ' + conn + ' ' + mark + ' ' + who + chip + state + act + tok;
+          const intent = a.intent ? a.intent.replace(/^solo:\s*/, '') : '';
+          if (intent) {
+            const tag = (a.intent && a.intent.startsWith('solo:')) ? cyan('solo ') : '';
+            const room = W - dw(line) - 2 - dw(tag);
+            if (room > 8) line += tag + dim(intent.slice(0, room));
+          }
+          return line;
+        };
+
+        // umbrellas ordered by child count desc (the biggest fan-out first).
+        const groups = [...kidsByParent.entries()].sort((x, y) => y[1].length - x[1].length);
+        for (const [pid, children] of groups) {
+          const lead = agentByIssueUuid.get(pid);
+          // umbrella header — distinct ☂ glyph + bold, lead's emoji + issue + status.
+          const who = padW('☂ ' + (lead.emoji || '·') + ' ' + (lead.issue || lead.sid8 || '—'), 16);
+          let head = ' ' + bold(who) + padW(lead.status ? statusChip(lead.status) : gray('·'), 8);
+          const label = lead.title || lead.intent || '';
+          if (label) {
+            const room = W - dw(head) - 2;
+            if (room > 8) head += ' ' + dim(label.slice(0, room));
+          }
+          lines.push(head);
+          children.sort((x, y) => (y.tokens - x.tokens)); // token-desc, like every other list
+          children.forEach((c, idx) => lines.push(childRow(c, idx === children.length - 1)));
+        }
+      }
 
       // each account header, then the agents using it.
       // D-1739: accounts themselves ordered by total token burn descending.

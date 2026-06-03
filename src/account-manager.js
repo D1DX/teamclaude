@@ -365,6 +365,11 @@ export class AccountManager {
         status: j.status ?? null,
         assigneeUserId: j.assigneeUserId ?? null,
         lastCommentAt: j.lastCommentAt ?? null,
+        // D-1798: tree linkage. issueId = this session's own pinned-issue UUID
+        // (the match key an umbrella is found by); parentId = its umbrella
+        // issue's UUID (null for a top-level / non-child session).
+        issueId: j.issueId ?? null,
+        parentId: j.parentId ?? null,
       };
     } catch { data = null; }
     this._pinCache.set(fullSid, { at: now, data });
@@ -385,17 +390,24 @@ export class AccountManager {
 
   fleetRows() {
     const rows = (this._readSessionsRegistry() || []).filter(r => this._pidAlive(r.pid));
-    return rows.map(r => ({
-      sid: r.sid,
-      emoji: r.emoji || null,
-      pid: r.pid ?? null,
-      intent: r.intent || null,
-      issue: r.pinned_issue || null,
-      started: r.started || null,
-      lastHeartbeat: r.last_heartbeat || null,
-      pin: this._sessionPin(r.sid),
-      inflight: this._sessionInflight(r.sid), // D-1739: ⚙ a tool is executing right now (D-1749 marker)
-    }));
+    return rows.map(r => {
+      const pin = this._sessionPin(r.sid);
+      return {
+        sid: r.sid,
+        emoji: r.emoji || null,
+        pid: r.pid ?? null,
+        intent: r.intent || null,
+        issue: r.pinned_issue || null,
+        started: r.started || null,
+        lastHeartbeat: r.last_heartbeat || null,
+        pin,
+        // D-1798: tree linkage surfaced at the row top-level so the render path
+        // can build the umbrella→children index without reaching into `pin`.
+        issueId: pin?.issueId || null,   // this session's own pinned-issue UUID
+        parentId: pin?.parentId || null, // its umbrella issue UUID (null = not a child)
+        inflight: this._sessionInflight(r.sid), // D-1739: ⚙ a tool is executing right now (D-1749 marker)
+      };
+    });
   }
 
   // D-1739: is a tool currently executing in this session? Reads the D-1749
