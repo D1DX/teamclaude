@@ -90,10 +90,13 @@ teamclaude login --api
 teamclaude server
 ```
 
-When running from a TTY, shows an interactive TUI with:
-- Account table with session/weekly quota progress bars and reset countdowns
-- Real-time activity log with request tracking
-- Keyboard shortcuts (see below)
+When running from a TTY, shows an interactive **fleet control plane** (the "Deck"):
+- **Sessions grouped by account** — each agent clustered under the Max account serving it, with the account header carrying status + quota bars + a per-account roll-up (`N agents · M live · tokens`). Accounts ordered by total token burn.
+- **Per-session row** — emoji · pinned issue (or sid) · issue-status chip (`work`/`todo`/`queued`/`block`/`review`) · live/idle · **activity glyph** (`⚙` a tool is executing, `~` the session is live/LLM responding, blank idle) · token burn · `$` cost · activity/intent line. `►` marks sessions that need the operator (blocked / in-review). All rows sorted by token count descending.
+- **Fleet header** — one-glance `N agents · M warm · K needs-you · total tokens · $burn`.
+- **By issue** — active issues only (those with a live session), each prefixed with its session emoji(s), sorted by token count descending. Press `i` to expand the full list. Historical/closed-issue usage lives in the task tracker, not here.
+- Dead sessions (pid no longer alive) are filtered out automatically, so no zombie rows.
+- Real-time activity log with request tracking.
 
 Falls back to plain log output when not a TTY (e.g. running as a service).
 
@@ -105,6 +108,8 @@ Falls back to plain log output when not a TTY (e.g. running as a service).
 | `a` | Add account (import or API key) |
 | `r` | Remove an account |
 | `R` | Reload accounts from config |
+| `b` | Mute / unmute the alert bell |
+| `i` | Expand / collapse the full By-issue list |
 | `q` | Quit |
 
 In selection mode, use `j`/`k` or arrow keys to navigate, `Enter` to confirm, `Esc` to cancel.
