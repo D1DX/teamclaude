@@ -1,6 +1,7 @@
 import { refreshAccessToken, isTokenExpiringSoon } from './oauth.js';
 import { readFileSync, writeFileSync, renameSync } from 'node:fs';
-import { homedir, totalmem, freemem, loadavg, cpus } from 'node:os';
+import { homedir, totalmem, freemem, loadavg, cpus, platform } from 'node:os';
+import { execFileSync } from 'node:child_process';
 import { join } from 'node:path';
 
 const WEEK_MS = 7 * 24 * 60 * 60 * 1000;
@@ -8,6 +9,33 @@ const HOUR_MS = 60 * 60 * 1000;
 // D1DX (D-1728): D1DX session presence registry — used only to resolve a
 // session emoji for log/TUI display. Best-effort; never load-bearing for routing.
 const SESSIONS_REGISTRY = join(homedir(), '.claude', 'state', 'sessions.json');
+
+// macOS "Memory Used" (App + Wired + Compressed), matching Activity Monitor.
+// os.freemem() can't be used here — it excludes reclaimable cache, overstating
+// used memory by ~10GB. Parsed from `vm_stat` and cached for 2s so the dashboard
+// snapshot (hit per /status request + TUI refresh) never hammers the shell-out.
+// Returns bytes, or null if vm_stat is unavailable/unparseable (caller falls back).
+let _macUsedCache = { at: 0, bytes: null };
+function _macUsedBytes() {
+  const now = Date.now();
+  if (_macUsedCache.bytes != null && now - _macUsedCache.at < 2000) return _macUsedCache.bytes;
+  try {
+    const out = execFileSync('vm_stat', { encoding: 'utf-8', timeout: 1000 });
+    const pageSize = Number(out.match(/page size of (\d+) bytes/)?.[1]) || 4096;
+    const pages = label => {
+      const m = out.match(new RegExp(`${label}:\\s+(\\d+)\\.`));
+      return m ? Number(m[1]) : 0;
+    };
+    const wired = pages('Pages wired down');
+    const compressed = pages('Pages occupied by compressor');
+    const appMem = Math.max(0, pages('Anonymous pages') - pages('Pages purgeable'));
+    const bytes = (appMem + wired + compressed) * pageSize;
+    _macUsedCache = { at: now, bytes };
+    return bytes;
+  } catch {
+    return null;
+  }
+}
 
 function emptyQuota() {
   return {
@@ -402,17 +430,24 @@ export class AccountManager {
   }
 
   // Process + system resource snapshot for the dashboard (D-1728 S8). Cheap —
-  // os + process only, no `ps` (per-instance mem/cpu is resolved by the caller
-  // from each session's pid, since that needs a shell-out we keep off this path).
+  // os + process, plus a single cached `vm_stat` on macOS for an accurate used
+  // figure (see _macUsedBytes). Per-instance mem/cpu still resolved by the
+  // caller from each session's pid.
   systemSnapshot() {
     const mu = process.memoryUsage();
-    const total = totalmem(), free = freemem();
+    const total = totalmem();
+    // os.freemem() on macOS counts reclaimable cache/inactive/compressor pages
+    // as NOT free, so (total - free) overstates used by ~10GB (15.8/16 vs 6.7).
+    // Derive the Activity-Monitor "Memory Used" figure via vm_stat instead;
+    // fall back to freemem() on non-darwin (where freemem is meaningful enough).
+    const macUsed = platform() === 'darwin' ? _macUsedBytes() : null;
+    const used = macUsed != null ? macUsed : (total - freemem());
     return {
       proxyRssMB: Math.round(mu.rss / 1048576),
       proxyUptimeSec: Math.round(process.uptime()),
       totalMemMB: Math.round(total / 1048576),
-      usedMemMB: Math.round((total - free) / 1048576),
-      usedMemPct: Math.round((1 - free / total) * 100),
+      usedMemMB: Math.round(used / 1048576),
+      usedMemPct: Math.round((used / total) * 100),
       loadAvg: loadavg().map(n => Math.round(n * 100) / 100),
       cpuCount: cpus().length,
     };
