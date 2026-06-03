@@ -346,8 +346,17 @@ export class AccountManager {
   // D-1739: every live presence-registry row enriched with its local pin
   // overlay — the whole-fleet spine for Deck (includes agents the proxy has
   // never routed). Best-effort + credential-free; empty array if unreadable.
+  // D-1739: a process is alive if kill(pid,0) succeeds; EPERM also means alive
+  // (someone else's process); only ESRCH (no such process) is dead. No pid →
+  // treat as alive (can't disprove). Mirrors the bash registry's active filter.
+  _pidAlive(pid) {
+    if (pid == null || pid === '') return true;
+    try { process.kill(Number(pid), 0); return true; }
+    catch (e) { return e.code === 'EPERM'; }
+  }
+
   fleetRows() {
-    const rows = this._readSessionsRegistry() || [];
+    const rows = (this._readSessionsRegistry() || []).filter(r => this._pidAlive(r.pid));
     return rows.map(r => ({
       sid: r.sid,
       emoji: r.emoji || null,
