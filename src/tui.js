@@ -176,6 +176,8 @@ export class TUI {
     // D-1728 S8: throttled per-instance mem/cpu sampler (ps on session pids).
     this._psAt = 0;
     this._psMap = {};
+    // D-1739: By-issue expand toggle ([i]) — collapsed caps at 8 rows.
+    this.byIssueExpanded = false;
   }
 
   // D-1728 S8: sample per-process RSS + CPU for the given pids, at most every 3s
@@ -300,6 +302,10 @@ export class TUI {
     else if (k === 'b') { // D-1739: mute/unmute the alert bell (in-view flag stays)
       this.bell = this.bell === false;
       this._addLog('Alert bell ' + (this.bell === false ? 'muted' : 'on'));
+    }
+    else if (k === 'i') { // D-1739: expand/collapse the By-issue list
+      this.byIssueExpanded = !this.byIssueExpanded;
+      if (this.running) this.render();
     }
   }
 
@@ -557,8 +563,12 @@ export class TUI {
         return line;
       };
 
-      // each account header, then the agents using it (attention-first)
-      for (let i = 0; i < this.am.accounts.length; i++) {
+      // each account header, then the agents using it.
+      // D-1739: accounts themselves ordered by total token burn descending.
+      const acctTok = i => (byAcct.get(this.am.accounts[i].name) || [])
+        .reduce((s, a) => s + a.inTok + a.outTok, 0);
+      const acctOrder = this.am.accounts.map((_, i) => i).sort((a, b) => acctTok(b) - acctTok(a));
+      for (const i of acctOrder) {
         const acct = this.am.accounts[i];
         const list = byAcct.get(acct.name) || [];
         let rin = 0, rout = 0, live = 0;
@@ -569,7 +579,7 @@ export class TUI {
         lines.push('');
         lines.push(this._renderAcctHeader(i, bw, showBoth, roll));
         if (!list.length) continue;
-        list.sort((x, y) => (Number(y.needsYou) - Number(x.needsYou)) || (Number(y.warm) - Number(x.warm)) || (y.tokens - x.tokens));
+        list.sort((x, y) => (y.tokens - x.tokens)); // D-1739: ALL rows by token count descending (needs-you stays a ► marker)
         for (const a of list) lines.push(agentRow(a));
       }
 
@@ -577,6 +587,7 @@ export class TUI {
       if (unrouted.length > 0) {
         lines.push('');
         lines.push('  ' + dim('· no account history ·') + '  ' + gray(unrouted.length));
+        unrouted.sort((x, y) => (y.tokens - x.tokens)); // D-1739: token-desc like every other list
         for (const a of unrouted) lines.push(agentRow(a));
       }
     }
@@ -585,16 +596,33 @@ export class TUI {
     // survives idle-eviction + restart). The operator's "all usage on the issue".
     const byIssue = this.am.ledgerByIssue ? this.am.ledgerByIssue() : [];
     if (byIssue.length > 0) {
+      // D-1739: issue → live session emoji(s). Up to 2 (collisions) keep the cell narrow.
+      const emojiByIssue = new Map();
+      for (const a of agents) {
+        if (!a.issue || !a.emoji) continue;
+        const cur = emojiByIssue.get(a.issue) || [];
+        if (!cur.includes(a.emoji)) cur.push(a.emoji);
+        emojiByIssue.set(a.issue, cur);
+      }
+      const issueLabel = iss => {
+        const e = emojiByIssue.get(iss);
+        return e && e.length ? e.slice(0, 2).join('') + ' ' + iss : iss;
+      };
       lines.push('');
-      const iHdr = ` By issue ${cyan(byIssue.length)} `;
+      // D-1739: expandable — [i] toggles the full list vs an 8-row cap.
+      const cap = this.byIssueExpanded ? byIssue.length : 8;
+      const shown = byIssue.slice(0, cap);
+      const more = byIssue.length - shown.length;
+      const iHdr = ` By issue ${cyan(byIssue.length)}${this.byIssueExpanded ? ' ' + gray('all') : ''} `;
       lines.push(iHdr + dim('─'.repeat(Math.max(1, W - vw(iHdr)))));
-      const irow = (a, b, c, d, e) => '   ' + rpad(a, 14) + rpad(b, 6) + rpad(c, 7) + rpad(d, 9) + e;
+      // first column is width-aware (padW) because the emoji prefix is a wide glyph.
+      const irow = (a, b, c, d, e) => '   ' + padW(a, 14) + rpad(b, 6) + rpad(c, 7) + rpad(d, 9) + e;
       lines.push(dim(irow('issue', 'sess', 'msgs', 'tokens', 'avg/m')));
       const tot = byIssue.reduce((a, g) => ({ s: a.s + g.sessions, m: a.m + g.messages, t: a.t + g.tokens }), { s: 0, m: 0, t: 0 });
-      for (const g of byIssue.slice(0, 8)) {
-        lines.push(irow(g.issue, String(g.sessions), String(g.messages), fmtN(g.tokens), fmtN(g.avgTokensPerMsg)));
+      for (const g of shown) {
+        lines.push(irow(issueLabel(g.issue), String(g.sessions), String(g.messages), fmtN(g.tokens), fmtN(g.avgTokensPerMsg)));
       }
-      if (byIssue.length > 8) lines.push('   ' + gray(`… +${byIssue.length - 8} more`));
+      if (more > 0) lines.push('   ' + gray(`… +${more} more — press i`));
       lines.push(bold(irow('TOTAL', String(tot.s), String(tot.m), fmtN(tot.t), fmtN(tot.m ? Math.round(tot.t / tot.m) : 0))));
     }
 
@@ -751,7 +779,7 @@ export class TUI {
   _renderFooter() {
     switch (this.mode) {
       case 'normal':
-        return ` ${bold('s')}witch  ${bold('a')}dd  ${bold('r')}emove  ${bold('R')}eload  ${bold('b')}ell${this.bell === false ? gray('·muted') : ''}  ${bold('q')}uit`;
+        return ` ${bold('s')}witch  ${bold('a')}dd  ${bold('r')}emove  ${bold('R')}eload  ${bold('b')}ell${this.bell === false ? gray('·muted') : ''}  ${bold('i')}ssues${this.byIssueExpanded ? gray('·all') : ''}  ${bold('q')}uit`;
       case 'select': {
         const act = this.selAction === 'switch' ? 'switch' : 'remove';
         return ` ${dim('↑↓')} select  ${bold('Enter')} ${act}  ${bold('Esc')} cancel`;
