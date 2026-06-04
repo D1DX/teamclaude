@@ -527,6 +527,18 @@ export class TUI {
     const bindByBare = new Map(binds.map(b => [bareOf(b.fullSid), b]));
     const needsYouP = p => !!(p && (p.status === 'blocked' || p.status === 'in_review' || p.assigneeUserId));
 
+    // D-1827: derive umbrella type from the umbrella lead's labels array.
+    // Labels are written by pc-current --set only when agent-kit supports it;
+    // defaults to 'unknown' when the labels field is absent or has no umbrella:* entry.
+    const umbrellaTypeOf = labels => {
+      if (!Array.isArray(labels)) return 'unknown';
+      for (const l of labels) {
+        const m = typeof l === 'string' ? l.match(/^umbrella:(parallel|sequential|hybrid)$/i) : null;
+        if (m) return m[1].charAt(0).toUpperCase() + m[1].slice(1).toLowerCase();
+      }
+      return 'unknown';
+    };
+
     // resolve every registry agent → account (current OR last-known) + live data
     const agents = fleet.map(f => {
       const bare = bareOf(f.sid);
@@ -542,6 +554,8 @@ export class TUI {
         issueId: f.issueId || f.pin?.issueId || null, // own pinned-issue UUID
         parentId: f.parentId || f.pin?.parentId || null, // umbrella issue UUID
         title: f.pin?.title || null, // issue title — umbrella header label
+        // D-1827: raw labels array (null if pc-current hasn't written them yet).
+        labels: f.labels || f.pin?.labels || null,
       };
     });
 
@@ -714,6 +728,57 @@ export class TUI {
         lines.push('');
         lines.push(sectionHdr('Umbrellas', uMeta));
 
+        // D-1827: per-type breakdown — one line per type present (Parallel / Sequential / Hybrid / unknown).
+        // Rolls up count · children · tokens across all umbrellas of each type.
+        // Type is read from the umbrella lead's labels array (umbrella:parallel|sequential|hybrid).
+        // Defaults to 'unknown' when labels are absent (pc-current does not yet write them).
+        //
+        // Two populations of umbrella leads:
+        //   A) Agents in kidsByParent (have ≥1 live child) — the normal case.
+        //   B) Agents with an umbrella:* label whose issueId is NOT in kidsByParent
+        //      (declared as umbrella but currently childless) — still count as an umbrella
+        //      for type-stats, and Parallel ones get a mismatch nudge in the tree below.
+        {
+          const typeStats = new Map(); // typeName → { count, children, tokens }
+          const accum = (lead, kidsArr) => {
+            const typeName = umbrellaTypeOf(lead.labels);
+            let s = typeStats.get(typeName);
+            if (!s) { s = { count: 0, children: 0, tokens: 0 }; typeStats.set(typeName, s); }
+            s.count++;
+            s.children += kidsArr.length;
+            s.tokens += (lead.tokens || 0) + kidsArr.reduce((acc, c) => acc + (c.tokens || 0), 0);
+          };
+          // Population A: leads with live children.
+          for (const [pid, kidsArr] of kidsByParent) {
+            const lead = agentByIssueUuid.get(pid);
+            if (lead) accum(lead, kidsArr);
+          }
+          // Population B: agents declaring umbrella:* but with no live children.
+          for (const a of agents) {
+            if (!a.issueId || kidsByParent.has(a.issueId)) continue; // already counted or not a lead
+            if (!Array.isArray(a.labels) || !a.labels.some(l => /^umbrella:(parallel|sequential|hybrid)$/i.test(l))) continue;
+            accum(a, []);
+          }
+          // Canonical order: Parallel → Sequential → Hybrid → unknown (alphabetical for any others).
+          const TYPE_ORDER = ['Parallel', 'Sequential', 'Hybrid'];
+          const typeNames = [...typeStats.keys()].sort((a, b) => {
+            const ai = TYPE_ORDER.indexOf(a), bi = TYPE_ORDER.indexOf(b);
+            if (ai !== -1 && bi !== -1) return ai - bi;
+            if (ai !== -1) return -1;
+            if (bi !== -1) return 1;
+            return a.localeCompare(b);
+          });
+          const COL_TYPE = 11; // 'Sequential' is 10 chars; pad to 11 for alignment
+          for (const t of typeNames) {
+            const s = typeStats.get(t);
+            const typeLbl = padW(t, COL_TYPE);
+            const cntLbl  = cyan(String(s.count));
+            const kidLbl  = gray(s.children + ' ↳');
+            const tokLbl  = green(fmtN(s.tokens));
+            lines.push(`  ${typeLbl} ${cntLbl} · ${kidLbl} · ${tokLbl}`);
+          }
+        }
+
         // one child row — indented under its umbrella with a tree connector.
         // Prefix = '   ' (3) + conn (2 = ├─/└─) + ' ' (1) + mark (1) + ' ' (1) = 8 cells,
         // matching agentRow's 8-cell prefix so all data columns align vertically.
@@ -768,6 +833,21 @@ export class TUI {
           lines.push(head);
           children.sort((x, y) => (y.tokens - x.tokens)); // token-desc, like every other list
           children.forEach((c, idx) => lines.push(childRow(c, idx === children.length - 1)));
+        }
+
+        // D-1827: mismatch nudge — render declared-Parallel umbrellas with 0 live
+        // children (they have an umbrella:parallel label but no child registered yet).
+        // These agents never appear in kidsByParent (no child = not a key), so they
+        // need a separate pass. One dim ⚠ per agent; no hard enforcement.
+        for (const a of agents) {
+          if (!a.issueId || kidsByParent.has(a.issueId)) continue;
+          if (umbrellaTypeOf(a.labels) !== 'Parallel') continue;
+          if (!Array.isArray(a.labels) || !a.labels.some(l => /^umbrella:parallel$/i.test(l))) continue;
+          const who = padW('☂ ' + (a.emoji || '·') + ' ' + (a.issue || a.sid8 || '—'), COL_WHO + 2);
+          const chip = padW(a.status ? statusChip(a.status) : gray('·'), COL_CHIP);
+          const nudge = dim('⚠ no live children');
+          let head = ' ' + bold(who) + '  ' + chip + '  ' + padW(dim('—'), 24) + ' ' + nudge;
+          lines.push(head);
         }
       }
 

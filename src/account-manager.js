@@ -378,6 +378,11 @@ export class AccountManager {
         // issue's UUID (null for a top-level / non-child session).
         issueId: j.issueId ?? null,
         parentId: j.parentId ?? null,
+        // D-1827: umbrella type label. pc-current --set does NOT currently project
+        // labels into pin.json (agent-kit scope), so this will be null for all
+        // existing pins. Forward-compatible: if a future pc-current update writes
+        // a `labels` array, it will be picked up here automatically.
+        labels: Array.isArray(j.labels) ? j.labels : null,
       };
     } catch { data = null; }
     this._pinCache.set(fullSid, { at: now, data });
@@ -417,6 +422,8 @@ export class AccountManager {
         // can build the umbrella→children index without reaching into `pin`.
         issueId: pin?.issueId || null,   // this session's own pinned-issue UUID
         parentId: pin?.parentId || null, // its umbrella issue UUID (null = not a child)
+        // D-1827: labels array from pin.json (null if not written by pc-current yet).
+        labels: pin?.labels || null,
         inflight: this._sessionInflight(r.sid), // D-1739: ⚙ a tool is executing right now (D-1749 marker)
       };
     });
