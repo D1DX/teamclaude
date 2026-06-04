@@ -444,6 +444,41 @@ export class TUI {
 
   // ── rendering ──────────────────────────────────────
 
+  // D-1820: factor the proxy/system line into its own method so child C can add
+  // threshold coloring inside here without touching the Top section layout.
+  // Returns the line STRING (leading space + gray content) or null when sys is falsy.
+  // D-1820 Req 3: threshold-color RAM%, load, and issues segment; gray scaffolding preserved.
+  _proxyLine(sys, _W) {
+    if (!sys) return null;
+    const gb = mb => (mb / 1024).toFixed(1);
+
+    // RAM % threshold color: green < 70, yellow 70–89, red ≥ 90
+    const ramPct = sys.usedMemPct;
+    const ramColor = ramPct >= 90 ? red : ramPct >= 70 ? yellow : green;
+    const ramStr = gray(`${gb(sys.usedMemMB)}/`) + gray(`${gb(sys.totalMemMB)}GB`) +
+      gray(' (') + ramColor(`${ramPct}%`) + gray(')');
+
+    // Load threshold color: green < cpus*0.7, yellow < cpus, red ≥ cpus
+    const load = sys.loadAvg[0];
+    const cpus = sys.cpuCount;
+    const loadColor = load >= cpus ? red : load >= cpus * 0.7 ? yellow : green;
+    const loadStr = loadColor(`${load}`);
+
+    // Issues segment: count throttled/exhausted/error accounts
+    const accounts = this.am.accounts || [];
+    const throttledN = accounts.filter(a => a.status === 'throttled').length;
+    const errorN = accounts.filter(a => a.status === 'exhausted' || a.status === 'error').length;
+    let issuesSeg = '';
+    if (throttledN > 0) issuesSeg += gray(' · ') + yellow(`${throttledN} throttled`);
+    if (errorN > 0)     issuesSeg += gray(' · ') + red(`${errorN} error`);
+
+    return ' ' +
+      gray(`proxy ${sys.proxyRssMB}MB · up ${fmtDur(sys.proxyUptimeSec)}    host RAM `) +
+      ramStr +
+      gray(` · load `) + loadStr + gray(` · ${cpus} cpus`) +
+      issuesSeg;
+  }
+
   render() {
     if (!this.running) return;
     const W = process.stdout.columns || 80;
@@ -463,12 +498,8 @@ export class TUI {
     lines.push(left + ' '.repeat(Math.max(1, W - vw(left) - vw(right))) + right);
     lines.push(' ' + dim('─'.repeat(W - 2)));
 
-    // D-1728 S8: system resource line (proxy + host).
+    // D-1728 S8: system resource snapshot — rendered via _proxyLine in the Top section.
     const sys = this.am.systemSnapshot ? this.am.systemSnapshot() : null;
-    if (sys) {
-      const gb = mb => (mb / 1024).toFixed(1);
-      lines.push(' ' + gray(`proxy ${sys.proxyRssMB}MB · up ${fmtDur(sys.proxyUptimeSec)}    host RAM ${gb(sys.usedMemMB)}/${gb(sys.totalMemMB)}GB (${sys.usedMemPct}%) · load ${sys.loadAvg[0]} · ${sys.cpuCount} cpus`));
-    }
 
     // ── Fleet control plane (D-1739): every live agent clustered UNDER its
     // account — current binding OR last-known account from the durable ledger —
@@ -513,6 +544,34 @@ export class TUI {
     if (this.bell !== false && hasAlert && alertKey !== this._lastAlertKey) process.stdout.write('\x07');
     this._lastAlertKey = hasAlert ? alertKey : '';
 
+    // D-1820: build umbrella/children index ONCE — reused by Top section fleet line
+    // (req 2), role indicators in agentRow (req 5), and Umbrellas section (req 4/6).
+    // An umbrella lead is a live agent whose issueId is another live agent's parentId.
+    // kidsByParent maps parentIssueUuid → [child agents]; orphans (no live lead) skipped.
+    const agentByIssueUuid = new Map();
+    for (const a of agents) if (a.issueId) agentByIssueUuid.set(a.issueId, a);
+    const kidsByParent = new Map();
+    for (const a of agents) {
+      if (!a.parentId || !agentByIssueUuid.has(a.parentId)) continue; // skip orphans
+      if (!kidsByParent.has(a.parentId)) kidsByParent.set(a.parentId, []);
+      kidsByParent.get(a.parentId).push(a);
+    }
+
+    // D-1820 Req 5: precompute umbrella lead set + child set for role indicators.
+    // ☂ = umbrella lead (its issueId key maps to it in kidsByParent via agentByIssueUuid)
+    // ↳ = child (its parentId is a key in kidsByParent)
+    // Note: ☂ is 2 cells (matched by WIDE_RE), ↳ is 1 — padW measures real display
+    // width, so every account row's chip/state/tok columns stay aligned regardless.
+    const umbrellaLeadSet = new Set();
+    for (const [pid] of kidsByParent) {
+      const lead = agentByIssueUuid.get(pid);
+      if (lead) umbrellaLeadSet.add(lead);
+    }
+    const childSet = new Set();
+    for (const a of agents) {
+      if (a.parentId && kidsByParent.has(a.parentId)) childSet.add(a);
+    }
+
     // bucket agents under their resolved account; the rest into an unrouted tail
     const byAcct = new Map();
     const unrouted = [];
@@ -543,18 +602,50 @@ export class TUI {
         ? Math.max(5, Math.min(16, Math.floor((W - 60) / 2)))
         : Math.max(5, Math.min(16, W - 48));
 
-      // fleet one-glance summary
-      let sH = ` Fleet  ${cyan(agents.length + ' agents')} · ${green(warmCount + ' warm')}`;
-      if (fleetNeedsYou > 0) sH += ` · ${red(fleetNeedsYou + ' needs-you')}`;
-      if (collide.size > 0) sH += ` · ${yellow(collide.size + ' collide')}`;
-      const sHR = `${fmtN(agg ? agg.tokens : 0)} tok · ${green('$' + aggCost.toFixed(2))} ▲ `;
-      lines.push('');
-      lines.push(sH + ' '.repeat(Math.max(1, W - dw(sH) - dw(sHR))) + sHR);
+      // ── D-1820 Req 1+2: Top section ─────────────────────────────────────
+      // Proxy line + rebuilt fleet summary, grouped before Umbrellas + Accounts.
+      {
+        const numUmbrellas = umbrellaLeadSet.size;
+        // child-only = in childSet but NOT also a lead (a nested-umbrella lead counts
+        // as ☂, never ↳), so solo · ☂ · ↳ always sums to agents.length.
+        const childOnly = [...childSet].filter(a => !umbrellaLeadSet.has(a)).length;
+        const independent = agents.filter(a => !umbrellaLeadSet.has(a) && !childSet.has(a)).length;
+        const runningLLM = this.active.size;  // in-flight upstream API calls through proxy
+        const runningTools = agents.filter(a => a.inflight).length;
+
+        const tHdr = ` Top `;
+        lines.push('');
+        lines.push(tHdr + dim('─'.repeat(Math.max(1, W - dw(tHdr)))));
+
+        // proxy/system line — child C owns coloring inside _proxyLine
+        const pl = this._proxyLine(sys, W);
+        if (pl) lines.push(pl);
+
+        // fleet summary left: agent breakdown + attention signals
+        let sH = ` Fleet  ${cyan(agents.length + ' agents')}`;
+        if (numUmbrellas > 0) {
+          sH += ` (${independent} solo · ${numUmbrellas} ☂ · ${childOnly} ↳)`;
+        }
+        sH += ` · ${green(warmCount + ' warm')}`;
+        if (fleetNeedsYou > 0) sH += ` · ${red(fleetNeedsYou + ' needs-you')}`;
+        if (collide.size > 0) sH += ` · ${yellow(collide.size + ' collide')}`;
+        sH += ` · ${cyan(runningLLM + ' LLM')} · ${runningTools} tools`;
+
+        // right-aligned: token total + $ burn
+        const sHR = `${fmtN(agg ? agg.tokens : 0)} tok · ${green('$' + aggCost.toFixed(2))} ▲ `;
+        lines.push(sH + ' '.repeat(Math.max(1, W - dw(sH) - dw(sHR))) + sHR);
+      }
 
       // one agent row, indented under its account
+      // D-1820 Req 5: role indicator glyph prepended before emoji in who column.
+      // roleGlyph width = 1 cell; who widened to 15 (was 13) to absorb "glyph " prefix.
+      // D-1820 Req 7 (display half): title fallback before sid8 — a.title shows
+      // issue title for sessions with no D-N yet resolved.
       const agentRow = a => {
         const mark = a.needsYou ? red('►') : (collide.has(a.issue) ? yellow('◆') : ' ');
-        const who = padW((a.emoji || '·') + ' ' + (a.issue || a.sid8 || '—'), 13);
+        const roleGlyph = umbrellaLeadSet.has(a) ? dim(cyan('☂')) : (childSet.has(a) ? dim(cyan('↳')) : ' ');
+        const label = a.issue || a.title || a.sid8 || '—';
+        const who = padW(roleGlyph + ' ' + (a.emoji || '·') + ' ' + label, 15);
         const chip = padW(a.status ? statusChip(a.status) : gray('·'), 8);
         const state = padW(a.bound ? (a.warm ? green('live') : gray('idle')) : gray('—'), 6);
         // D-1739: activity glyph — ⚙ tool executing, ~ LLM responding/active, blank idle.
@@ -570,34 +661,34 @@ export class TUI {
         return line;
       };
 
-      // ══ Umbrella → children tree (D-1798) ══════════════════════════════
-      // A structural overlay ABOVE the account groups. A session is a CHILD
-      // when its pin carries parentId; its umbrella is the LIVE session whose
-      // issueId equals that parentId. Built entirely in-memory from pin.json
-      // (no API/DB calls). Only umbrellas whose lead is a live session render
-      // here — orphan children (lead not live / wrapped) are left to the
-      // account groups below, exactly as today. Parentless sessions untouched.
-      const agentByIssueUuid = new Map();
-      for (const a of agents) if (a.issueId) agentByIssueUuid.set(a.issueId, a);
-      const kidsByParent = new Map();
-      for (const a of agents) {
-        if (!a.parentId || !agentByIssueUuid.has(a.parentId)) continue; // skip orphans
-        if (!kidsByParent.has(a.parentId)) kidsByParent.set(a.parentId, []);
-        kidsByParent.get(a.parentId).push(a);
-      }
+      // ══ D-1820 Req 4: Umbrellas as a standalone section ════════════════
+      // After the Top section, before account groups. The umbrella→children tree
+      // (D-1798) renders here. Orphan children (lead not live/wrapped) remain in
+      // the account groups below, exactly as today.
       if (kidsByParent.size > 0) {
         const totalKids = [...kidsByParent.values()].reduce((s, l) => s + l.length, 0);
         const treeWord = kidsByParent.size === 1 ? ' umbrella' : ' umbrellas';
-        const uHdr = ` Umbrellas  ${cyan(kidsByParent.size + treeWord)} · ${gray(totalKids + (totalKids === 1 ? ' child' : ' children'))} `;
+
+        // D-1820 Req 6: token total on the header — sum of each umbrella lead's
+        // tokens + its children's tokens; mirrors the ` By issue ` TOTAL pattern.
+        let totalUmbrellaTok = 0;
+        for (const [pid, children] of kidsByParent) {
+          const lead = agentByIssueUuid.get(pid);
+          if (lead) totalUmbrellaTok += lead.tokens;
+          for (const c of children) totalUmbrellaTok += c.tokens;
+        }
+        const uHdr = ` Umbrellas  ${cyan(kidsByParent.size + treeWord)} · ${gray(totalKids + (totalKids === 1 ? ' child' : ' children'))} · ${fmtN(totalUmbrellaTok)} tok `;
         lines.push('');
         lines.push(uHdr + dim('─'.repeat(Math.max(1, W - dw(uHdr)))));
 
         // one child row — indented under its umbrella with a tree connector,
-        // columns aligned to the account-group agentRow (who/chip/state/act/tok).
+        // columns aligned to agentRow (who/chip/state/act/tok).
+        // D-1820 Req 7 (display half): title fallback — a.title before a.sid8.
         const childRow = (a, last) => {
           const conn = gray(last ? '└─' : '├─');
           const mark = a.needsYou ? red('►') : (collide.has(a.issue) ? yellow('◆') : ' ');
-          const who = padW((a.emoji || '·') + ' ' + (a.issue || a.sid8 || '—'), 13);
+          const clabel = a.issue || a.title || a.sid8 || '—';
+          const who = padW((a.emoji || '·') + ' ' + clabel, 13);
           const chip = padW(a.status ? statusChip(a.status) : gray('·'), 8);
           const state = padW(a.bound ? (a.warm ? green('live') : gray('idle')) : gray('—'), 6);
           const act = padW(a.inflight ? cyan('⚙') : (a.warm ? dim('~') : ' '), 3);
@@ -612,17 +703,18 @@ export class TUI {
           return line;
         };
 
-        // umbrellas ordered by child count desc (the biggest fan-out first).
+        // umbrellas ordered by child count desc (biggest fan-out first).
         const groups = [...kidsByParent.entries()].sort((x, y) => y[1].length - x[1].length);
         for (const [pid, children] of groups) {
           const lead = agentByIssueUuid.get(pid);
+          if (!lead) continue; // defensive: matches the token-total loop guard above
           // umbrella header — distinct ☂ glyph + bold, lead's emoji + issue + status.
           const who = padW('☂ ' + (lead.emoji || '·') + ' ' + (lead.issue || lead.sid8 || '—'), 16);
           let head = ' ' + bold(who) + padW(lead.status ? statusChip(lead.status) : gray('·'), 8);
-          const label = lead.title || lead.intent || '';
-          if (label) {
+          const headLabel = lead.title || lead.intent || '';
+          if (headLabel) {
             const room = W - dw(head) - 2;
-            if (room > 8) head += ' ' + dim(label.slice(0, room));
+            if (room > 8) head += ' ' + dim(headLabel.slice(0, room));
           }
           lines.push(head);
           children.sort((x, y) => (y.tokens - x.tokens)); // token-desc, like every other list
@@ -716,10 +808,14 @@ export class TUI {
     }
 
     // Completed log
+    // D-1820 Req 8: color activity rows by severity (error=red, warn=yellow, else plain).
     const footerH = 2;
     const space = Math.max(0, H - lines.length - footerH);
     for (let i = 0; i < space && i < this.log.length; i++) {
-      lines.push(`   ${gray(this.log[i].t)}  ${this.log[i].msg}`);
+      const { t, msg } = this.log[i];
+      const sev = this._logSeverity(msg);
+      const coloredMsg = sev === 'error' ? red(msg) : sev === 'warn' ? yellow(msg) : msg;
+      lines.push(`   ${gray(t)}  ${coloredMsg}`);
     }
 
     // Pad to fill
@@ -847,6 +943,16 @@ export class TUI {
     const pin = this.config.pricing?.inPerMtok ?? 3;
     const pout = this.config.pricing?.outPerMtok ?? 15;
     return ((inTok || 0) / 1e6) * pin + ((outTok || 0) / 1e6) * pout;
+  }
+
+  // D-1820 Req 8: classify a log message as 'error', 'warn', or null.
+  // error wins over warn. HTTP status is matched only in its `(NNN,`/`(NNN)`
+  // log position (onRequestEnd format) so 3-digit paths/durations/account names
+  // don't false-trigger; keyword matches catch non-request log lines.
+  _logSeverity(msg) {
+    if (/\(5\d\d[,)]|error|fail|exhausted|rejected/i.test(msg)) return 'error';
+    if (/\(4\d\d[,)]|throttl|overload|warn/i.test(msg)) return 'warn';
+    return null;
   }
 
   _renderFooter() {
