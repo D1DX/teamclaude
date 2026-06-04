@@ -365,6 +365,14 @@ export class AccountManager {
         status: j.status ?? null,
         assigneeUserId: j.assigneeUserId ?? null,
         lastCommentAt: j.lastCommentAt ?? null,
+        // D-1820: identifier = the human D-N string from pin.json. pc-current --set
+        // writes this field (see `pc_current --set` → jq projection in pc-current).
+        // The registry row's `pinned_issue` is the canonical source, but it can be
+        // null for sessions registered via pc_session_ensure/pc_session_claim_emoji
+        // (self-heal / relaunch paths) that never completed a /task run. In that
+        // case, pin.json's `identifier` is the only local source of the D-N. Used
+        // as a fallback in fleetRows() when r.pinned_issue is blank.
+        identifier: j.identifier ?? null,
         // D-1798: tree linkage. issueId = this session's own pinned-issue UUID
         // (the match key an umbrella is found by); parentId = its umbrella
         // issue's UUID (null for a top-level / non-child session).
@@ -397,7 +405,11 @@ export class AccountManager {
         emoji: r.emoji || null,
         pid: r.pid ?? null,
         intent: r.intent || null,
-        issue: r.pinned_issue || null,
+        // D-1820: registry `pinned_issue` is the canonical D-N source; fall back to
+        // pin.json `identifier` for sessions that were registered via the self-heal /
+        // relaunch path (pc_session_ensure → pc_sessions_register) without a
+        // subsequent /task run that calls pc-current --set to update the registry row.
+        issue: r.pinned_issue || pin?.identifier || null,
         started: r.started || null,
         lastHeartbeat: r.last_heartbeat || null,
         pin,
