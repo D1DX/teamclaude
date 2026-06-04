@@ -148,6 +148,11 @@ function fmtDur(sec) {
   return `${d}d${h % 24}h`;
 }
 
+// D-1820: rolling quota window lengths — the pace arrow compares used% against
+// how much of the window has elapsed. Claude Max: 5h session + 7d weekly.
+const FIVE_H_MS = 5 * 60 * 60 * 1000;
+const SEVEN_D_MS = 7 * 24 * 60 * 60 * 1000;
+
 // ── TUI class ────────────────────────────────────────────────
 
 export class TUI {
@@ -962,7 +967,8 @@ export class TUI {
     // Quota ratios — prefer unified (Claude Max), fall back to standard (API key)
     const q = a.quota;
     let r1 = null, r2 = null, l1 = 'Ses', l2 = 'Wk', t1 = null, t2 = null;
-    if (q.unified5h != null || q.unified7d != null) {
+    const isUnified = q.unified5h != null || q.unified7d != null;
+    if (isUnified) {
       r1 = q.unified5h; r2 = q.unified7d; t1 = q.unified5hReset; t2 = q.unified7dReset;
     } else {
       l1 = 'Tok'; l2 = 'Req';
@@ -973,14 +979,41 @@ export class TUI {
       t1 = q.resetsAt ? new Date(q.resetsAt).getTime() : null; t2 = t1;
     }
 
-    let line = ` ${sel}${glyph} ${name} ${status} ${l1}${bar(r1, bw, t1)}`;
-    if (showBoth) line += `   ${l2}${bar(r2, bw, t2)}`;
+    // D-1820: pace arrow after each bar — only Max/unified accounts have a known
+    // rolling window (5h/7d); API-key Tok/Req windows are unknown → '·'.
+    const w1 = isUnified ? FIVE_H_MS : null;
+    const w2 = isUnified ? SEVEN_D_MS : null;
+    let line = ` ${sel}${glyph} ${name} ${status} ${l1}${bar(r1, bw, t1)} ${this._paceArrow(r1, t1, w1)}`;
+    if (showBoth) line += `   ${l2}${bar(r2, bw, t2)} ${this._paceArrow(r2, t2, w2)}`;
     line += `  ${roll}`;
     return line;
   }
 
   _acctGlyph(type) {
     return type === 'apikey' ? cyan('◇') : cyan('◆');
+  }
+
+  // D-1820: burn-rate arrow for one quota window — compares used% against how
+  // much of the rolling window has elapsed, so the operator sees whether to load
+  // more work (under-pace) or cool down (over-pace, will hit the cap before reset).
+  //   ↑ green  = under-spending (headroom) — safe to pile on work
+  //   → yellow = tracking even with the clock
+  //   ↓N red   = over-spending — projected to hit the cap in ~N (before the reset)
+  //   · gray   = no data / unknown window (error account, API-key Tok/Req)
+  _paceArrow(used, resetTs, windowMs) {
+    if (used == null || resetTs == null || windowMs == null) return gray('·');
+    const timeToReset = resetTs - Date.now();
+    const elapsedFrac = Math.max(0, Math.min(1, 1 - timeToReset / windowMs));
+    if (elapsedFrac < 0.02) return gray('·'); // too early in the window to judge pace
+    const headroom = elapsedFrac - used;      // >0 under-pace, <0 over-pace
+    if (headroom > 0.05) return green('↑');
+    if (headroom < -0.05) {
+      if (used >= 0.98) return red('↓!');      // already at the cap
+      const fStar = elapsedFrac / used;        // window-fraction at projected exhaust (<1)
+      const etaSec = Math.max(0, Math.round((fStar - elapsedFrac) * windowMs / 1000));
+      return red('↓' + fmtDur(etaSec));        // cool down — cap in ~ETA, before reset
+    }
+    return yellow('→');
   }
 
   // D-1739 S4: API-equivalent $ burn — what these tokens would cost pay-as-you-go
