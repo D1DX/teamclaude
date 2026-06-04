@@ -491,6 +491,15 @@ export class TUI {
 
     const lines = [];
 
+    // D-1820: one section-header design, reused by every section (Top · Umbrellas ·
+    // Accounts · By issue · Activity) so separators look identical everywhere.
+    // ` Label  <meta> ` in bold-cyan, then a dim ─ rule filling the width. Callers
+    // push a blank line before it for clear separation.
+    const sectionHdr = (label, meta = '') => {
+      const h = ` ${bold(cyan(label))}${meta ? '  ' + meta : ''} `;
+      return h + dim('─'.repeat(Math.max(1, W - dw(h))));
+    };
+
     // ── Header
     const left = bold(' TeamClaude');
     const port = this.config.proxy?.port || 3456;
@@ -613,9 +622,8 @@ export class TUI {
         const runningLLM = this.active.size;  // in-flight upstream API calls through proxy
         const runningTools = agents.filter(a => a.inflight).length;
 
-        const tHdr = ` Top `;
         lines.push('');
-        lines.push(tHdr + dim('─'.repeat(Math.max(1, W - dw(tHdr)))));
+        lines.push(sectionHdr('Top'));
 
         // proxy/system line — child C owns coloring inside _proxyLine
         const pl = this._proxyLine(sys, W);
@@ -677,9 +685,9 @@ export class TUI {
           if (lead) totalUmbrellaTok += lead.tokens;
           for (const c of children) totalUmbrellaTok += c.tokens;
         }
-        const uHdr = ` Umbrellas  ${cyan(kidsByParent.size + treeWord)} · ${gray(totalKids + (totalKids === 1 ? ' child' : ' children'))} · ${fmtN(totalUmbrellaTok)} tok `;
+        const uMeta = `${cyan(kidsByParent.size + treeWord)} · ${gray(totalKids + (totalKids === 1 ? ' child' : ' children'))} · ${green(fmtN(totalUmbrellaTok) + ' tok')}`;
         lines.push('');
-        lines.push(uHdr + dim('─'.repeat(Math.max(1, W - dw(uHdr)))));
+        lines.push(sectionHdr('Umbrellas', uMeta));
 
         // one child row — indented under its umbrella with a tree connector,
         // columns aligned to agentRow (who/chip/state/act/tok).
@@ -708,9 +716,13 @@ export class TUI {
         for (const [pid, children] of groups) {
           const lead = agentByIssueUuid.get(pid);
           if (!lead) continue; // defensive: matches the token-total loop guard above
-          // umbrella header — distinct ☂ glyph + bold, lead's emoji + issue + status.
+          // umbrella header — distinct ☂ glyph + bold, lead's emoji + issue + status,
+          // then the umbrella's token totals: parent's own (self) + parent+children (all).
           const who = padW('☂ ' + (lead.emoji || '·') + ' ' + (lead.issue || lead.sid8 || '—'), 16);
-          let head = ' ' + bold(who) + padW(lead.status ? statusChip(lead.status) : gray('·'), 8);
+          const leadTok = lead.tokens || 0;
+          const umbrellaTot = leadTok + children.reduce((s, c) => s + (c.tokens || 0), 0);
+          const tokSeg = `${green(fmtN(leadTok))} ${dim('self')} · ${bold(green(fmtN(umbrellaTot)))} ${dim('all')}`;
+          let head = ' ' + bold(who) + padW(lead.status ? statusChip(lead.status) : gray('·'), 8) + padW(tokSeg, 22);
           const headLabel = lead.title || lead.intent || '';
           if (headLabel) {
             const room = W - dw(head) - 2;
@@ -727,6 +739,11 @@ export class TUI {
       const acctTok = i => (byAcct.get(this.am.accounts[i].name) || [])
         .reduce((s, a) => s + a.inTok + a.outTok, 0);
       const acctOrder = this.am.accounts.map((_, i) => i).sort((a, b) => acctTok(b) - acctTok(a));
+      // D-1820: Accounts section header — same design as the other sections.
+      const totalAcctTok = acctOrder.reduce((s, i) => s + acctTok(i), 0);
+      const aMeta = `${cyan(this.am.accounts.length + (this.am.accounts.length === 1 ? ' account' : ' accounts'))} · ${green(fmtN(totalAcctTok) + ' tok')}`;
+      lines.push('');
+      lines.push(sectionHdr('Accounts', aMeta));
       for (const i of acctOrder) {
         const acct = this.am.accounts[i];
         const list = byAcct.get(acct.name) || [];
@@ -778,8 +795,8 @@ export class TUI {
       const cap = this.byIssueExpanded ? byIssue.length : 8;
       const shown = byIssue.slice(0, cap);
       const more = byIssue.length - shown.length;
-      const iHdr = ` By issue ${cyan(byIssue.length)}${this.byIssueExpanded ? ' ' + gray('all') : ''} `;
-      lines.push(iHdr + dim('─'.repeat(Math.max(1, W - vw(iHdr)))));
+      const iMeta = `${cyan(byIssue.length)}${this.byIssueExpanded ? ' ' + gray('all') : ''}`;
+      lines.push(sectionHdr('By issue', iMeta));
       // first column is width-aware (padW) because the emoji prefix is a wide glyph.
       const irow = (a, b, c, d, e) => '   ' + padW(a, 14) + rpad(b, 6) + rpad(c, 7) + rpad(d, 9) + e;
       lines.push(dim(irow('issue', 'sess', 'msgs', 'tokens', 'avg/m')));
@@ -794,9 +811,7 @@ export class TUI {
     // ── Activity header
     lines.push('');
     const ac = this.active.size;
-    const acTag = ac > 0 ? `  ${cyan(ac + ' active')}` : '';
-    const aHdr = ` Activity${acTag} `;
-    lines.push(aHdr + dim('─'.repeat(Math.max(1, W - vw(aHdr)))));
+    lines.push(sectionHdr('Activity', ac > 0 ? cyan(ac + ' active') : ''));
 
     // Active requests
     const now = Date.now();
