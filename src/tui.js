@@ -644,26 +644,46 @@ export class TUI {
         lines.push(sH + ' '.repeat(Math.max(1, W - dw(sH) - dw(sHR))) + sHR);
       }
 
-      // one agent row, indented under its account
+      // D-1820: unified column lane model — every session-like row (agentRow and
+      // childRow) shares the SAME column start positions so chip/state/act/tok/intent
+      // form clean vertical lanes across both the Umbrellas and Accounts sections.
+      //
+      // Prefix: 8 display cells in both row types:
+      //   agentRow  → '      ' (6 sp) + mark (1) + ' ' (1) = 8
+      //   childRow  → '   ' (3 sp) + conn (2 = ├─/└─) + ' ' (1) + mark (1) + ' ' (1) = 8
+      //
+      // Column widths (display cells):
+      //   who   : padW(_, 20)  — role-glyph + emoji + issue label
+      //   [gap2]: 2 spaces
+      //   chip  : padW(_, 9)   — status word (work/review/block/todo/…)
+      //   [gap1]: 1 space
+      //   state : padW(_, 6)   — live / idle / —
+      //   [gap1]: 1 space
+      //   act   : padW(_, 3)   — ⚙ / ~ / space
+      //   [gap1]: 1 space
+      //   tok   : padW(_, 8)   — token count
+      //   [gap2]: 2 spaces
+      //   intent: W - 8 - 20 - 2 - 9 - 1 - 6 - 1 - 3 - 1 - 8 - 2 = W - 61 chars remaining
+      //
       // D-1820 Req 5: role indicator glyph prepended before emoji in who column.
-      // roleGlyph width = 1 cell; who widened to 15 (was 13) to absorb "glyph " prefix.
       // D-1820 Req 7 (display half): title fallback before sid8 — a.title shows
       // issue title for sessions with no D-N yet resolved.
+      const COL_WHO = 20, COL_CHIP = 9, COL_STATE = 6, COL_ACT = 3, COL_TOK = 8;
       const agentRow = a => {
         const mark = a.needsYou ? red('►') : (collide.has(a.issue) ? yellow('◆') : ' ');
         const roleGlyph = umbrellaLeadSet.has(a) ? dim(cyan('☂')) : (childSet.has(a) ? dim(cyan('↳')) : ' ');
         const label = a.issue || a.title || a.sid8 || '—';
-        const who = padW(roleGlyph + ' ' + (a.emoji || '·') + ' ' + label, 15);
-        const chip = padW(a.status ? statusChip(a.status) : gray('·'), 8);
-        const state = padW(a.bound ? (a.warm ? green('live') : gray('idle')) : gray('—'), 6);
+        const who   = padW(roleGlyph + ' ' + (a.emoji || '·') + ' ' + label, COL_WHO);
+        const chip  = padW(a.status ? statusChip(a.status) : gray('·'), COL_CHIP);
+        const state = padW(a.bound ? (a.warm ? green('live') : gray('idle')) : gray('—'), COL_STATE);
         // D-1739: activity glyph — ⚙ tool executing, ~ LLM responding/active, blank idle.
-        const act = padW(a.inflight ? cyan('⚙') : (a.warm ? dim('~') : ' '), 3);
-        const tok = padW(a.bound ? green(fmtN(a.tokens)) : gray('—'), 7);
-        let line = '     ' + mark + ' ' + who + chip + state + act + tok;
+        const act   = padW(a.inflight ? cyan('⚙') : (a.warm ? dim('~') : ' '), COL_ACT);
+        const tok   = padW(a.bound ? green(fmtN(a.tokens)) : gray('—'), COL_TOK);
+        let line = '      ' + mark + ' ' + who + '  ' + chip + ' ' + state + ' ' + act + ' ' + tok + '  ';
         const intent = a.intent ? a.intent.replace(/^solo:\s*/, '') : '';
         if (intent) {
           const tag = (a.intent && a.intent.startsWith('solo:')) ? cyan('solo ') : '';
-          const room = W - dw(line) - 2 - dw(tag);
+          const room = W - dw(line) - dw(tag);
           if (room > 8) line += tag + dim(intent.slice(0, room));
         }
         return line;
@@ -689,23 +709,25 @@ export class TUI {
         lines.push('');
         lines.push(sectionHdr('Umbrellas', uMeta));
 
-        // one child row — indented under its umbrella with a tree connector,
-        // columns aligned to agentRow (who/chip/state/act/tok).
+        // one child row — indented under its umbrella with a tree connector.
+        // Prefix = '   ' (3) + conn (2 = ├─/└─) + ' ' (1) + mark (1) + ' ' (1) = 8 cells,
+        // matching agentRow's 8-cell prefix so all data columns align vertically.
         // D-1820 Req 7 (display half): title fallback — a.title before a.sid8.
         const childRow = (a, last) => {
           const conn = gray(last ? '└─' : '├─');
           const mark = a.needsYou ? red('►') : (collide.has(a.issue) ? yellow('◆') : ' ');
           const clabel = a.issue || a.title || a.sid8 || '—';
-          const who = padW((a.emoji || '·') + ' ' + clabel, 13);
-          const chip = padW(a.status ? statusChip(a.status) : gray('·'), 8);
-          const state = padW(a.bound ? (a.warm ? green('live') : gray('idle')) : gray('—'), 6);
-          const act = padW(a.inflight ? cyan('⚙') : (a.warm ? dim('~') : ' '), 3);
-          const tok = padW(a.bound ? green(fmtN(a.tokens)) : gray('—'), 7);
-          let line = '   ' + conn + ' ' + mark + ' ' + who + chip + state + act + tok;
+          // No role glyph for child rows (they're implicitly ↳ by tree context); pad to COL_WHO.
+          const who   = padW((a.emoji || '·') + ' ' + clabel, COL_WHO);
+          const chip  = padW(a.status ? statusChip(a.status) : gray('·'), COL_CHIP);
+          const state = padW(a.bound ? (a.warm ? green('live') : gray('idle')) : gray('—'), COL_STATE);
+          const act   = padW(a.inflight ? cyan('⚙') : (a.warm ? dim('~') : ' '), COL_ACT);
+          const tok   = padW(a.bound ? green(fmtN(a.tokens)) : gray('—'), COL_TOK);
+          let line = '   ' + conn + ' ' + mark + ' ' + who + '  ' + chip + ' ' + state + ' ' + act + ' ' + tok + '  ';
           const intent = a.intent ? a.intent.replace(/^solo:\s*/, '') : '';
           if (intent) {
             const tag = (a.intent && a.intent.startsWith('solo:')) ? cyan('solo ') : '';
-            const room = W - dw(line) - 2 - dw(tag);
+            const room = W - dw(line) - dw(tag);
             if (room > 8) line += tag + dim(intent.slice(0, room));
           }
           return line;
@@ -716,13 +738,23 @@ export class TUI {
         for (const [pid, children] of groups) {
           const lead = agentByIssueUuid.get(pid);
           if (!lead) continue; // defensive: matches the token-total loop guard above
-          // umbrella header — distinct ☂ glyph + bold, lead's emoji + issue + status,
-          // then the umbrella's token totals: parent's own (self) + parent+children (all).
-          const who = padW('☂ ' + (lead.emoji || '·') + ' ' + (lead.issue || lead.sid8 || '—'), 16);
+          // umbrella header — ☂ + bold lead label + status chip + tok self/all totals.
+          // Layout: 1-space left indent, then COL_WHO+2 wide (bold who), then chip, then tokSeg.
+          // who is 2 cells wider than COL_WHO (the ☂ prefix occupies 2 cells by itself);
+          // we use COL_WHO+2 so the chip column lands at the same horizontal position.
+          const who = padW('☂ ' + (lead.emoji || '·') + ' ' + (lead.issue || lead.sid8 || '—'), COL_WHO + 2);
           const leadTok = lead.tokens || 0;
           const umbrellaTot = leadTok + children.reduce((s, c) => s + (c.tokens || 0), 0);
-          const tokSeg = `${green(fmtN(leadTok))} ${dim('self')} · ${bold(green(fmtN(umbrellaTot)))} ${dim('all')}`;
-          let head = ' ' + bold(who) + padW(lead.status ? statusChip(lead.status) : gray('·'), 8) + padW(tokSeg, 22);
+          // D-1820: suppress noisy "0 self · 0 all" when umbrella has no tokens at all.
+          // When umbrellaTot is 0 show a dim dash; when leadTok is 0 but children have
+          // tokens, suppress the "0 self" half and show only the "all" total.
+          const tokSeg = umbrellaTot === 0
+            ? dim('—')
+            : leadTok === 0
+              ? `${dim('—')} ${dim('self')} · ${bold(green(fmtN(umbrellaTot)))} ${dim('all')}`
+              : `${green(fmtN(leadTok))} ${dim('self')} · ${bold(green(fmtN(umbrellaTot)))} ${dim('all')}`;
+          const chip = padW(lead.status ? statusChip(lead.status) : gray('·'), COL_CHIP);
+          let head = ' ' + bold(who) + '  ' + chip + '  ' + padW(tokSeg, 24);
           const headLabel = lead.title || lead.intent || '';
           if (headLabel) {
             const room = W - dw(head) - 2;
