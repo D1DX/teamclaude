@@ -827,6 +827,16 @@ async function syncAccountsFromDisk(diskConfig, memConfig, accountManager) {
       accountManager.addAccount(diskAcct);
       added++;
       console.log(`[TeamClaude] Picked up new account "${diskAcct.name}" from config`);
+      // D-1820: warm the freshly-added account now (parity with startup warmAll)
+      // so Reload fires the 1-token request against it immediately, instead of
+      // leaving it cold until the next routed session. Best-effort + detached —
+      // never block/hang the sync on a slow or hanging fetch.
+      const newMgr = accountManager.accounts.find(a =>
+        (diskAcct.accountUuid && a.accountUuid === diskAcct.accountUuid) || a.name === diskAcct.name);
+      if (newMgr) {
+        accountManager.warmOne(newMgr, memConfig.upstream || 'https://api.anthropic.com')
+          .catch(err => console.error(`[TeamClaude] Warm failed for "${diskAcct.name}": ${err.message}`));
+      }
       continue;
     }
 
