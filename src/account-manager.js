@@ -76,6 +76,7 @@ export class AccountManager {
         lastUsed: null,
       },
       rateLimitedUntil: null,
+      _inflight: 0, // D1DX (D-1903): live count of concurrent upstream requests on this account
     }));
     this.currentIndex = 0;
     this.switchThreshold = switchThreshold;
@@ -123,6 +124,19 @@ export class AccountManager {
     this.perAccountBackoffFloorSec = opts.perAccountBackoffFloorSec ?? 60;
     this.perAccountBackoffCapSec   = opts.perAccountBackoffCapSec   ?? 600;
     this.perAccountBackoffFactor   = opts.perAccountBackoffFactor   ?? 1.5;
+    // ── D1DX patch (D-1903): per-account concurrent in-flight cap ──
+    // A second spreading dimension on top of the D-1728 warm-session-count cap:
+    // bound-session-count is not instantaneous concurrency (a bound-but-idle
+    // session is 0 load; a single hot session can fire many concurrent upstream
+    // calls). When a NEW session (re)binds, _pickAccountForBinding prefers an
+    // account whose live in-flight count is below this cap, so a burst of new
+    // sessions / rebinds spreads off an already-slammed account instead of
+    // dogpiling the single highest-weekly-urgency one (the 2026-06-05 burst-rate
+    // 429 storm: 131:1 header-less:real 429s). It only STEERS new bindings — it
+    // never cuts a warm session (cache affinity) and never refuses service (falls
+    // back to the least-in-flight account). Higher = drain weekly-urgency harder;
+    // lower = spread bursts more aggressively.
+    this.maxInFlightPerAccount = opts.maxInFlightPerAccount ?? 6;
     this._sessionTagCache = { at: 0, rows: null }; // cached sessions.json read for emoji tags
 
     // ── D1DX patch (D-1728 S6): durable per-issue usage ledger ──
@@ -279,13 +293,36 @@ export class AccountManager {
     const baseCap = Math.max(1, Math.ceil((active + 1) / usable.length));
     const ranked = usable.slice().sort((a, c) => this._weeklyUrgency(c) - this._weeklyUrgency(a));
 
+    // D1DX (D-1903): a candidate must be under BOTH the warm-session-count cap
+    // (parallel spread) AND the concurrent in-flight cap (burst spread). The
+    // in-flight check deflects a burst of new binds off an account currently
+    // slammed with concurrent requests even when its session-count is fine.
     for (const a of ranked) {
       const cap = baseCap * this._resetProximityBoost(a);
-      if (counts[a.index] < cap) return a;
+      if (counts[a.index] < cap && (a._inflight || 0) < this.maxInFlightPerAccount) return a;
     }
-    // Every usable account is at its (boosted) cap — least-loaded among the
-    // highest-urgency ranking still keeps work flowing.
-    return ranked.reduce((best, a) => (counts[a.index] < counts[best.index] ? a : best), ranked[0]);
+    // Every usable account is at a cap — keep work flowing by picking the least
+    // loaded: fewest in-flight first (spreads the burst), then fewest warm sessions.
+    return ranked.reduce((best, a) => {
+      const ai = a._inflight || 0, bi = best._inflight || 0;
+      if (ai !== bi) return ai < bi ? a : best;
+      return counts[a.index] < counts[best.index] ? a : best;
+    }, ranked[0]);
+  }
+
+  // ── D1DX patch (D-1903): per-account in-flight accounting ──────────
+  // server.js brackets each real upstream attempt with start/end so the count
+  // reflects concurrent requests actually hitting an account right now. Bounded
+  // + clamped so a missed end (it shouldn't happen — server.js guards + finally)
+  // can never wedge an account permanently above its cap.
+  noteInflightStart(accountIndex) {
+    const a = this.accounts[accountIndex];
+    if (a) a._inflight = (a._inflight || 0) + 1;
+  }
+
+  noteInflightEnd(accountIndex) {
+    const a = this.accounts[accountIndex];
+    if (a) a._inflight = Math.max(0, (a._inflight || 0) - 1);
   }
 
   // Tier-3 fallback (pure): the soonest-to-reset account, reactivated only if its
@@ -1103,6 +1140,7 @@ export class AccountManager {
       quota: emptyQuota(),
       usage: { totalInputTokens: 0, totalOutputTokens: 0, totalRequests: 0, lastUsed: null },
       rateLimitedUntil: null,
+      _inflight: 0, // D1DX (D-1903)
     });
     return index;
   }
@@ -1238,6 +1276,7 @@ export class AccountManager {
         name: a.name,
         type: a.type,
         status: a.status,
+        inflight: a._inflight || 0, // D1DX (D-1903): live concurrent in-flight count
         quota: { ...a.quota },
         usage: { ...a.usage },
         rateLimitedUntil: a.rateLimitedUntil

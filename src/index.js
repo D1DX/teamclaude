@@ -113,6 +113,8 @@ async function serverCommand() {
     perAccountBackoffFloorSec: config.perAccountBackoffFloorSec ?? 60,
     perAccountBackoffCapSec: config.perAccountBackoffCapSec ?? 600,
     perAccountBackoffFactor: config.perAccountBackoffFactor ?? 1.5,
+    // D1DX (D-1903): per-account concurrent in-flight cap (default covers configs predating the key).
+    maxInFlightPerAccount: config.maxInFlightPerAccount ?? 6,
     // D1DX (D-1728 S6): durable usage ledger tunables.
     ledgerRetentionHours: config.ledgerRetentionHours ?? 168,
     ledgerSaveSec: config.ledgerSaveSec ?? 10,

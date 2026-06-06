@@ -36,6 +36,13 @@ export function createDefaultConfig() {
     perAccountBackoffFloorSec: 60, // bounded per-account 429 backoff floor (replaces full-5h over-bench)
     perAccountBackoffCapSec: 600,  // bounded per-account 429 backoff cap
     perAccountBackoffFactor: 1.5,  // escalation per consecutive same-account 429
+    // D1DX (D-1903): per-account concurrent in-flight cap — steers a burst of new
+    // session (re)binds off an account already serving this many concurrent
+    // upstream requests, so bursts spread instead of dogpiling one account
+    // (concurrency-induced burst-rate 429s). Steers new binds only; never cuts a
+    // warm session, never refuses service. Higher = drain weekly-urgency harder;
+    // lower = spread bursts more aggressively.
+    maxInFlightPerAccount: 6,
     // D1DX (D-1728): minimal logs + auto-prune. Per-request full-body dumps are
     // OFF by default (the daily operational log keeps the signal); flip to true
     // only for deep debugging. Logs older than logRetentionHours are auto-deleted.

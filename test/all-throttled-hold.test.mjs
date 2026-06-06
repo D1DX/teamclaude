@@ -21,6 +21,7 @@ function makeAM({ account = null, hardCapped = false, backoff = 1 } = {}) {
     allThrottledBackoff() { return backoff; },
     ensureTokenFresh() {}, updateQuota() {}, markRateLimited() {},
     noteSuccess() {}, noteAccountSuccess() {}, updateUsage() {}, getStatus() { return {}; },
+    noteInflightStart() {}, noteInflightEnd() {}, // D1DX (D-1903)
   };
 }
 

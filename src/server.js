@@ -57,6 +57,21 @@ export function createProxyServer(accountManager, config, hooks = {}) {
         return;
       }
 
+      // D1DX patch (D-1903): local health endpoint. A bare `GET`/`HEAD /` (and
+      // `/health`) is a connectivity probe Claude Code / monitors fire ~every 30s.
+      // Anthropic returns 404 for it, so WITHOUT this short-circuit every probe is
+      // forwarded upstream on a real Max account — burning a token refresh + a
+      // selection + a real round-trip to api.anthropic.com, AND emitting a
+      // `GET / → <acct> (404)` oplog line (23% of the daily log on 2026-06-05) +
+      // consuming the all-throttled path during saturation (234 spurious 429s that
+      // day). Answer it locally with 200, no routing, and return BEFORE the request
+      // counter / onRequest* hooks so it never reaches an account or the log.
+      if ((req.method === 'GET' || req.method === 'HEAD') && (req.url === '/' || req.url === '/health')) {
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(req.method === 'HEAD' ? undefined : JSON.stringify({ status: 'ok', service: 'teamclaude' }));
+        return;
+      }
+
       // Let client token refresh requests pass through to upstream untouched.
       // The proxy manages its own tokens via ensureTokenFresh(); intercepting
       // or rewriting client refreshes would cause token rotation conflicts.
@@ -254,6 +269,14 @@ async function forwardRequest(req, res, body, accountManager, upstream, retryCou
     }
   }
 
+  // D1DX patch (D-1903): bracket the upstream attempt so account._inflight
+  // reflects requests actually in flight on this account right now. The finally
+  // below releases it on every exit — success, error, or a failover/hold/retry
+  // recursion. Release is correct across recursion: a recursive forwardRequest()
+  // call only reaches its own noteInflightStart AFTER its first `await`
+  // (ensureTokenFresh), which runs after this invocation's finally has fired —
+  // so the old account is always released before the new one increments.
+  accountManager.noteInflightStart(account.index);
   try {
     const upstreamRes = await fetch(upstreamUrl, {
       method,
@@ -447,6 +470,10 @@ async function forwardRequest(req, res, body, accountManager, upstream, retryCou
         error: { type: 'proxy_error', message: `Upstream error: ${err.message}` },
       }));
     }
+  } finally {
+    // D1DX patch (D-1903): release this account's in-flight slot on every exit
+    // path (success, terminal error, or a failover/hold/retry recursion).
+    accountManager.noteInflightEnd(account.index);
   }
 }
 
