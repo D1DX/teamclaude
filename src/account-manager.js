@@ -135,6 +135,18 @@ export class AccountManager {
     this.perAccountBackoffFloorSec = opts.perAccountBackoffFloorSec ?? 60;
     this.perAccountBackoffCapSec   = opts.perAccountBackoffCapSec   ?? 600;
     this.perAccountBackoffFactor   = opts.perAccountBackoffFactor   ?? 1.5;
+    // ── D1DX patch (operator 2026-06-06, D-1936): burst-429 fast recovery ──
+    // A header-less 429 on a BUDGET-HEALTHY account (comfortable headroom on
+    // both the 5h + weekly windows) is almost always burst-rate (concurrency),
+    // NOT quota — benching it for the full 60s floor pulls a healthy account out
+    // of the pool and bounces load onto the near-cap accounts (the 2026-06-06
+    // churn: cherry/daniel at 17–20% used cycling throttled while apple/banana
+    // at 85–95% became the sink). Such an account gets a SHORT cooldown so it
+    // rejoins in seconds; a near-cap account keeps the long floor (stays rested).
+    this.burstBackoffFloorSec = opts.burstBackoffFloorSec ?? 5;    // short cooldown for a healthy burst-429
+    this.burstBackoffCapSec   = opts.burstBackoffCapSec   ?? 30;   // bounded — a flapping hotspot still climbs but stays in rotation
+    this.burstStaggerSec      = opts.burstStaggerSec      ?? 2;    // reduced de-sync stagger on the burst path
+    this.burstHealthyBelow    = opts.burstHealthyBelow    ?? 0.80; // both 5h+weekly below this ⇒ treat a header-less 429 as burst, not quota
     // ── D1DX patch (D-1903): per-account concurrent in-flight cap ──
     // A second spreading dimension on top of the D-1728 warm-session-count cap:
     // bound-session-count is not instantaneous concurrency (a bound-but-idle
@@ -988,29 +1000,41 @@ export class AccountManager {
 
     const capMs = this.perAccountBackoffCapSec * 1000;
     let windowMs;
+    let burstHealthy = false; // header-less 429 on a budget-healthy account → short cooldown
     if (retryAfterSeconds != null && !isNaN(retryAfterSeconds)) {
       // Honor an explicit header, but never bench beyond the bounded cap.
       windowMs = Math.min(retryAfterSeconds * 1000, capMs);
     } else {
-      // No header — bounded escalating backoff (floor × factor^(streak-1)).
-      const sec = Math.min(
-        this.perAccountBackoffCapSec,
-        this.perAccountBackoffFloorSec * Math.pow(this.perAccountBackoffFactor, account._rl429Streak - 1),
-      );
+      // No header. Distinguish a BURST (concurrency) 429 from a genuine
+      // quota/rolling-window 429: an account with comfortable headroom on BOTH
+      // windows that 429s is burst-rate, not out of budget (D-1936). A null
+      // window is treated as healthy for that window (warmer anchors them;
+      // absence must not force the long bench). Healthy → short cooldown so it
+      // rejoins the pool in seconds; near-cap → the existing 60s escalating floor.
+      const q = account.quota;
+      burstHealthy = !this._atHardLimit(account)
+        && (q.unified5h == null || q.unified5h < this.burstHealthyBelow)
+        && (q.unified7d == null || q.unified7d < this.burstHealthyBelow);
+      const floorSec = burstHealthy ? this.burstBackoffFloorSec : this.perAccountBackoffFloorSec;
+      const capSec   = burstHealthy ? this.burstBackoffCapSec   : this.perAccountBackoffCapSec;
+      const sec = Math.min(capSec, floorSec * Math.pow(this.perAccountBackoffFactor, account._rl429Streak - 1));
       windowMs = sec * 1000;
     }
 
     // S2: per-account stagger (deterministic base by index) + jitter (tail), so
     // a burst of 429s doesn't cluster every account's window on the same instant.
-    const staggerMs = account.index * this.recoveryStaggerSec * 1000
-      + Math.random() * this.recoveryStaggerSec * 1000;
+    // The burst path uses a reduced unit so a healthy account isn't held out by
+    // a long stagger that would undo the short cooldown.
+    const staggerUnit = burstHealthy ? this.burstStaggerSec : this.recoveryStaggerSec;
+    const staggerMs = account.index * staggerUnit * 1000
+      + Math.random() * staggerUnit * 1000;
 
     account.status = 'throttled';
     account.rateLimitedUntil = now + windowMs + staggerMs;
     // D1DX patch: remember the displaced current account so selection
     // prefers returning to it (cache-warm) at the next switch once it clears.
     if (accountIndex === this.currentIndex) this.homeIndex = accountIndex;
-    console.log(`[TeamClaude] Account "${account.name}" rate limited until +${Math.round((windowMs + staggerMs) / 1000)}s (429 streak ${account._rl429Streak})`);
+    console.log(`[TeamClaude] Account "${account.name}" rate limited until +${Math.round((windowMs + staggerMs) / 1000)}s (429 streak ${account._rl429Streak}${burstHealthy ? ', burst — short cooldown' : ''})`);
   }
 
   /**

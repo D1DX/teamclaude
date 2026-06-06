@@ -37,12 +37,15 @@ const throttleAll = (am, untilMs) => {
 { const am = mk({ perAccountBackoffFloorSec: 60, recoveryStaggerSec: 5 });
   const now = Date.now();
   am.accounts[1].quota.unified5hReset = now + 200000; // 200s out — D-1728 must IGNORE this
+  am.accounts[1].quota.unified7d = 0.90;               // D-1936: near-cap → sustained (long) backoff path
   am.markRateLimited(1, null);                          // 429 with NO retry-after header
   const remaining = am.accounts[1].rateLimitedUntil - now;
-  // D-1728 supersedes D-1705 S1 for a SINGLE account: a headerless 429 uses the
-  // bounded per-account backoff (floor 60s + index stagger), NOT the full 5h
-  // reset (200s). The rolling 5h window recovers long before the nominal reset.
-  ok('D-1728 markRateLimited(null header) = bounded backoff (~60s), not the full 5h reset (200s)',
+  // D-1728 supersedes D-1705 S1 for a SINGLE account: a headerless 429 on a
+  // near-cap account uses the bounded per-account backoff (floor 60s + index
+  // stagger), NOT the full 5h reset (200s). The rolling 5h window recovers long
+  // before the nominal reset. (D-1936: a budget-HEALTHY account would instead
+  // get the short burst cooldown — see burst-recovery.test.mjs.)
+  ok('D-1728 markRateLimited(null header) on near-cap = bounded backoff (~60s), not the full 5h reset (200s)',
      remaining >= 60000 && remaining < 80000); }
 
 // ── S2: de-synchronized recovery (per-account stagger) ─────────────────────

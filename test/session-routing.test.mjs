@@ -77,12 +77,16 @@ const H = 3600 * 1000, D = 24 * H;
   ok('reset-proximity boost is 1 when the account has no weekly headroom', am._resetProximityBoost(am.accounts[0]) === 1); }
 
 // ── S3: bounded per-account backoff — escalates, caps, resets on success ──────
+// D-1936: the SUSTAINED path (near-cap account) keeps the 60s floor. A headerless
+// 429 on a near-cap account is genuine pressure, not burst → long backoff. (The
+// budget-healthy burst path → short cooldown is covered in burst-recovery.test.mjs.)
 { const am = mk({ perAccountBackoffFloorSec: 60, perAccountBackoffFactor: 1.5, perAccountBackoffCapSec: 600, recoveryStaggerSec: 0 });
+  am.accounts[0].quota.unified7d = 0.90;             // near-cap → sustained (long) backoff path
   const now = Date.now();
   am.markRateLimited(0, null); const w1 = Math.round((am.accounts[0].rateLimitedUntil - now) / 1000);
   am.markRateLimited(0, null); const w2 = Math.round((am.accounts[0].rateLimitedUntil - now) / 1000);
   am.markRateLimited(0, null); const w3 = Math.round((am.accounts[0].rateLimitedUntil - now) / 1000);
-  ok('headerless 429 escalates bounded backoff 60→90→135 (not the full 5h reset)', w1 === 60 && w2 === 90 && w3 === 135);
+  ok('headerless 429 on a near-cap account escalates bounded 60→90→135 (not the full 5h reset)', w1 === 60 && w2 === 90 && w3 === 135);
   am.noteAccountSuccess(0);
   am.markRateLimited(0, null); const w4 = Math.round((am.accounts[0].rateLimitedUntil - now) / 1000);
   ok('a success resets the per-account 429 streak back to the floor', w4 === 60); }
