@@ -6,6 +6,7 @@ import { join } from 'node:path';
 
 const WEEK_MS = 7 * 24 * 60 * 60 * 1000;
 const HOUR_MS = 60 * 60 * 1000;
+const DAY_MS = 24 * 60 * 60 * 1000;
 // D1DX (D-1728): D1DX session presence registry — used only to resolve a
 // session emoji for log/TUI display. Best-effort; never load-bearing for routing.
 const SESSIONS_REGISTRY = join(homedir(), '.claude', 'state', 'sessions.json');
@@ -117,6 +118,16 @@ export class AccountManager {
     this.bindingEvictMs        = (opts.bindingEvictSec        ?? 1800) * 1000; // drop idle bindings
     this.bindingBoostBaseHours = opts.bindingBoostBaseHours    ?? 48;          // reset-proximity boost knee
     this.bindingMaxBoost       = opts.bindingMaxBoost          ?? this.accounts.length; // cap the boost
+    // ── D1DX patch (operator 2026-06-06, D-1936): hard weekly-reserve floor ──
+    // The reset-proximity boost above piles new sessions onto a near-reset
+    // account (use-it-or-lose-it), punching through the SOFT weeklyReserve cap
+    // and fully draining it. This floor is HARD for NEW bindings: an account
+    // must retain weeklyReservePerDay of weekly budget for every 24h left until
+    // its 7d reset, else it is excluded from new bindings (warm sessions still
+    // hold — cache affinity). Degrades to most-headroom when ALL are below floor
+    // (never refuses service). weeklyReserveFloorCap clamps the early-week floor.
+    this.weeklyReservePerDay   = opts.weeklyReservePerDay   ?? 0.075; // ~7.5%/24h-left (operator band 5–10%)
+    this.weeklyReserveFloorCap = opts.weeklyReserveFloorCap ?? 0.50;  // clamp so early-week never excludes the whole pool
     // Per-account bounded backoff (D-1728): replaces the D-1705 "derive the full
     // 5h reset on a headerless 429" over-bench. A 429 benches the account for a
     // bounded escalating window (floor × factor^streak), not hours — so a
@@ -277,6 +288,18 @@ export class AccountManager {
     return Math.min(this.bindingMaxBoost, Math.max(1, boost));
   }
 
+  // Hard reserve floor (operator 2026-06-06, D-1936): the minimum weekly
+  // headroom an account must keep to remain eligible for NEW bindings =
+  // weeklyReservePerDay × days-to-7d-reset, clamped to weeklyReserveFloorCap.
+  // Protects ~5–10% per 24h left from the reset-proximity boost. Returns 0 when
+  // the reset time is unknown (can't compute days-left → don't gate the account).
+  _weeklyReserveFloor(account) {
+    const reset = account.quota.unified7dReset;
+    if (!reset) return 0;
+    const daysToReset = Math.max(0, (reset - Date.now()) / DAY_MS);
+    return Math.min(this.weeklyReserveFloorCap, this.weeklyReservePerDay * daysToReset);
+  }
+
   /**
    * Pick the best account to (re)bind a session to (pure — no global-sticky side
    * effects). Spreads sessions across accounts for parallel throughput (load
@@ -289,9 +312,16 @@ export class AccountManager {
     const usable = this.accounts.filter(a => this._isUsable(a));
     if (usable.length === 0) return this._soonestUsableOrNull();
 
+    // D1DX (operator 2026-06-06, D-1936): prefer accounts that still hold their
+    // hard reserve floor; only dip into below-floor (reserve-protected) accounts
+    // when nothing above-floor remains — so a near-reset account isn't drained
+    // past its ~5–10%/24h-left band while a headroom account sits idle.
+    const aboveFloor = usable.filter(a => this._weeklyRemaining(a) > this._weeklyReserveFloor(a));
+    const pool = aboveFloor.length > 0 ? aboveFloor : usable;
+
     const { counts, active } = this._activeSessionCounts();
-    const baseCap = Math.max(1, Math.ceil((active + 1) / usable.length));
-    const ranked = usable.slice().sort((a, c) => this._weeklyUrgency(c) - this._weeklyUrgency(a));
+    const baseCap = Math.max(1, Math.ceil((active + 1) / pool.length));
+    const ranked = pool.slice().sort((a, c) => this._weeklyUrgency(c) - this._weeklyUrgency(a));
 
     // D1DX (D-1903): a candidate must be under BOTH the warm-session-count cap
     // (parallel spread) AND the concurrent in-flight cap (burst spread). The

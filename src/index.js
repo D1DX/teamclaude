@@ -110,6 +110,9 @@ async function serverCommand() {
     bindingEvictSec: config.bindingEvictSec ?? 1800,
     bindingBoostBaseHours: config.bindingBoostBaseHours ?? 48,
     bindingMaxBoost: config.bindingMaxBoost ?? null,
+    // D1DX (operator 2026-06-06, D-1936): hard weekly-reserve floor for new bindings.
+    weeklyReservePerDay: config.weeklyReservePerDay ?? 0.075,
+    weeklyReserveFloorCap: config.weeklyReserveFloorCap ?? 0.50,
     perAccountBackoffFloorSec: config.perAccountBackoffFloorSec ?? 60,
     perAccountBackoffCapSec: config.perAccountBackoffCapSec ?? 600,
     perAccountBackoffFactor: config.perAccountBackoffFactor ?? 1.5,
