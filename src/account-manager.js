@@ -1,5 +1,5 @@
 import { refreshAccessToken, isTokenExpiringSoon } from './oauth.js';
-import { readFileSync, writeFileSync, renameSync } from 'node:fs';
+import { readFileSync, writeFileSync, renameSync, readdirSync, statSync } from 'node:fs';
 import { homedir, totalmem, freemem, loadavg, cpus, platform } from 'node:os';
 import { execFileSync } from 'node:child_process';
 import { join } from 'node:path';
@@ -10,6 +10,8 @@ const DAY_MS = 24 * 60 * 60 * 1000;
 // D1DX (D-1728): D1DX session presence registry — used only to resolve a
 // session emoji for log/TUI display. Best-effort; never load-bearing for routing.
 const SESSIONS_REGISTRY = join(homedir(), '.claude', 'state', 'sessions.json');
+const PROJECTS_DIR = join(homedir(), '.claude', 'projects');
+const SESSION_ZOMBIE_MS = 12 * 60 * 60 * 1000; // 12h — matches lib-sessions PC_ZOMBIE_THRESHOLD_S (D-2085)
 
 // macOS "Memory Used" (App + Wired + Compressed), matching Activity Monitor.
 // os.freemem() can't be used here — it excludes reclaimable cache, overstating
@@ -468,6 +470,39 @@ export class AccountManager {
     return data;
   }
 
+  // D-2085: return the age (ms) of the newest matching transcript file for a
+  // session sid of the form "cc-<uuid>". Globs ~/.claude/projects/*/<uuid>.jsonl;
+  // if multiple matches, uses the newest mtime. Returns null if no file found or
+  // on any fs error (sentinel → caller treats as conservative present).
+  _transcriptAgeMs(sid) {
+    if (!sid) return null;
+    const uuid = sid.startsWith('cc-') ? sid.slice(3) : sid;
+    try {
+      let newestMtime = null;
+      let projectDirs;
+      try { projectDirs = readdirSync(PROJECTS_DIR); } catch { return null; }
+      for (const dir of projectDirs) {
+        const candidate = join(PROJECTS_DIR, dir, `${uuid}.jsonl`);
+        try {
+          const st = statSync(candidate);
+          if (newestMtime === null || st.mtimeMs > newestMtime) newestMtime = st.mtimeMs;
+        } catch { /* not found in this dir */ }
+      }
+      if (newestMtime === null) return null;
+      return Date.now() - newestMtime;
+    } catch { return null; }
+  }
+
+  // D-2085: a row is PRESENT (keep it in fleet) iff its pid is alive (fast
+  // positive), OR its transcript is not a zombie. Mirrors pc_session_present
+  // in lib-sessions.sh (D-2085). Conservative: unknown transcript → present.
+  _present(r) {
+    if (this._pidAlive(r.pid)) return true;          // fast positive
+    const age = this._transcriptAgeMs(r.sid);
+    if (age == null) return true;                    // unknown transcript → conservative present
+    return age <= SESSION_ZOMBIE_MS;                 // fresh → present; stale >12h → zombie
+  }
+
   // D-1739: every live presence-registry row enriched with its local pin
   // overlay — the whole-fleet spine for Deck (includes agents the proxy has
   // never routed). Best-effort + credential-free; empty array if unreadable.
@@ -481,7 +516,7 @@ export class AccountManager {
   }
 
   fleetRows() {
-    const rows = (this._readSessionsRegistry() || []).filter(r => this._pidAlive(r.pid));
+    const rows = (this._readSessionsRegistry() || []).filter(r => this._present(r));
     return rows.map(r => {
       const pin = this._sessionPin(r.sid);
       return {
