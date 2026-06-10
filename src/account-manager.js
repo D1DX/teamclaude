@@ -162,6 +162,19 @@ export class AccountManager {
     // back to the least-in-flight account). Higher = drain weekly-urgency harder;
     // lower = spread bursts more aggressively.
     this.maxInFlightPerAccount = opts.maxInFlightPerAccount ?? 6;
+    // ── D1DX patch #10 (operator 2026-06-10, D-2104): pace-to-expiry controller ──
+    // Each account tracks an expected-utilization line expected(t) = fraction-of-
+    // week-elapsed (half the week gone ⇒ aim for 50% weekly used). A new binding
+    // goes to the account most BEHIND its line (gap = expected − u7d). Accounts in
+    // expiringAccounts (subscriptions ending — daniel/apple) take ABSOLUTE
+    // precedence while behind their line, so their soon-to-vanish budget drains
+    // first; the reserve/floor partition is bypassed for them (the controller
+    // subsumes it). Accounts more than paceOvershootGuard AHEAD of their line stop
+    // taking new bindings (overshoot guard). When the expiring accounts catch up,
+    // demand flows to the others' gaps. Default [] ⇒ pure pace-to-line, no
+    // precedence (still strictly better drain than the prior weekly-urgency rank).
+    this.expiringAccounts  = opts.expiringAccounts  ?? [];   // account names that should drain before expiry
+    this.paceOvershootGuard = opts.paceOvershootGuard ?? 0.05; // > this far AHEAD of line ⇒ no new bindings
     this._sessionTagCache = { at: 0, rows: null }; // cached sessions.json read for emoji tags
 
     // ── D1DX patch (D-1728 S6): durable per-issue usage ledger ──
@@ -314,28 +327,82 @@ export class AccountManager {
     return Math.min(this.weeklyReserveFloorCap, this.weeklyReservePerDay * daysToReset);
   }
 
+  // ── D1DX patch #10 (D-2104): pace-to-expiry controller helpers ──────────────
+  // expected(t) = fraction of THIS account's own 7d window that has elapsed.
+  // 0 just after a reset → 1 at the reset. Per-account (each account's 7d window
+  // is anchored independently). Returns null when the reset time is unknown — we
+  // can't place the line, so the gap is treated as neutral (0) by _paceGap.
+  _paceExpected(account) {
+    const reset = account.quota.unified7dReset;
+    if (!reset) return null;
+    const tToReset = Math.max(0, reset - Date.now());
+    return 1 - Math.min(1, tToReset / WEEK_MS);
+  }
+
+  // Signed distance from the expected line: expected − weekly-used.
+  //   > 0  → BEHIND the line (under-utilized; wants more bindings)
+  //   < 0  → AHEAD of the line (over-utilized; overshoot guard may exclude it)
+  //   = 0  → on the line, or the reset is unknown (neutral — neither promoted nor guarded)
+  _paceGap(account) {
+    const expected = this._paceExpected(account);
+    if (expected == null) return 0;
+    const u7d = account.quota.unified7d ?? 0;
+    return expected - u7d;
+  }
+
+  // Subscription ending soon — drain before expiry. Names come from config
+  // (expiringAccounts); empty by default ⇒ no account gets precedence.
+  _isExpiring(account) {
+    return this.expiringAccounts.includes(account.name);
+  }
+
   /**
    * Pick the best account to (re)bind a session to (pure — no global-sticky side
    * effects). Spreads sessions across accounts for parallel throughput (load
-   * cap = ceil((active+1)/usable)), drains the highest weekly-urgency account
-   * first, and loosens the cap by the reset-proximity boost so soon-to-reset
-   * budget is drained aggressively. The 5h hard ceiling (_isUsable) + 429
-   * failover bound over-stacking. Returns null only when the pool is exhausted.
+   * cap = ceil((active+1)/usable)), drains the account most BEHIND its expected-
+   * utilization line first (expiring accounts first while behind — D-2104), and
+   * loosens the cap by the reset-proximity boost so soon-to-reset budget is
+   * drained aggressively. The 5h hard ceiling (_isUsable) + 429 failover bound
+   * over-stacking. Returns null only when the pool is exhausted.
    */
   _pickAccountForBinding() {
     const usable = this.accounts.filter(a => this._isUsable(a));
     if (usable.length === 0) return this._soonestUsableOrNull();
 
-    // D1DX (operator 2026-06-06, D-1936): prefer accounts that still hold their
-    // hard reserve floor; only dip into below-floor (reserve-protected) accounts
-    // when nothing above-floor remains — so a near-reset account isn't drained
-    // past its ~5–10%/24h-left band while a headroom account sits idle.
-    const aboveFloor = usable.filter(a => this._weeklyRemaining(a) > this._weeklyReserveFloor(a));
-    const pool = aboveFloor.length > 0 ? aboveFloor : usable;
+    // ── D1DX patch #10 (operator 2026-06-10, D-2104): pace-to-expiry controller ──
+    // Rank by how far BEHIND its expected-utilization line an account is (gap =
+    // expected − u7d) instead of weekly-urgency; expiring accounts get absolute
+    // precedence while behind; accounts well ahead of the line are guarded out.
+    // The parallel-spread rails below (load cap × reset-proximity boost, in-flight
+    // cap, least-loaded fallback) are unchanged — only the pool + rank change.
+
+    // Overshoot guard: an account more than paceOvershootGuard AHEAD of its line
+    // stops taking NEW bindings (its warm sessions still hold — cache affinity).
+    // Degrade to all-usable if that would leave nobody (never refuse service).
+    const onPace = usable.filter(a => this._paceGap(a) >= -this.paceOvershootGuard);
+    const guarded = onPace.length > 0 ? onPace : usable;
+
+    // Expiring-first precedence: while ANY expiring account is behind its line,
+    // restrict new bindings to the expiring-behind set so their soon-to-vanish
+    // budget drains first. Expiring accounts are exempt from the D-1936 reserve
+    // floor (the controller subsumes it). Once they catch up (gap ≤ 0), demand
+    // flows to everyone, with the reserve floor still protecting non-expiring
+    // accounts (degrade to guarded if the floor would empty the pool).
+    const expiringBehind = guarded.filter(a => this._isExpiring(a) && this._paceGap(a) > 0);
+    let pool;
+    if (expiringBehind.length > 0) {
+      pool = expiringBehind;
+    } else {
+      const aboveFloor = guarded.filter(a =>
+        this._isExpiring(a) || this._weeklyRemaining(a) > this._weeklyReserveFloor(a));
+      pool = aboveFloor.length > 0 ? aboveFloor : guarded;
+    }
 
     const { counts, active } = this._activeSessionCounts();
     const baseCap = Math.max(1, Math.ceil((active + 1) / pool.length));
-    const ranked = pool.slice().sort((a, c) => this._weeklyUrgency(c) - this._weeklyUrgency(a));
+    // Most BEHIND its pace line first — continuous use-it-or-lose-it (replaces the
+    // weekly-urgency rank; the reset-proximity boost stays on the cap below).
+    const ranked = pool.slice().sort((a, c) => this._paceGap(c) - this._paceGap(a));
 
     // D1DX (D-1903): a candidate must be under BOTH the warm-session-count cap
     // (parallel spread) AND the concurrent in-flight cap (burst spread). The

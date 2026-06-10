@@ -43,6 +43,14 @@ export function createDefaultConfig() {
     // warm session, never refuses service. Higher = drain weekly-urgency harder;
     // lower = spread bursts more aggressively.
     maxInFlightPerAccount: 6,
+    // D1DX patch #10 (operator 2026-06-10, D-2104): pace-to-expiry controller.
+    // expiringAccounts — names whose subscriptions end soon; they drain to their
+    // expected-utilization line FIRST (absolute precedence while behind) and skip
+    // the reserve floor. Empty = no precedence (pure pace-to-line for all).
+    // paceOvershootGuard — an account more than this far AHEAD of its line stops
+    // taking new bindings (warm sessions still hold). 0.05 = 5 points.
+    expiringAccounts: [],
+    paceOvershootGuard: 0.05,
     // D1DX (D-1728): minimal logs + auto-prune. Per-request full-body dumps are
     // OFF by default (the daily operational log keeps the signal); flip to true
     // only for deep debugging. Logs older than logRetentionHours are auto-deleted.

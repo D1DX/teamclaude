@@ -123,6 +123,10 @@ async function serverCommand() {
     burstHealthyBelow: config.burstHealthyBelow ?? 0.80,
     // D1DX (D-1903): per-account concurrent in-flight cap (default covers configs predating the key).
     maxInFlightPerAccount: config.maxInFlightPerAccount ?? 6,
+    // D1DX patch #10 (operator 2026-06-10, D-2104): pace-to-expiry controller
+    // (defaults cover configs predating the keys; [] ⇒ no expiring precedence).
+    expiringAccounts: config.expiringAccounts ?? [],
+    paceOvershootGuard: config.paceOvershootGuard ?? 0.05,
     // D1DX (D-1728 S6): durable usage ledger tunables.
     ledgerRetentionHours: config.ledgerRetentionHours ?? 168,
     ledgerSaveSec: config.ledgerSaveSec ?? 10,
