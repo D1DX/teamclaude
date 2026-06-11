@@ -182,6 +182,65 @@ function renderFleet(allAgents) {
   ok('solo D-SOLO not in tree block', !treeBlock.some(l => l.includes('D-SOLO')));
 }
 
+// ── LIVE PATH: real pin.json on disk, read through production fleetRows() ──────
+// Acceptance #3 ("verified live against a running multi-level fleet"): drive the
+// REAL fleetRows()->_sessionPin() disk-read path (NOT a fleetRows stub) against a
+// 3-level fleet written as actual pin.json files, exactly as a live fleet writes
+// them. Only the binding/snapshot helpers are stubbed (those need the live proxy).
+{
+  const SS = join(homedir(), '.claude', 'state', 'sessions');
+  const nodes = [
+    { sid:'cc-treetest-hoo', emoji:'🦘', pin:{ identifier:'D-HOO', issueId:'tt-uHOO', parentId:null, status:'in_progress', title:'HoO', labels:['orchestrator'] } },
+    { sid:'cc-treetest-A',   emoji:'🦛', pin:{ identifier:'D-A',   issueId:'tt-uA', parentId:'tt-uHOO', status:'in_progress', labels:['orchestrator:child','orchestrator'] } },
+    { sid:'cc-treetest-B',   emoji:'🦝', pin:{ identifier:'D-B',   issueId:'tt-uB', parentId:'tt-uHOO', status:'in_review' } },
+    { sid:'cc-treetest-A1',  emoji:'🦜', pin:{ identifier:'D-A1',  issueId:'tt-uA1', parentId:'tt-uA', status:'blocked' } },
+    { sid:'cc-treetest-B1',  emoji:'🦉', pin:{ identifier:'D-B1',  issueId:'tt-uB1', parentId:'tt-uB', status:'in_progress' } },
+  ];
+  const dirs = [];
+  try {
+    for (const n of nodes) { const d = join(SS, n.sid); mkdirSync(d, { recursive: true }); writeFileSync(join(d, 'pin.json'), JSON.stringify(n.pin)); dirs.push(d); }
+    const am = mk();
+    // Inject ONLY the registry rows; pins are read REAL from disk by fleetRows->_sessionPin.
+    am._sessionTagCache = { at: Date.now() + 1e9, rows: nodes.map(n => ({ sid:n.sid, pid:process.pid, emoji:n.emoji, intent:null, pinned_issue:n.pin.identifier })) };
+    const toks = { 'cc-treetest-hoo':10000,'cc-treetest-A':5000,'cc-treetest-B':3000,'cc-treetest-A1':20000,'cc-treetest-B1':12000 };
+    am.sessionBindingSummary = () => nodes.map(n => ({ fullSid:n.sid, tokens:toks[n.sid], inputTokens:toks[n.sid], outputTokens:0, account:'a0', warm:false, idleSec:null }));
+    am.ledgerBySid = () => new Map();
+    am.sessionAggregate = () => ({ tokens:50000, inputTokens:50000, outputTokens:0, sessions:5, warm:0, requests:0, elapsedSec:1 });
+    am.systemSnapshot = () => ({ proxyRssMB:100, proxyUptimeSec:60, totalMemMB:16384, usedMemMB:8192, usedMemPct:50, loadAvg:[0.5,0.5,0.5], cpuCount:8 });
+    am.ledgerByIssue = () => [];
+
+    // fleetRows() reads the pins from DISK — prove the tree linkage came through it.
+    const fr = am.fleetRows().filter(f => f.sid.startsWith('cc-treetest-'));
+    ok('fleetRows read 5 pins from disk', fr.length === 5);
+    ok('fleetRows surfaced parentId chain from disk', fr.find(f => f.issue === 'D-A1')?.parentId === 'tt-uA');
+
+    const stub = { accountManager: am, config: {}, saveConfig() {}, syncAccounts() {}, onQuit() {} };
+    const tui = new TUI(stub); tui.running = true;
+    const oc = process.stdout.columns, orw = process.stdout.rows;
+    Object.defineProperty(process.stdout, 'columns', { value: 110, configurable: true });
+    Object.defineProperty(process.stdout, 'rows',    { value: 60,  configurable: true });
+    const w = []; const ow = process.stdout.write.bind(process.stdout);
+    process.stdout.write = c => { w.push(String(c)); return true; };
+    try { tui.render(); } finally {
+      process.stdout.write = ow;
+      Object.defineProperty(process.stdout, 'columns', { value: oc, configurable: true });
+      Object.defineProperty(process.stdout, 'rows',    { value: orw, configurable: true });
+      tui.running = false;
+    }
+    const lines = w.join('').replace(/\x1b\[[0-9;]*m/g, '').split(/\r?\n/);
+    const has = s => lines.some(l => l.includes(s));
+    const lw = s => lines.find(l => l.includes(s)) || '';
+    ok('LIVE: Tree renders 5 nodes from disk pins', lines.some(l => /Tree/.test(l) && l.includes('5 nodes')));
+    ok('LIVE: L0 root D-HOO', has('D-HOO'));
+    ok('LIVE: L1 D-A', has('D-A '));
+    ok('LIVE: L2 D-A1 (3rd level)', has('D-A1'));
+    ok('LIVE: HoO Σ 50k subtree', /Σ/.test(lw('D-HOO')) && lw('D-HOO').includes('50'));
+    ok('LIVE: Levels line spans 3 depths', /L0/.test(lw('Levels')) && /L1/.test(lw('Levels')) && /L2/.test(lw('Levels')));
+  } finally {
+    for (const d of dirs) { try { rmSync(d, { recursive: true, force: true }); } catch {} }
+  }
+}
+
 // ── Cycle / malformed-parent safety: a self-parent node must not hang render. ──
 {
   const root = makeAgent({ sid: 'cc-r', issueId: 'uR', issue: 'D-R', tokens: 100 });
