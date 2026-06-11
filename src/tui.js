@@ -527,17 +527,12 @@ export class TUI {
     const bindByBare = new Map(binds.map(b => [bareOf(b.fullSid), b]));
     const needsYouP = p => !!(p && (p.status === 'blocked' || p.status === 'in_review' || p.assigneeUserId));
 
-    // D-1827: derive umbrella type from the umbrella lead's labels array.
-    // Labels are written by pc-current --set only when agent-kit supports it;
-    // defaults to 'unknown' when the labels field is absent or has no umbrella:* entry.
-    const umbrellaTypeOf = labels => {
-      if (!Array.isArray(labels)) return 'unknown';
-      for (const l of labels) {
-        const m = typeof l === 'string' ? l.match(/^umbrella:(parallel|sequential|hybrid)$/i) : null;
-        if (m) return m[1].charAt(0).toUpperCase() + m[1].slice(1).toLowerCase();
-      }
-      return 'unknown';
-    };
+    // D-2105: orchestrator-role detection is pure parentId (tree nesting), not a
+    // label. The legacy umbrella:(parallel|sequential|hybrid) type-breakdown is
+    // retired — the charter has no sub-type label, and per-level rollups (below)
+    // are the new aggregate view. Phase/ordering display is D-1866's job.
+    const isOrchestratorLabel = l =>
+      typeof l === 'string' && /^orchestrator(:child)?$/i.test(l);
 
     // resolve every registry agent → account (current OR last-known) + live data
     const agents = fleet.map(f => {
@@ -708,146 +703,101 @@ export class TUI {
         return line;
       };
 
-      // ══ D-1820 Req 4: Umbrellas as a standalone section ════════════════
-      // After the Top section, before account groups. The umbrella→children tree
-      // (D-1798) renders here. Orphan children (lead not live/wrapped) remain in
-      // the account groups below, exactly as today.
-      if (kidsByParent.size > 0) {
-        const totalKids = [...kidsByParent.values()].reduce((s, l) => s + l.length, 0);
-        const treeWord = kidsByParent.size === 1 ? ' umbrella' : ' umbrellas';
+      // ══ D-2105: Tree — the FULL orchestration tree, recursive to any depth ══
+      // Roots = lead agents (≥1 live child) whose own parent is NOT a live agent
+      // (top of a tree; orphan-as-root). Each node renders depth-indented with
+      // ├─/└─ connectors + │ continuation bars; tokens roll up per-subtree
+      // (self · Σ), per-level (Levels line), and per-tree ($ on the header).
+      // Tree art lives INSIDE the who column so chip/state/act/tok lanes stay
+      // vertically aligned at EVERY depth. Replaces the one-level Umbrellas
+      // section (D-1798/D-1820/D-1827); folds the umbrella→orchestrator rename
+      // (D-1960). Phase/ordering display stays D-1866's job.
+      const isChildAgent = a => a.parentId && agentByIssueUuid.has(a.parentId);
+      const treeRoots = agents.filter(a => a.issueId && kidsByParent.has(a.issueId) && !isChildAgent(a));
 
-        // D-1820 Req 6: token total on the header — sum of each umbrella lead's
-        // tokens + its children's tokens; mirrors the ` By issue ` TOTAL pattern.
-        let totalUmbrellaTok = 0;
-        for (const [pid, children] of kidsByParent) {
-          const lead = agentByIssueUuid.get(pid);
-          if (lead) totalUmbrellaTok += lead.tokens;
-          for (const c of children) totalUmbrellaTok += c.tokens;
-        }
-        const uMeta = `${cyan(kidsByParent.size + treeWord)} · ${gray(totalKids + (totalKids === 1 ? ' child' : ' children'))} · ${green(fmtN(totalUmbrellaTok) + ' tok')}`;
+      if (treeRoots.length > 0) {
+        // memoized subtree token total (self + all descendants); cycle-safe.
+        const subtreeTokCache = new Map();
+        const subtreeTokens = (a, seen = new Set()) => {
+          const key = a.issueId;
+          if (key && subtreeTokCache.has(key)) return subtreeTokCache.get(key);
+          if (key && seen.has(key)) return a.tokens || 0; // cycle: count self only
+          if (key) seen.add(key);
+          let t = a.tokens || 0;
+          for (const c of (kidsByParent.get(key) || [])) t += subtreeTokens(c, seen);
+          if (key) subtreeTokCache.set(key, t);
+          return t;
+        };
+
+        // running totals filled during the recursive walk.
+        let treeNodeCount = 0, treeIn = 0, treeOut = 0;
+        const levelStats = []; // depth → { count, tokens }
+
         lines.push('');
-        lines.push(sectionHdr('Umbrellas', uMeta));
+        const hdrIdx = lines.length;
+        lines.push(''); // header placeholder — filled after totals are known
 
-        // D-1827: per-type breakdown — one line per type present (Parallel / Sequential / Hybrid / unknown).
-        // Rolls up count · children · tokens across all umbrellas of each type.
-        // Type is read from the umbrella lead's labels array (umbrella:parallel|sequential|hybrid).
-        // Defaults to 'unknown' when labels are absent (pc-current does not yet write them).
-        //
-        // Two populations of umbrella leads:
-        //   A) Agents in kidsByParent (have ≥1 live child) — the normal case.
-        //   B) Agents with an umbrella:* label whose issueId is NOT in kidsByParent
-        //      (declared as umbrella but currently childless) — still count as an umbrella
-        //      for type-stats, and Parallel ones get a mismatch nudge in the tree below.
-        {
-          const typeStats = new Map(); // typeName → { count, children, tokens }
-          const accum = (lead, kidsArr) => {
-            const typeName = umbrellaTypeOf(lead.labels);
-            let s = typeStats.get(typeName);
-            if (!s) { s = { count: 0, children: 0, tokens: 0 }; typeStats.set(typeName, s); }
-            s.count++;
-            s.children += kidsArr.length;
-            s.tokens += (lead.tokens || 0) + kidsArr.reduce((acc, c) => acc + (c.tokens || 0), 0);
-          };
-          // Population A: leads with live children.
-          for (const [pid, kidsArr] of kidsByParent) {
-            const lead = agentByIssueUuid.get(pid);
-            if (lead) accum(lead, kidsArr);
-          }
-          // Population B: agents declaring umbrella:* but with no live children.
-          for (const a of agents) {
-            if (!a.issueId || kidsByParent.has(a.issueId)) continue; // already counted or not a lead
-            if (!Array.isArray(a.labels) || !a.labels.some(l => /^umbrella:(parallel|sequential|hybrid)$/i.test(l))) continue;
-            accum(a, []);
-          }
-          // Canonical order: Parallel → Sequential → Hybrid → unknown (alphabetical for any others).
-          const TYPE_ORDER = ['Parallel', 'Sequential', 'Hybrid'];
-          const typeNames = [...typeStats.keys()].sort((a, b) => {
-            const ai = TYPE_ORDER.indexOf(a), bi = TYPE_ORDER.indexOf(b);
-            if (ai !== -1 && bi !== -1) return ai - bi;
-            if (ai !== -1) return -1;
-            if (bi !== -1) return 1;
-            return a.localeCompare(b);
-          });
-          const COL_TYPE = 11; // 'Sequential' is 10 chars; pad to 11 for alignment
-          for (const t of typeNames) {
-            const s = typeStats.get(t);
-            const typeLbl = padW(t, COL_TYPE);
-            const cntLbl  = cyan(String(s.count));
-            const kidLbl  = gray(s.children + ' ↳');
-            const tokLbl  = green(fmtN(s.tokens));
-            lines.push(`  ${typeLbl} ${cntLbl} · ${kidLbl} · ${tokLbl}`);
-          }
-        }
+        // who-column width for the tree: the indented art + emoji + label all live
+        // inside this fixed lane so every other column lines up at any depth.
+        const COL_WHO_TREE = 26;
+        const renderNode = (a, depth, isLast, bars, seen) => {
+          if (a.issueId && seen.has(a.issueId)) return; // cycle guard
+          if (a.issueId) seen.add(a.issueId);
+          treeNodeCount++;
+          treeIn += a.inTok || 0; treeOut += a.outTok || 0;
+          if (!levelStats[depth]) levelStats[depth] = { count: 0, tokens: 0 };
+          levelStats[depth].count++;
+          levelStats[depth].tokens += a.tokens || 0;
 
-        // one child row — indented under its umbrella with a tree connector.
-        // Prefix = '   ' (3) + conn (2 = ├─/└─) + ' ' (1) + mark (1) + ' ' (1) = 8 cells,
-        // matching agentRow's 8-cell prefix so all data columns align vertically.
-        // D-1820 Req 7 (display half): title fallback — a.title before a.sid8.
-        const childRow = (a, last) => {
-          const conn = gray(last ? '└─' : '├─');
+          const kids = (a.issueId ? kidsByParent.get(a.issueId) : null) || [];
+          const isLead = kids.length > 0;
+          const indent = bars.map(b => (b ? '│  ' : '   ')).join('');
+          const conn = depth === 0 ? '' : (isLast ? '└─ ' : '├─ ');
+          const glyph = isLead ? dim(cyan('☂')) + ' ' : (depth > 0 ? dim(cyan('↳')) + ' ' : '');
+          const label = a.issue || a.title || a.sid8 || '—';
+          const whoRaw = indent + conn + glyph + (a.emoji || '·') + ' ' + label;
+          const who = padW(whoRaw, COL_WHO_TREE);
           const mark = a.needsYou ? red('►') : (collide.has(a.issue) ? yellow('◆') : ' ');
-          const clabel = a.issue || a.title || a.sid8 || '—';
-          // No role glyph for child rows (they're implicitly ↳ by tree context); pad to COL_WHO.
-          const who   = padW((a.emoji || '·') + ' ' + clabel, COL_WHO);
           const chip  = padW(a.status ? statusChip(a.status) : gray('·'), COL_CHIP);
           const state = padW(a.bound ? (a.warm ? green('live') : gray('idle')) : gray('—'), COL_STATE);
           const act   = padW(a.inflight ? cyan('⚙') : (a.warm ? dim('~') : ' '), COL_ACT);
           const tok   = padW(a.bound ? green(fmtN(a.tokens)) : gray('—'), COL_TOK);
-          let line = '   ' + conn + ' ' + mark + ' ' + who + '  ' + chip + ' ' + state + ' ' + act + ' ' + tok + '  ';
-          const intent = a.intent ? a.intent.replace(/^solo:\s*/, '') : '';
-          if (intent) {
-            const tag = (a.intent && a.intent.startsWith('solo:')) ? cyan('solo ') : '';
-            const room = W - dw(line) - dw(tag);
-            if (room > 8) line += tag + dim(intent.slice(0, room));
+          let line = ' ' + mark + ' ' + (depth === 0 ? bold(who) : who) + '  ' + chip + ' ' + state + ' ' + act + ' ' + tok;
+          // lead nodes also show the Σ subtree total after the self-token lane.
+          if (isLead) line += '  ' + dim('Σ') + ' ' + bold(green(fmtN(subtreeTokens(a))));
+          // intent / title tail
+          const tailRaw = (depth === 0 ? (a.title || a.intent) : a.intent) || '';
+          if (tailRaw) {
+            const tail = tailRaw.replace(/^solo:\s*/, '');
+            const room = W - dw(line) - 2;
+            if (room > 8) line += '  ' + dim(tail.slice(0, room));
           }
-          return line;
+          lines.push(line);
+          // recurse children, largest subtree first.
+          const ordered = [...kids].sort((x, y) => subtreeTokens(y) - subtreeTokens(x));
+          ordered.forEach((c, i) =>
+            renderNode(c, depth + 1, i === ordered.length - 1, [...bars, !isLast], seen));
         };
 
-        // umbrellas ordered by child count desc (biggest fan-out first).
-        const groups = [...kidsByParent.entries()].sort((x, y) => y[1].length - x[1].length);
-        for (const [pid, children] of groups) {
-          const lead = agentByIssueUuid.get(pid);
-          if (!lead) continue; // defensive: matches the token-total loop guard above
-          // umbrella header — ☂ + bold lead label + status chip + tok self/all totals.
-          // Layout: 1-space left indent, then COL_WHO+2 wide (bold who), then chip, then tokSeg.
-          // who is 2 cells wider than COL_WHO (the ☂ prefix occupies 2 cells by itself);
-          // we use COL_WHO+2 so the chip column lands at the same horizontal position.
-          const who = padW('☂ ' + (lead.emoji || '·') + ' ' + (lead.issue || lead.sid8 || '—'), COL_WHO + 2);
-          const leadTok = lead.tokens || 0;
-          const umbrellaTot = leadTok + children.reduce((s, c) => s + (c.tokens || 0), 0);
-          // D-1820: suppress noisy "0 self · 0 all" when umbrella has no tokens at all.
-          // When umbrellaTot is 0 show a dim dash; when leadTok is 0 but children have
-          // tokens, suppress the "0 self" half and show only the "all" total.
-          const tokSeg = umbrellaTot === 0
-            ? dim('—')
-            : leadTok === 0
-              ? `${dim('—')} ${dim('self')} · ${bold(green(fmtN(umbrellaTot)))} ${dim('all')}`
-              : `${green(fmtN(leadTok))} ${dim('self')} · ${bold(green(fmtN(umbrellaTot)))} ${dim('all')}`;
-          const chip = padW(lead.status ? statusChip(lead.status) : gray('·'), COL_CHIP);
-          let head = ' ' + bold(who) + '  ' + chip + '  ' + padW(tokSeg, 24);
-          const headLabel = lead.title || lead.intent || '';
-          if (headLabel) {
-            const room = W - dw(head) - 2;
-            if (room > 8) head += ' ' + dim(headLabel.slice(0, room));
-          }
-          lines.push(head);
-          children.sort((x, y) => (y.tokens - x.tokens)); // token-desc, like every other list
-          children.forEach((c, idx) => lines.push(childRow(c, idx === children.length - 1)));
-        }
+        const seen = new Set();
+        const rootsOrdered = [...treeRoots].sort((x, y) => subtreeTokens(y) - subtreeTokens(x));
+        let treeTok = 0;
+        for (const r of rootsOrdered) { treeTok += subtreeTokens(r); renderNode(r, 0, true, [], seen); }
 
-        // D-1827: mismatch nudge — render declared-Parallel umbrellas with 0 live
-        // children (they have an umbrella:parallel label but no child registered yet).
-        // These agents never appear in kidsByParent (no child = not a key), so they
-        // need a separate pass. One dim ⚠ per agent; no hard enforcement.
-        for (const a of agents) {
-          if (!a.issueId || kidsByParent.has(a.issueId)) continue;
-          if (umbrellaTypeOf(a.labels) !== 'Parallel') continue;
-          if (!Array.isArray(a.labels) || !a.labels.some(l => /^umbrella:parallel$/i.test(l))) continue;
-          const who = padW('☂ ' + (a.emoji || '·') + ' ' + (a.issue || a.sid8 || '—'), COL_WHO + 2);
-          const chip = padW(a.status ? statusChip(a.status) : gray('·'), COL_CHIP);
-          const nudge = dim('⚠ no live children');
-          let head = ' ' + bold(who) + '  ' + chip + '  ' + padW(dim('—'), 24) + ' ' + nudge;
-          lines.push(head);
+        // header — now that the walk computed node count + tokens.
+        const treeWord = treeRoots.length === 1 ? ' tree' : ' trees';
+        const treeCost = this._cost(treeIn, treeOut);
+        const tMeta = `${cyan(treeRoots.length + treeWord)} · ${gray(treeNodeCount + (treeNodeCount === 1 ? ' node' : ' nodes'))} · ${green(fmtN(treeTok) + ' tok')} · ${green('$' + treeCost.toFixed(2))}`;
+        lines[hdrIdx] = sectionHdr('Tree', tMeta);
+
+        // S3: per-level rollup line — count · tokens at each depth.
+        if (levelStats.some(Boolean)) {
+          let lv = ' ' + dim('Levels');
+          levelStats.forEach((s, d) => {
+            if (!s) return;
+            lv += `  ${cyan('L' + d)} ${s.count}·${green(fmtN(s.tokens))}`;
+          });
+          lines.push(lv);
         }
       }
 
