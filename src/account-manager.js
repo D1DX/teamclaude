@@ -54,6 +54,46 @@ function _macUsedBytes() {
   }
 }
 
+// Real CPU-busy % (100 − idle), from os.cpus() aggregate time deltas. The CPU
+// gauge previously used the system LOAD AVERAGE (load/cores), which counts
+// runnable+waiting threads — so it pegged red even when cores sat idle (a Mac
+// at 60% idle still showed "100%"). This measures actual compute: busy =
+// 1 − idleΔ/totalΔ between two consecutive snapshots. Cached 1s so multiple
+// reads in one render tick reuse the same delta window; the first call (no
+// prior sample) seeds from cumulative-since-boot. Returns 0..100, or null if
+// cpus() is unavailable (caller keeps load average as the fallback display).
+let _cpuPrev = null; // { idle, total } from the last cache-miss sample
+let _cpuBusyCache = { at: 0, pct: null };
+function _cpuBusyPct() {
+  const now = Date.now();
+  if (_cpuBusyCache.pct != null && now - _cpuBusyCache.at < 1000) return _cpuBusyCache.pct;
+  let idle = 0, total = 0;
+  try {
+    for (const c of cpus()) {
+      const t = c.times;
+      idle += t.idle;
+      total += t.user + t.nice + t.sys + t.idle + t.irq;
+    }
+  } catch {
+    return null;
+  }
+  let pct;
+  if (_cpuPrev) {
+    const idleD = idle - _cpuPrev.idle;
+    const totalD = total - _cpuPrev.total;
+    pct = totalD > 0
+      ? Math.max(0, Math.min(100, Math.round(100 * (1 - idleD / totalD))))
+      : (_cpuBusyCache.pct ?? 0); // no tick elapsed — reuse last reading
+  } else {
+    // First call: cumulative-since-boot busy% — valid, just less responsive
+    // until the next sample establishes a delta window.
+    pct = total > 0 ? Math.round(100 * (1 - idle / total)) : 0;
+  }
+  _cpuPrev = { idle, total };
+  _cpuBusyCache = { at: now, pct };
+  return pct;
+}
+
 function emptyQuota() {
   return {
     // Standard API rate limits (API key accounts)
@@ -560,6 +600,7 @@ export class AccountManager {
       usedMemPct: Math.round((used / total) * 100),
       loadAvg: loadavg().map(n => Math.round(n * 100) / 100),
       cpuCount: cpus().length,
+      cpuBusyPct: _cpuBusyPct(), // D-2173: actual CPU utilization (the gauge driver); load avg kept as secondary text
     };
   }
 

@@ -453,7 +453,7 @@ async function statusCommand() {
     const gb = mb => mb == null ? '?' : (mb / 1024).toFixed(1);
     console.log(`Proxy:    UP · port ${config.proxy.port} · up ${fmtDur(sys.proxyUptimeSec)} · proxy RSS ${sys.proxyRssMB ?? '?'}MB`);
     console.log(`Routing:  ${wired}`);
-    console.log(`System:   RAM ${gb(sys.usedMemMB)}/${gb(sys.totalMemMB)}GB (${sys.usedMemPct ?? '?'}%) · load ${(sys.loadAvg || []).join(' ')} · ${sys.cpuCount ?? '?'} cpus`);
+    console.log(`System:   RAM ${gb(sys.usedMemMB)}/${gb(sys.totalMemMB)}GB (${sys.usedMemPct ?? '?'}%) · cpu ${sys.cpuBusyPct ?? '?'}% busy · load ${(sys.loadAvg || []).join(' ')} · ${sys.cpuCount ?? '?'} cpus`);
     console.log('');
 
     console.log(`Active account: ${data.currentAccount}`);

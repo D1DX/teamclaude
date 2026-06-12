@@ -464,7 +464,11 @@ export class TUI {
     const cpus = sys.cpuCount || 1;
     const load = sys.loadAvg?.[0] ?? 0;
     const ramRatio = (sys.usedMemPct ?? 0) / 100;
-    const loadRatio = Math.min(1, load / cpus); // 1.0 = all cores saturated
+    // D-2173: gauge ACTUAL CPU-busy % (1.0 = cores saturated). Load average
+    // over-reports — it counts runnable+waiting threads, pegging red even when
+    // idle. Fall back to load/cpus only if cpuBusyPct is unavailable (non-os).
+    const cpuBusy = sys.cpuBusyPct;
+    const cpuRatio = cpuBusy != null ? cpuBusy / 100 : Math.min(1, load / cpus);
     const GW = 16; // gauge width (cells)
 
     // Issues segment: count throttled / exhausted accounts (kept on the summary line).
@@ -479,7 +483,7 @@ export class TUI {
     return [
       ' ' + gray(`proxy ${sys.proxyRssMB}MB · up ${fmtDur(sys.proxyUptimeSec)} · ${cpus} cpus`) + issuesSeg,
       ' ' + lbl('RAM') + bar(ramRatio, GW) + gray(`  ${gb(sys.usedMemMB)}/${gb(sys.totalMemMB)}GB`),
-      ' ' + lbl('CPU') + bar(loadRatio, GW) + gray(`  load ${load} / ${cpus} cores`),
+      ' ' + lbl('CPU') + bar(cpuRatio, GW) + gray(`  ${cpuBusy != null ? cpuBusy + '% busy · ' : ''}load ${load} / ${cpus} cores`),
     ];
   }
 
