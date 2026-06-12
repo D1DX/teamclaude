@@ -147,6 +147,8 @@ function fmtDur(sec) {
   const d = Math.floor(h / 24);
   return `${d}d${h % 24}h`;
 }
+// D-2169: compact API-equivalent $ for a Deck cell (— when zero).
+function fmtCost(c) { return (c && c > 0) ? '$' + c.toFixed(2) : '—'; }
 
 // D-1820: rolling quota window lengths — the pace arrow compares used% against
 // how much of the window has elapsed. Claude Max: 5h session + 7d weekly.
@@ -453,23 +455,19 @@ export class TUI {
   // threshold coloring inside here without touching the Top section layout.
   // Returns the line STRING (leading space + gray content) or null when sys is falsy.
   // D-1820 Req 3: threshold-color RAM%, load, and issues segment; gray scaffolding preserved.
-  _proxyLine(sys, _W) {
-    if (!sys) return null;
+  // D-2169: visual proxy/host health panel — gauge bars for RAM + CPU-load (the
+  // existing bar() helper colors green<0.7 / yellow<0.9 / red≥0.9), plus a proxy
+  // summary line. Returns an array of rendered lines (or [] when sys is falsy).
+  _healthPanel(sys) {
+    if (!sys) return [];
     const gb = mb => (mb / 1024).toFixed(1);
+    const cpus = sys.cpuCount || 1;
+    const load = sys.loadAvg?.[0] ?? 0;
+    const ramRatio = (sys.usedMemPct ?? 0) / 100;
+    const loadRatio = Math.min(1, load / cpus); // 1.0 = all cores saturated
+    const GW = 16; // gauge width (cells)
 
-    // RAM % threshold color: green < 70, yellow 70–89, red ≥ 90
-    const ramPct = sys.usedMemPct;
-    const ramColor = ramPct >= 90 ? red : ramPct >= 70 ? yellow : green;
-    const ramStr = gray(`${gb(sys.usedMemMB)}/`) + gray(`${gb(sys.totalMemMB)}GB`) +
-      gray(' (') + ramColor(`${ramPct}%`) + gray(')');
-
-    // Load threshold color: green < cpus*0.7, yellow < cpus, red ≥ cpus
-    const load = sys.loadAvg[0];
-    const cpus = sys.cpuCount;
-    const loadColor = load >= cpus ? red : load >= cpus * 0.7 ? yellow : green;
-    const loadStr = loadColor(`${load}`);
-
-    // Issues segment: count throttled/exhausted/error accounts
+    // Issues segment: count throttled / exhausted accounts (kept on the summary line).
     const accounts = this.am.accounts || [];
     const throttledN = accounts.filter(a => a.status === 'throttled').length;
     const errorN = accounts.filter(a => a.status === 'exhausted' || a.status === 'error').length;
@@ -477,11 +475,12 @@ export class TUI {
     if (throttledN > 0) issuesSeg += gray(' · ') + yellow(`${throttledN} throttled`);
     if (errorN > 0)     issuesSeg += gray(' · ') + red(`${errorN} error`);
 
-    return ' ' +
-      gray(`proxy ${sys.proxyRssMB}MB · up ${fmtDur(sys.proxyUptimeSec)}    host RAM `) +
-      ramStr +
-      gray(` · load `) + loadStr + gray(` · ${cpus} cpus`) +
-      issuesSeg;
+    const lbl = s => gray(padW(s, 5)); // aligned gauge labels
+    return [
+      ' ' + gray(`proxy ${sys.proxyRssMB}MB · up ${fmtDur(sys.proxyUptimeSec)} · ${cpus} cpus`) + issuesSeg,
+      ' ' + lbl('RAM') + bar(ramRatio, GW) + gray(`  ${gb(sys.usedMemMB)}/${gb(sys.totalMemMB)}GB`),
+      ' ' + lbl('CPU') + bar(loadRatio, GW) + gray(`  load ${load} / ${cpus} cores`),
+    ];
   }
 
   render() {
@@ -512,7 +511,7 @@ export class TUI {
     lines.push(left + ' '.repeat(Math.max(1, W - vw(left) - vw(right))) + right);
     lines.push(' ' + dim('─'.repeat(W - 2)));
 
-    // D-1728 S8: system resource snapshot — rendered via _proxyLine in the Top section.
+    // D-1728 S8: system resource snapshot — rendered via _healthPanel in the Top section (D-2169).
     const sys = this.am.systemSnapshot ? this.am.systemSnapshot() : null;
 
     // ── Fleet control plane (D-1739): every live agent clustered UNDER its
@@ -545,6 +544,7 @@ export class TUI {
         account: b?.account || lastAcct.get(bare)?.account || null,
         bound: !!b, warm: b?.warm || false, idleSec: b?.idleSec ?? null,
         tokens: b?.tokens || 0, inTok: b?.inputTokens || 0, outTok: b?.outputTokens || 0,
+        cost: b?.cost || 0, // D-2169: API-equivalent $ for this session
         // D-1798: umbrella→children tree linkage (from pin.json, via fleetRows).
         issueId: f.issueId || f.pin?.issueId || null, // own pinned-issue UUID
         parentId: f.parentId || f.pin?.parentId || null, // umbrella issue UUID
@@ -620,7 +620,7 @@ export class TUI {
       lines.push(yellow('  No accounts configured. Press [a] to add one.'));
     } else {
       const showBoth = W >= 70;
-      const aggCost = agg ? this._cost(agg.inputTokens, agg.outputTokens) : 0;
+      const aggCost = agg ? (agg.cost || 0) : 0; // D-2169: accurate per-model $ (not the flat _cost guess)
       const bw = showBoth
         ? Math.max(5, Math.min(16, Math.floor((W - 60) / 2)))
         : Math.max(5, Math.min(16, W - 48));
@@ -639,9 +639,8 @@ export class TUI {
         lines.push('');
         lines.push(sectionHdr('Top'));
 
-        // proxy/system line — child C owns coloring inside _proxyLine
-        const pl = this._proxyLine(sys, W);
-        if (pl) lines.push(pl);
+        // D-2169: visual health panel (proxy summary + RAM/CPU gauge bars)
+        for (const hl of this._healthPanel(sys)) lines.push(hl);
 
         // fleet summary left: agent breakdown + attention signals
         let sH = ` Fleet  ${cyan(agents.length + ' agents')}`;
@@ -682,7 +681,7 @@ export class TUI {
       // D-1820 Req 5: role indicator glyph prepended before emoji in who column.
       // D-1820 Req 7 (display half): title fallback before sid8 — a.title shows
       // issue title for sessions with no D-N yet resolved.
-      const COL_WHO = 20, COL_CHIP = 9, COL_STATE = 6, COL_ACT = 3, COL_TOK = 8;
+      const COL_WHO = 20, COL_CHIP = 9, COL_STATE = 6, COL_ACT = 3, COL_TOK = 8, COL_COST = 8;
       const agentRow = a => {
         const mark = a.needsYou ? red('►') : (collide.has(a.issue) ? yellow('◆') : ' ');
         const roleGlyph = umbrellaLeadSet.has(a) ? dim(cyan('☂')) : (childSet.has(a) ? dim(cyan('↳')) : ' ');
@@ -693,7 +692,8 @@ export class TUI {
         // D-1739: activity glyph — ⚙ tool executing, ~ LLM responding/active, blank idle.
         const act   = padW(a.inflight ? cyan('⚙') : (a.warm ? dim('~') : ' '), COL_ACT);
         const tok   = padW(a.bound ? green(fmtN(a.tokens)) : gray('—'), COL_TOK);
-        let line = '      ' + mark + ' ' + who + '  ' + chip + ' ' + state + ' ' + act + ' ' + tok + '  ';
+        const cst   = padW(a.bound && a.cost ? green(fmtCost(a.cost)) : gray('—'), COL_COST); // D-2169
+        let line = '      ' + mark + ' ' + who + '  ' + chip + ' ' + state + ' ' + act + ' ' + tok + ' ' + cst + '  ';
         const intent = a.intent ? a.intent.replace(/^solo:\s*/, '') : '';
         if (intent) {
           const tag = (a.intent && a.intent.startsWith('solo:')) ? cyan('solo ') : '';
@@ -730,7 +730,7 @@ export class TUI {
         };
 
         // running totals filled during the recursive walk.
-        let treeNodeCount = 0, treeIn = 0, treeOut = 0;
+        let treeNodeCount = 0, treeIn = 0, treeOut = 0, treeCostAcc = 0; // D-2169: $ rollup
         const levelStats = []; // depth → { count, tokens }
 
         lines.push('');
@@ -744,7 +744,7 @@ export class TUI {
           if (a.issueId && seen.has(a.issueId)) return; // cycle guard
           if (a.issueId) seen.add(a.issueId);
           treeNodeCount++;
-          treeIn += a.inTok || 0; treeOut += a.outTok || 0;
+          treeIn += a.inTok || 0; treeOut += a.outTok || 0; treeCostAcc += a.cost || 0;
           if (!levelStats[depth]) levelStats[depth] = { count: 0, tokens: 0 };
           levelStats[depth].count++;
           levelStats[depth].tokens += a.tokens || 0;
@@ -762,7 +762,8 @@ export class TUI {
           const state = padW(a.bound ? (a.warm ? green('live') : gray('idle')) : gray('—'), COL_STATE);
           const act   = padW(a.inflight ? cyan('⚙') : (a.warm ? dim('~') : ' '), COL_ACT);
           const tok   = padW(a.bound ? green(fmtN(a.tokens)) : gray('—'), COL_TOK);
-          let line = ' ' + mark + ' ' + (depth === 0 ? bold(who) : who) + '  ' + chip + ' ' + state + ' ' + act + ' ' + tok;
+          const cst   = padW(a.bound && a.cost ? green(fmtCost(a.cost)) : gray('—'), COL_COST); // D-2169
+          let line = ' ' + mark + ' ' + (depth === 0 ? bold(who) : who) + '  ' + chip + ' ' + state + ' ' + act + ' ' + tok + ' ' + cst;
           // lead nodes also show the Σ subtree total after the self-token lane.
           if (isLead) line += '  ' + dim('Σ') + ' ' + bold(green(fmtN(subtreeTokens(a))));
           // intent / title tail
@@ -786,7 +787,7 @@ export class TUI {
 
         // header — now that the walk computed node count + tokens.
         const treeWord = treeRoots.length === 1 ? ' tree' : ' trees';
-        const treeCost = this._cost(treeIn, treeOut);
+        const treeCost = treeCostAcc; // D-2169: accurate per-model $ rollup
         const tMeta = `${cyan(treeRoots.length + treeWord)} · ${gray(treeNodeCount + (treeNodeCount === 1 ? ' node' : ' nodes'))} · ${green(fmtN(treeTok) + ' tok')} · ${green('$' + treeCost.toFixed(2))}`;
         lines[hdrIdx] = sectionHdr('Tree', tMeta);
 
@@ -865,14 +866,15 @@ export class TUI {
       const iMeta = `${cyan(byIssue.length)}${this.byIssueExpanded ? ' ' + gray('all') : ''}`;
       lines.push(sectionHdr('By issue', iMeta));
       // first column is width-aware (padW) because the emoji prefix is a wide glyph.
-      const irow = (a, b, c, d, e) => '   ' + padW(a, 14) + rpad(b, 6) + rpad(c, 7) + rpad(d, 9) + e;
-      lines.push(dim(irow('issue', 'sess', 'msgs', 'tokens', 'avg/m')));
-      const tot = byIssue.reduce((a, g) => ({ s: a.s + g.sessions, m: a.m + g.messages, t: a.t + g.tokens }), { s: 0, m: 0, t: 0 });
+      // D-2169: + a $ cost column between tokens and avg/m.
+      const irow = (a, b, c, d, e, f) => '   ' + padW(a, 14) + rpad(b, 6) + rpad(c, 7) + rpad(d, 9) + rpad(e, 9) + f;
+      lines.push(dim(irow('issue', 'sess', 'msgs', 'tokens', '$', 'avg/m')));
+      const tot = byIssue.reduce((a, g) => ({ s: a.s + g.sessions, m: a.m + g.messages, t: a.t + g.tokens, c: a.c + (g.cost || 0) }), { s: 0, m: 0, t: 0, c: 0 });
       for (const g of shown) {
-        lines.push(irow(issueLabel(g.issue), String(g.sessions), String(g.messages), fmtN(g.tokens), fmtN(g.avgTokensPerMsg)));
+        lines.push(irow(issueLabel(g.issue), String(g.sessions), String(g.messages), fmtN(g.tokens), fmtCost(g.cost), fmtN(g.avgTokensPerMsg)));
       }
       if (more > 0) lines.push('   ' + gray(`… +${more} more — press i`));
-      lines.push(bold(irow('TOTAL', String(tot.s), String(tot.m), fmtN(tot.t), fmtN(tot.m ? Math.round(tot.t / tot.m) : 0))));
+      lines.push(bold(irow('TOTAL', String(tot.s), String(tot.m), fmtN(tot.t), fmtCost(tot.c), fmtN(tot.m ? Math.round(tot.t / tot.m) : 0))));
     }
 
     // ── Activity header

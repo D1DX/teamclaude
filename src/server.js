@@ -634,20 +634,39 @@ function parseSSEUsage(event, accountIndex, accountManager, sessionId = null) {
   try {
     const data = JSON.parse(dataLine.slice(6));
     if (data.type === 'message_start' && data.message?.usage) {
-      accountManager.updateUsage(accountIndex, data.message.usage.input_tokens, 0, sessionId);
+      // D-2169: input + cache tokens + model land on message_start. Output
+      // tokens arrive on message_delta (no model — the binding remembers it).
+      accountManager.updateUsage(
+        accountIndex, data.message.usage.input_tokens || 0, 0, sessionId,
+        { ..._cacheOpts(data.message.usage), model: data.message.model || null },
+      );
     } else if (data.type === 'message_delta' && data.usage) {
-      accountManager.updateUsage(accountIndex, 0, data.usage.output_tokens, sessionId);
+      accountManager.updateUsage(accountIndex, 0, data.usage.output_tokens || 0, sessionId);
     }
   } catch {
     // not valid JSON, skip
   }
 }
 
+// D-2169: split a usage object's cache-creation into 5m vs 1h. When the API
+// omits the breakdown, treat all cache-creation as 5m (Claude Code's default TTL).
+function _cacheOpts(usage) {
+  const cc = usage.cache_creation || {};
+  let c5 = cc.ephemeral_5m_input_tokens;
+  let c1 = cc.ephemeral_1h_input_tokens;
+  if (c5 == null && c1 == null) { c5 = usage.cache_creation_input_tokens || 0; c1 = 0; }
+  else { c5 = c5 || 0; c1 = c1 || 0; }
+  return { cacheCreate5m: c5, cacheCreate1h: c1, cacheRead: usage.cache_read_input_tokens || 0 };
+}
+
 function extractUsageFromBody(buffer, accountIndex, accountManager, sessionId = null) {
   try {
     const json = JSON.parse(buffer.toString());
     if (json.usage) {
-      accountManager.updateUsage(accountIndex, json.usage.input_tokens, json.usage.output_tokens, sessionId);
+      accountManager.updateUsage(
+        accountIndex, json.usage.input_tokens || 0, json.usage.output_tokens || 0, sessionId,
+        { ..._cacheOpts(json.usage), model: json.model || null },
+      );
     }
   } catch {
     // not JSON or no usage

@@ -5,6 +5,22 @@ import { execFileSync } from 'node:child_process';
 import { join } from 'node:path';
 
 const WEEK_MS = 7 * 24 * 60 * 60 * 1000;
+
+// D1DX (D-2169): per-model API pricing, $/Mtok [input, output]. The Messages API
+// returns no cost field — we compute the API-equivalent cost from token usage +
+// the response's `model`. Cache multipliers (of the INPUT rate): write-5m 1.25×,
+// write-1h 2×, read 0.1×. Family parsed from the model string; unknown → opus
+// (Claude Code is predominantly Opus). Override per-family via opts.pricing.
+const PRICING = {
+  fable:  [10, 50],   // claude-fable-5 / mythos-5 (new top tier)
+  mythos: [10, 50],
+  opus:   [5, 25],    // opus 4.x
+  sonnet: [3, 15],    // sonnet 4.x
+  haiku:  [1, 5],     // haiku 4.5
+};
+const CACHE_WRITE_5M_MULT = 1.25;
+const CACHE_WRITE_1H_MULT = 2.0;
+const CACHE_READ_MULT = 0.1;
 // D1DX (D-1728): D1DX session presence registry — used only to resolve a
 // session emoji for log/TUI display. Best-effort; never load-bearing for routing.
 const SESSIONS_REGISTRY = join(homedir(), '.claude', 'state', 'sessions.json');
@@ -117,6 +133,24 @@ export class AccountManager {
     this.ledgerSaveMs = (opts.ledgerSaveSec ?? 10) * 1000;
     this._ledgerDirty = false;
     this._ledgerLastSaveAt = 0;
+
+    // D1DX (D-2169): per-model price overrides (family → [in$, out$] per Mtok).
+    // Falls back to the PRICING table above per family.
+    this.pricing = opts.pricing ?? null;
+  }
+
+  // D1DX (D-2169): resolve $/Mtok [input, output] for a model string. Family
+  // parsed from the string; unknown → opus (CC is mostly Opus).
+  _priceFor(model) {
+    const m = String(model || '').toLowerCase();
+    let key = 'opus';
+    if (m.includes('fable')) key = 'fable';
+    else if (m.includes('mythos')) key = 'mythos';
+    else if (m.includes('opus')) key = 'opus';
+    else if (m.includes('sonnet')) key = 'sonnet';
+    else if (m.includes('haiku')) key = 'haiku';
+    const [inp, out] = (this.pricing && this.pricing[key]) || PRICING[key];
+    return { in: inp, out };
   }
 
   // D1DX patch: actively sweep ALL accounts every request + on every status read,
@@ -563,6 +597,8 @@ export class AccountManager {
         inputTokens: b.inputTokens || 0,
         outputTokens: b.outputTokens || 0,
         tokens,
+        cost: b.cost || 0,            // D-2169: API-equivalent $ for this session
+        model: b.model || null,       // D-2169: last-seen model (for the price tier)
         avgTokensPerMsg: reqs ? Math.round(tokens / reqs) : 0,
         tokensPerMin: Math.round(tokens / (elapsedSec / 60)),
       });
@@ -573,19 +609,20 @@ export class AccountManager {
   // Aggregate across all live sessions for the dashboard TOTAL (D-1728).
   sessionAggregate() {
     const now = Date.now();
-    let sessions = 0, warm = 0, requests = 0, inputTokens = 0, outputTokens = 0, earliest = now;
+    let sessions = 0, warm = 0, requests = 0, inputTokens = 0, outputTokens = 0, cost = 0, earliest = now;
     for (const b of this.sessionBindings.values()) {
       sessions++;
       if (now - b.lastUsedAt < this.cacheAffinityWindowMs) warm++;
       requests += b.requests || 0;
       inputTokens += b.inputTokens || 0;
       outputTokens += b.outputTokens || 0;
+      cost += b.cost || 0;
       if (b.firstSeenAt && b.firstSeenAt < earliest) earliest = b.firstSeenAt;
     }
     const tokens = inputTokens + outputTokens;
     const elapsedSec = Math.max(1, Math.round((now - earliest) / 1000));
     return {
-      sessions, warm, requests, inputTokens, outputTokens, tokens, elapsedSec,
+      sessions, warm, requests, inputTokens, outputTokens, tokens, cost, elapsedSec,
       avgTokensPerMsg: requests ? Math.round(tokens / requests) : 0,
       tokensPerMin: Math.round(tokens / (elapsedSec / 60)),
     };
@@ -629,19 +666,22 @@ export class AccountManager {
   }
 
   // Attribute one message's usage to the durable ledger (keyed by sid::issue).
-  _ledgerTouch(sessionId, accountName, inputTokens, outputTokens) {
+  // D1DX (D-2169): also accumulates `cost` ($) and remembers the last `model`.
+  _ledgerTouch(sessionId, accountName, inputTokens, outputTokens, cost = 0, model = null) {
     if (!sessionId) return;
     const issue = this._sessionRow(sessionId)?.pinned_issue || '';
     const key = `${sessionId}::${issue}`;
     let e = this.usageLedger.get(key);
     const now = Date.now();
     if (!e) {
-      e = { sid: sessionId, issue, account: accountName, messages: 0, inputTokens: 0, outputTokens: 0, firstSeenAt: now, lastActiveAt: now };
+      e = { sid: sessionId, issue, account: accountName, messages: 0, inputTokens: 0, outputTokens: 0, cost: 0, model: null, firstSeenAt: now, lastActiveAt: now };
       this.usageLedger.set(key, e);
     }
     e.account = accountName;
     if (inputTokens) { e.messages++; e.inputTokens += inputTokens; }
     if (outputTokens) e.outputTokens += outputTokens;
+    if (cost) e.cost = (e.cost || 0) + cost;
+    if (model) e.model = model;
     e.lastActiveAt = now;
     this._ledgerDirty = true;
   }
@@ -660,11 +700,12 @@ export class AccountManager {
     for (const e of this.usageLedger.values()) {
       const k = e.issue || '(unassigned)';
       let g = byIssue.get(k);
-      if (!g) { g = { issue: k, sessions: 0, messages: 0, inputTokens: 0, outputTokens: 0, lastActiveAt: 0 }; byIssue.set(k, g); }
+      if (!g) { g = { issue: k, sessions: 0, messages: 0, inputTokens: 0, outputTokens: 0, cost: 0, lastActiveAt: 0 }; byIssue.set(k, g); }
       g.sessions++;
       g.messages += e.messages || 0;
       g.inputTokens += e.inputTokens || 0;
       g.outputTokens += e.outputTokens || 0;
+      g.cost += e.cost || 0;
       if ((e.lastActiveAt || 0) > g.lastActiveAt) g.lastActiveAt = e.lastActiveAt;
     }
     return [...byIssue.values()].map(g => {
@@ -789,23 +830,47 @@ export class AccountManager {
 
   /**
    * Update cumulative token usage from response body data.
+   *
+   * D1DX (D-2169): also computes API-equivalent COST. message_start carries
+   * input_tokens (uncached) + cache tokens + the model; message_delta carries
+   * output_tokens only — so the model is remembered on the binding from
+   * message_start and reused for the output-side cost. opts: { cacheCreate5m,
+   * cacheCreate1h, cacheRead, model }.
    */
-  updateUsage(accountIndex, inputTokens, outputTokens, sessionId = null) {
+  updateUsage(accountIndex, inputTokens, outputTokens, sessionId = null, opts = {}) {
     const account = this.accounts[accountIndex];
     if (!account) return;
     if (inputTokens) account.usage.totalInputTokens += inputTokens;
     if (outputTokens) account.usage.totalOutputTokens += outputTokens;
-    // D-1728: per-session attribution for the live dashboard. message_start
-    // carries input_tokens (one per message → counts a "message"); message_delta
-    // carries output_tokens. Only attributes when the session still has a binding.
+
+    const sb = sessionId ? this.sessionBindings.get(sessionId) : null;
+    // Resolve the model for pricing: explicit (message_start) → remember it;
+    // else the binding's last-seen model (message_delta) → else null (→ opus).
+    const model = opts.model || sb?.model || null;
+    if (opts.model && sb) sb.model = opts.model;
+    const price = this._priceFor(model);
+    const cacheCreate5m = opts.cacheCreate5m || 0;
+    const cacheCreate1h = opts.cacheCreate1h || 0;
+    const cacheRead = opts.cacheRead || 0;
+    const cost = (
+      (inputTokens || 0) * price.in
+      + cacheCreate5m * price.in * CACHE_WRITE_5M_MULT
+      + cacheCreate1h * price.in * CACHE_WRITE_1H_MULT
+      + cacheRead * price.in * CACHE_READ_MULT
+      + (outputTokens || 0) * price.out
+    ) / 1e6;
+    account.usage.totalCost = (account.usage.totalCost || 0) + cost;
+
+    // D-1728: per-session attribution for the live dashboard. Only attributes
+    // when the session still has a binding.
     if (sessionId) {
-      const sb = this.sessionBindings.get(sessionId);
       if (sb) {
         if (inputTokens) { sb.requests++; sb.inputTokens += inputTokens; }
         if (outputTokens) sb.outputTokens += outputTokens;
+        sb.cost = (sb.cost || 0) + cost;
       }
       // D-1728 S6: durable ledger (survives idle-eviction + restart).
-      this._ledgerTouch(sessionId, account.name, inputTokens, outputTokens);
+      this._ledgerTouch(sessionId, account.name, inputTokens, outputTokens, cost, model);
       this._maybeSaveLedger();
     }
   }
