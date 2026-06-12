@@ -91,47 +91,23 @@ async function serverCommand() {
   }
 
   const threshold = config.switchThreshold || 0.98;
-  // D1DX: weeklyReserve defaults to 0.20 for configs predating the key.
-  const weeklyReserve = config.weeklyReserve ?? 0.20;
-  // D1DX: periodic re-rank tunables (Responsive preset; defaults cover configs predating the keys).
-  const rerankEvery = config.rerankEvery ?? 10;
-  const rerankMargin = config.rerankMargin ?? 1.3;
-  // D1DX (D-1705): all-throttled backoff + de-sync recovery tunables (defaults cover configs predating the keys).
-  const allThrottledOpts = {
-    allThrottledFloorSec: config.allThrottledFloorSec ?? 60,
-    allThrottledCapSec: config.allThrottledCapSec ?? 600,
-    retryJitterPct: config.retryJitterPct ?? 0.15,
-    recoveryStaggerSec: config.recoveryStaggerSec ?? 5,
-    recoveryGapSec: config.recoveryGapSec ?? 20,
-    escalationFactor: config.escalationFactor ?? 1.5,
-    // D1DX (D-1728): per-session cache-affinity routing + bounded per-account backoff
-    // (defaults cover configs predating the keys; bindingMaxBoost null → account count).
-    cacheAffinityWindowSec: config.cacheAffinityWindowSec ?? 300,
-    bindingEvictSec: config.bindingEvictSec ?? 1800,
-    bindingBoostBaseHours: config.bindingBoostBaseHours ?? 48,
-    bindingMaxBoost: config.bindingMaxBoost ?? null,
-    // D1DX (operator 2026-06-06, D-1936): hard weekly-reserve floor for new bindings.
-    weeklyReservePerDay: config.weeklyReservePerDay ?? 0.075,
-    weeklyReserveFloorCap: config.weeklyReserveFloorCap ?? 0.50,
-    perAccountBackoffFloorSec: config.perAccountBackoffFloorSec ?? 60,
-    perAccountBackoffCapSec: config.perAccountBackoffCapSec ?? 600,
-    perAccountBackoffFactor: config.perAccountBackoffFactor ?? 1.5,
-    // D1DX (operator 2026-06-06, D-1936): burst-429 fast recovery for budget-healthy accounts.
-    burstBackoffFloorSec: config.burstBackoffFloorSec ?? 5,
-    burstBackoffCapSec: config.burstBackoffCapSec ?? 30,
-    burstStaggerSec: config.burstStaggerSec ?? 2,
-    burstHealthyBelow: config.burstHealthyBelow ?? 0.80,
-    // D1DX (D-1903): per-account concurrent in-flight cap (default covers configs predating the key).
-    maxInFlightPerAccount: config.maxInFlightPerAccount ?? 6,
-    // D1DX patch #10 (operator 2026-06-10, D-2104): pace-to-expiry controller
-    // (defaults cover configs predating the keys; [] ⇒ no expiring precedence).
+  // D1DX (D-2165): simplified routing — one selection rule (pace-to-line) + minimal
+  // rails. Defaults cover configs predating the keys.
+  const opts = {
+    // Selection
     expiringAccounts: config.expiringAccounts ?? [],
     paceOvershootGuard: config.paceOvershootGuard ?? 0.05,
-    // D1DX (D-1728 S6): durable usage ledger tunables.
+    // Cache-affinity
+    cacheAffinityWindowSec: config.cacheAffinityWindowSec ?? 300,
+    bindingEvictSec: config.bindingEvictSec ?? 1800,
+    // 429 handling
+    backoffSec: config.backoffSec ?? 60,
+    allThrottledCapSec: config.allThrottledCapSec ?? 600,
+    // Ledger (observability)
     ledgerRetentionHours: config.ledgerRetentionHours ?? 168,
     ledgerSaveSec: config.ledgerSaveSec ?? 10,
   };
-  const accountManager = new AccountManager(accounts, threshold, weeklyReserve, rerankEvery, rerankMargin, allThrottledOpts);
+  const accountManager = new AccountManager(accounts, threshold, opts);
 
   // D1DX (D-1728 S6): durable per-issue usage ledger — load at startup so totals
   // survive a restart; saved debounced on the hot path + on shutdown below.

@@ -16,48 +16,19 @@ export function createDefaultConfig() {
       apiKey: 'tc-' + randomBytes(24).toString('base64url'),
     },
     upstream: 'https://api.anthropic.com',
-    switchThreshold: 0.98, // hard ceiling (5h axis + real weekly limit)
-    weeklyReserve: 0.20,   // D1DX: soft weekly reserve floor, time-decayed
-    rerankEvery: 10,       // D1DX: re-rank cadence — calls between weekly-urgency re-checks
-    rerankMargin: 1.3,     // D1DX: re-rank switches only if another preferred acct's urgency > current x this
-    warmOnStartup: true,   // D1DX: ping each account at boot to anchor windows
-    // D1DX (D-1705): all-throttled backoff + de-synchronized recovery
-    allThrottledFloorSec: 60,   // min retry-after told to the client when all accounts are throttled
-    allThrottledCapSec: 600,    // max retry-after (client re-polls, self-correcting as accounts free)
-    retryJitterPct: 0.15,       // upward-only jitter on the client retry-after (de-sync concurrent retries)
-    recoveryStaggerSec: 5,      // per-account stagger added to rateLimitedUntil (de-sync window expiry)
-    recoveryGapSec: 20,         // half-open recovery: min gap between account re-entries
-    escalationFactor: 1.5,      // floor *= factor^(streak-1) on repeated back-to-back all-throttled episodes
-    // D1DX (D-1728): per-session cache-affinity routing + bounded per-account backoff
-    cacheAffinityWindowSec: 300,   // warm-stick window (Anthropic prompt cache TTL — same account while warm)
-    bindingEvictSec: 1800,         // drop a session binding after it's idle this long
-    bindingBoostBaseHours: 48,     // reset-proximity boost knee: boost ≈ base / hours-to-7d-reset
-    bindingMaxBoost: null,         // cap on the reset-proximity boost (null → number of accounts)
-    perAccountBackoffFloorSec: 60, // bounded per-account 429 backoff floor (replaces full-5h over-bench)
-    perAccountBackoffCapSec: 600,  // bounded per-account 429 backoff cap
-    perAccountBackoffFactor: 1.5,  // escalation per consecutive same-account 429
-    // D1DX (D-1903): per-account concurrent in-flight cap — steers a burst of new
-    // session (re)binds off an account already serving this many concurrent
-    // upstream requests, so bursts spread instead of dogpiling one account
-    // (concurrency-induced burst-rate 429s). Steers new binds only; never cuts a
-    // warm session, never refuses service. Higher = drain weekly-urgency harder;
-    // lower = spread bursts more aggressively.
-    maxInFlightPerAccount: 6,
-    // D1DX patch #10 (operator 2026-06-10, D-2104): pace-to-expiry controller.
-    // expiringAccounts — names whose subscriptions end soon; they drain to their
-    // expected-utilization line FIRST (absolute precedence while behind) and skip
-    // the reserve floor. Empty = no precedence (pure pace-to-line for all).
-    // paceOvershootGuard — an account more than this far AHEAD of its line stops
-    // taking new bindings (warm sessions still hold). 0.05 = 5 points.
-    expiringAccounts: [],
-    paceOvershootGuard: 0.05,
-    // D1DX (D-1728): minimal logs + auto-prune. Per-request full-body dumps are
-    // OFF by default (the daily operational log keeps the signal); flip to true
-    // only for deep debugging. Logs older than logRetentionHours are auto-deleted.
-    logRequests: false,            // write per-request full request/response dumps (verbose, ~MB each)
+    warmOnStartup: true,           // ping each account at boot to anchor rate-limit windows
+    // ── Routing (D1DX) — 5 knobs ──
+    switchThreshold: 0.98,         // HARD ceiling — never route past this (real-429 guard)
+    cacheAffinityWindowSec: 300,   // a session sticks to its account while used within this window
+    bindingEvictSec: 1800,         // drop an idle session binding after this long
+    backoffSec: 60,                // a 429 benches the account this long (+ jitter), then re-probe
+    expiringAccounts: [],          // names whose subscription ends soon — drain to their pace line first
+    paceOvershootGuard: 0.05,      // an account >this far AHEAD of its pace line takes no new work (5 pts)
+    allThrottledCapSec: 600,       // max client retry-after when EVERY account is throttled
+    // ── Logs + ledger (observability) ──
+    logRequests: false,            // per-request full-body dumps (verbose) — debug only
     logRetentionHours: 24,         // auto-delete log files older than this (0 = never)
-    // D1DX (D-1728 S6): durable per-issue usage ledger.
-    ledgerRetentionHours: 168,     // keep ledger entries this long after last activity (7d)
+    ledgerRetentionHours: 168,     // keep per-issue usage ledger entries this long (7d)
     ledgerSaveSec: 10,             // debounce window for ledger disk writes
     accounts: [],
   };

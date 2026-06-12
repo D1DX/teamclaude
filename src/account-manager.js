@@ -5,8 +5,6 @@ import { execFileSync } from 'node:child_process';
 import { join } from 'node:path';
 
 const WEEK_MS = 7 * 24 * 60 * 60 * 1000;
-const HOUR_MS = 60 * 60 * 1000;
-const DAY_MS = 24 * 60 * 60 * 1000;
 // D1DX (D-1728): D1DX session presence registry — used only to resolve a
 // session emoji for log/TUI display. Best-effort; never load-bearing for routing.
 const SESSIONS_REGISTRY = join(homedir(), '.claude', 'state', 'sessions.json');
@@ -58,10 +56,11 @@ function emptyQuota() {
 }
 
 export class AccountManager {
-  // D1DX patch: weeklyReserve drives the time-decayed weekly cap.
-  // switchThreshold (0.98) stays the HARD ceiling on the 5h axis + the real
-  // weekly limit; weeklyReserve (0.20) is the SOFT preference floor on 7d.
-  constructor(accounts, switchThreshold = 0.98, weeklyReserve = 0.20, rerankEvery = 10, rerankMargin = 1.3, opts = {}) {
+  // D1DX — simplified routing (D-2165). ONE selection rule: pace-to-line. Each
+  // account aims for an expected-utilization line = fraction of its OWN 7d window
+  // elapsed; new work goes to the account furthest BEHIND its line. switchThreshold
+  // (0.98) is the hard ceiling that is never crossed (the real-429 guard).
+  constructor(accounts, switchThreshold = 0.98, opts = {}) {
     this.accounts = accounts.map((acct, index) => ({
       index,
       name: acct.name,
@@ -79,113 +78,43 @@ export class AccountManager {
         lastUsed: null,
       },
       rateLimitedUntil: null,
-      _inflight: 0, // D1DX (D-1903): live count of concurrent upstream requests on this account
+      _inflight: 0, // live concurrent upstream requests (spread tiebreak + display)
     }));
     this.currentIndex = 0;
-    this.switchThreshold = switchThreshold;
-    this.weeklyReserve = weeklyReserve;
-    // D1DX patch (§5.1): periodic re-rank. Every `rerankEvery` selections, move to a
-    // preferred account whose weekly-urgency exceeds current × `rerankMargin`. Keeps the
-    // sticky cache-locality win while preventing the selector from getting STUCK on a
-    // healthy-but-low-urgency account (use-it-or-lose-it). Tunable via config.
-    this.rerankEvery = rerankEvery;
-    this.rerankMargin = rerankMargin;
-    this._sinceRerank = 0;        // selections on `current` since the last re-rank check
-    this._didBootSelect = false;  // Fix C: first selection picks the best account, not config index 0
-    this.homeIndex = null; // account to prefer returning to after a 429 failover (cache locality)
+    this.switchThreshold = switchThreshold; // hard ceiling — 5h axis + real weekly limit
+    this._didBootSelect = false;            // first selection picks best, not config index 0
 
-    // ── D1DX patch (D-1705): all-throttled backoff + de-synchronized recovery ──
-    // Tunables (defaults mirror config.js / index.js; config is never hand-edited).
-    this.allThrottledFloorSec = opts.allThrottledFloorSec ?? 60;   // min wait told to the client
-    this.allThrottledCapSec   = opts.allThrottledCapSec   ?? 600;  // max wait (client re-polls, self-correcting)
-    this.retryJitterPct       = opts.retryJitterPct       ?? 0.15; // UPWARD-only jitter on the client retry-after
-    this.recoveryStaggerSec   = opts.recoveryStaggerSec   ?? 5;    // per-account stagger added to rateLimitedUntil
-    this.recoveryGapSec       = opts.recoveryGapSec       ?? 20;   // half-open: min gap between account releases
-    this.escalationFactor     = opts.escalationFactor     ?? 1.5;  // floor *= factor^(streak-1) on repeat episodes
-    // Episode state. An "episode" = a run of all-throttled returns not yet ended
-    // by a success. Used for the escalating floor + the half-open release gate.
-    this._allThrottledStreak = 0;   // consecutive all-throttled episodes since the last success
-    this._lastAllThrottledAt = 0;   // ms — debounces concurrent 429s into one episode
-    this._lastBackoffMs = 0;        // ms — last computed backoff, the episode-debounce window
-    this._recoveryReleaseAt = 0;    // ms — half-open gate: next throttled account may release at/after this
+    // ── Selection: pace-to-line ──
+    // expiringAccounts (subscriptions ending) drain to their line FIRST. An account
+    // more than paceOvershootGuard AHEAD of its line takes no new bindings — and a
+    // warm session bound to it is released at its next message (lazy eviction).
+    this.expiringAccounts   = opts.expiringAccounts   ?? [];
+    this.paceOvershootGuard = opts.paceOvershootGuard ?? 0.05;
 
-    // ── D1DX patch (D-1728): per-session cache-affinity routing ──
-    // Anthropic prompt cache is 5-min TTL + per-account, so each Claude Code
-    // session (keyed on the x-claude-code-session-id header) binds to ONE
-    // account and stays cache-warm on it; it only switches on a blocker
-    // (immediate) or after the cache window lapses (free rebalance). Non-urgent
-    // weekly-urgency balancing never cuts a warm session mid-window.
-    this.sessionBindings = new Map(); // sid -> { index, lastUsedAt, boundAt }
+    // ── Cache-affinity ──
+    // A session sticks to one account (per-account prompt cache) until a blocker,
+    // the idle window lapses, or the account runs past its pace line.
+    this.sessionBindings = new Map(); // sid -> { index, lastUsedAt, boundAt, ... }
     this.cacheAffinityWindowMs = (opts.cacheAffinityWindowSec ?? 300) * 1000; // warm-stick window
     this.bindingEvictMs        = (opts.bindingEvictSec        ?? 1800) * 1000; // drop idle bindings
-    this.bindingBoostBaseHours = opts.bindingBoostBaseHours    ?? 48;          // reset-proximity boost knee
-    this.bindingMaxBoost       = opts.bindingMaxBoost          ?? this.accounts.length; // cap the boost
-    // ── D1DX patch (operator 2026-06-06, D-1936): hard weekly-reserve floor ──
-    // The reset-proximity boost above piles new sessions onto a near-reset
-    // account (use-it-or-lose-it), punching through the SOFT weeklyReserve cap
-    // and fully draining it. This floor is HARD for NEW bindings: an account
-    // must retain weeklyReservePerDay of weekly budget for every 24h left until
-    // its 7d reset, else it is excluded from new bindings (warm sessions still
-    // hold — cache affinity). Degrades to most-headroom when ALL are below floor
-    // (never refuses service). weeklyReserveFloorCap clamps the early-week floor.
-    this.weeklyReservePerDay   = opts.weeklyReservePerDay   ?? 0.075; // ~7.5%/24h-left (operator band 5–10%)
-    this.weeklyReserveFloorCap = opts.weeklyReserveFloorCap ?? 0.50;  // clamp so early-week never excludes the whole pool
-    // Per-account bounded backoff (D-1728): replaces the D-1705 "derive the full
-    // 5h reset on a headerless 429" over-bench. A 429 benches the account for a
-    // bounded escalating window (floor × factor^streak), not hours — so a
-    // transient/rolling-window 429 re-probes in ~60s and "all exhausted" stays real.
-    this.perAccountBackoffFloorSec = opts.perAccountBackoffFloorSec ?? 60;
-    this.perAccountBackoffCapSec   = opts.perAccountBackoffCapSec   ?? 600;
-    this.perAccountBackoffFactor   = opts.perAccountBackoffFactor   ?? 1.5;
-    // ── D1DX patch (operator 2026-06-06, D-1936): burst-429 fast recovery ──
-    // A header-less 429 on a BUDGET-HEALTHY account (comfortable headroom on
-    // both the 5h + weekly windows) is almost always burst-rate (concurrency),
-    // NOT quota — benching it for the full 60s floor pulls a healthy account out
-    // of the pool and bounces load onto the near-cap accounts (the 2026-06-06
-    // churn: cherry/daniel at 17–20% used cycling throttled while apple/banana
-    // at 85–95% became the sink). Such an account gets a SHORT cooldown so it
-    // rejoins in seconds; a near-cap account keeps the long floor (stays rested).
-    this.burstBackoffFloorSec = opts.burstBackoffFloorSec ?? 5;    // short cooldown for a healthy burst-429
-    this.burstBackoffCapSec   = opts.burstBackoffCapSec   ?? 30;   // bounded — a flapping hotspot still climbs but stays in rotation
-    this.burstStaggerSec      = opts.burstStaggerSec      ?? 2;    // reduced de-sync stagger on the burst path
-    this.burstHealthyBelow    = opts.burstHealthyBelow    ?? 0.80; // both 5h+weekly below this ⇒ treat a header-less 429 as burst, not quota
-    // ── D1DX patch (D-1903): per-account concurrent in-flight cap ──
-    // A second spreading dimension on top of the D-1728 warm-session-count cap:
-    // bound-session-count is not instantaneous concurrency (a bound-but-idle
-    // session is 0 load; a single hot session can fire many concurrent upstream
-    // calls). When a NEW session (re)binds, _pickAccountForBinding prefers an
-    // account whose live in-flight count is below this cap, so a burst of new
-    // sessions / rebinds spreads off an already-slammed account instead of
-    // dogpiling the single highest-weekly-urgency one (the 2026-06-05 burst-rate
-    // 429 storm: 131:1 header-less:real 429s). It only STEERS new bindings — it
-    // never cuts a warm session (cache affinity) and never refuses service (falls
-    // back to the least-in-flight account). Higher = drain weekly-urgency harder;
-    // lower = spread bursts more aggressively.
-    this.maxInFlightPerAccount = opts.maxInFlightPerAccount ?? 6;
-    // ── D1DX patch #10 (operator 2026-06-10, D-2104): pace-to-expiry controller ──
-    // Each account tracks an expected-utilization line expected(t) = fraction-of-
-    // week-elapsed (half the week gone ⇒ aim for 50% weekly used). A new binding
-    // goes to the account most BEHIND its line (gap = expected − u7d). Accounts in
-    // expiringAccounts (subscriptions ending — daniel/apple) take ABSOLUTE
-    // precedence while behind their line, so their soon-to-vanish budget drains
-    // first; the reserve/floor partition is bypassed for them (the controller
-    // subsumes it). Accounts more than paceOvershootGuard AHEAD of their line stop
-    // taking new bindings (overshoot guard). When the expiring accounts catch up,
-    // demand flows to the others' gaps. Default [] ⇒ pure pace-to-line, no
-    // precedence (still strictly better drain than the prior weekly-urgency rank).
-    this.expiringAccounts  = opts.expiringAccounts  ?? [];   // account names that should drain before expiry
-    this.paceOvershootGuard = opts.paceOvershootGuard ?? 0.05; // > this far AHEAD of line ⇒ no new bindings
+
+    // ── 429 handling: one bounded backoff ──
+    // A throttled account is benched for backoffSec (+ small de-sync jitter), then
+    // re-probed; a genuinely capped account is still excluded honestly by
+    // _atHardLimit. allThrottledCapSec bounds the client retry-after when EVERY
+    // account is throttled (the server hold-loop re-polls within that window).
+    this.backoffSec         = opts.backoffSec         ?? 60;
+    this.allThrottledCapSec = opts.allThrottledCapSec ?? 600;
+
     this._sessionTagCache = { at: 0, rows: null }; // cached sessions.json read for emoji tags
 
-    // ── D1DX patch (D-1728 S6): durable per-issue usage ledger ──
-    // Survives idle-eviction AND proxy restart (unlike the live sessionBindings).
-    // Keyed by `sid::issue` so a session that re-pins to another issue splits
-    // cleanly. The source of truth for the per-issue dashboard + the Paperclip
-    // rollup (S7). Persisted to ~/teamclaude-logs/usage-ledger.json (debounced).
-    this.usageLedger = new Map(); // "sid::issue" -> { sid, issue, account, messages, inputTokens, outputTokens, firstSeenAt, lastActiveAt }
-    this.ledgerPath = null;       // set by setLedgerPath() at startup
-    this.ledgerRetentionMs = (opts.ledgerRetentionHours ?? 168) * 60 * 60 * 1000; // 7d default
-    this.ledgerSaveMs = (opts.ledgerSaveSec ?? 10) * 1000; // debounce window for disk writes
+    // ── Durable per-issue usage ledger (observability — unchanged) ──
+    // Survives idle-eviction AND proxy restart. Keyed by `sid::issue`. Source of
+    // truth for the per-issue dashboard. Persisted to usage-ledger.json (debounced).
+    this.usageLedger = new Map();
+    this.ledgerPath = null;
+    this.ledgerRetentionMs = (opts.ledgerRetentionHours ?? 168) * 60 * 60 * 1000;
+    this.ledgerSaveMs = (opts.ledgerSaveSec ?? 10) * 1000;
     this._ledgerDirty = false;
     this._ledgerLastSaveAt = 0;
   }
@@ -208,32 +137,16 @@ export class AccountManager {
   getActiveAccount() {
     this._sweepAll();
     const current = this.accounts[this.currentIndex];
-
-    // D1DX patch (Fix C — boot-select): the first-ever selection picks the best
-    // account by weekly-urgency rather than defaulting to config index 0.
-    if (!this._didBootSelect) {
-      this._didBootSelect = true;
-      return this._selectNext();
+    // Sticky while the current account is usable AND still on (or behind) its pace
+    // line; otherwise (re)pick by the one rule. First-ever call always picks.
+    if (this._didBootSelect && current && this._isUsable(current)
+        && this._paceGap(current) >= -this.paceOvershootGuard) {
+      return current; // stay cache-warm
     }
-
-    // D1DX patch (§5.1 — periodic re-rank): otherwise sticky (stay cache-warm on
-    // `current`), but `_selectNext`'s urgency ranker only runs at a FORCED switch —
-    // so without this it gets STUCK on a healthy-but-low-urgency account while a
-    // more about-to-be-wasted account goes undrained. Every `rerankEvery` calls,
-    // move to a preferred account whose weekly-urgency > current × `rerankMargin`.
-    // The margin keeps it from cache-churning on small urgency differences.
-    if (this._isPreferred(current)) {
-      if (++this._sinceRerank >= this.rerankEvery) {
-        this._sinceRerank = 0;
-        const best = this._bestPreferred();
-        if (best && best.index !== current.index &&
-            this._weeklyUrgency(best) > this._weeklyUrgency(current) * this.rerankMargin) {
-          return this._switchTo(best, `account "${best.name}" (periodic re-rank — higher weekly urgency)`);
-        }
-      }
-      return current; // sticky — stay cache-warm
-    }
-    return this._selectNext();
+    this._didBootSelect = true;
+    const chosen = this._pickAccountForBinding();
+    if (chosen) this._switchTo(chosen, `account "${chosen.name}" (pace-to-line)`);
+    return chosen;
   }
 
   // ── D1DX patch (D-1728): per-session cache-affinity routing ─────
@@ -257,21 +170,28 @@ export class AccountManager {
     if (b) {
       const acct = this.accounts[b.index];
       const warm = now - b.lastUsedAt < this.cacheAffinityWindowMs;
-      // Warm + usable → stay put (the whole point: don't churn the cache).
-      if (acct && warm && !this._isBlocked(acct) && !this._atHardLimit(acct)) {
+      const onPace = acct && this._paceGap(acct) >= -this.paceOvershootGuard;
+      // Warm + usable + still on (or behind) its pace line → stay put (don't churn
+      // the cache). If the bound account has run PAST its line, fall through and
+      // rebind (lazy over-pace eviction — the next pick rebalances to a more-behind
+      // account). A blocked / hard-capped account also falls through (immediate).
+      if (acct && warm && onPace && !this._isBlocked(acct) && !this._atHardLimit(acct)) {
         b.lastUsedAt = now;
         return acct;
       }
     }
 
-    // (Re)bind: no binding, window lapsed, or the bound account is blocked/capped.
+    // (Re)bind: no binding, window lapsed, bound account blocked/capped, or over its line.
     const chosen = this._pickAccountForBinding();
     if (!chosen) return null; // genuinely exhausted — server returns an honest 429
 
+    const prevAcct = b ? this.accounts[b.index] : null;
     const prevIdx = b?.index;
+    const stillWarm = b && now - b.lastUsedAt < this.cacheAffinityWindowMs;
     const reason = !b ? 'new session'
-      : (now - b.lastUsedAt < this.cacheAffinityWindowMs) ? 'blocker'   // was warm; bound acct blocked/capped
-      : 'window lapsed';
+      : !stillWarm ? 'window lapsed'
+      : (prevAcct && this._paceGap(prevAcct) < -this.paceOvershootGuard) ? 'over pace line'
+      : 'blocker'; // was warm; bound acct blocked/capped
     // Preserve per-session stats across a rebind — a session's work spans its
     // account switches (firstSeenAt = the session's true start, not the latest bind).
     this.sessionBindings.set(sessionId, {
@@ -281,7 +201,7 @@ export class AccountManager {
       inputTokens: b?.inputTokens ?? 0,
       outputTokens: b?.outputTokens ?? 0,
     });
-    this.currentIndex = chosen.index; // keep TUI "active account" + homeIndex logic meaningful
+    this.currentIndex = chosen.index; // keep TUI "active account" meaningful
     if (prevIdx !== chosen.index) {
       console.log(`[TeamClaude] Session ${this._sessionTag(sessionId)} → "${chosen.name}" (${reason})`);
     }
@@ -303,31 +223,7 @@ export class AccountManager {
     return { counts, active };
   }
 
-  // Reset-proximity boost (operator D-1728): an account with weekly headroom and
-  // an imminent 7d reset should absorb progressively more sessions (use-it-or-
-  // lose-it). ~1 at ≥48h, ~2 at 24h, ~4 at 12h, ~8 at 6h, capped at bindingMaxBoost.
-  _resetProximityBoost(account) {
-    if (this._weeklyRemaining(account) <= 0) return 1;
-    const reset = account.quota.unified7dReset;
-    if (!reset) return 1;
-    const tToResetH = Math.max(0.5, (reset - Date.now()) / HOUR_MS);
-    const boost = Math.round(this.bindingBoostBaseHours / tToResetH);
-    return Math.min(this.bindingMaxBoost, Math.max(1, boost));
-  }
-
-  // Hard reserve floor (operator 2026-06-06, D-1936): the minimum weekly
-  // headroom an account must keep to remain eligible for NEW bindings =
-  // weeklyReservePerDay × days-to-7d-reset, clamped to weeklyReserveFloorCap.
-  // Protects ~5–10% per 24h left from the reset-proximity boost. Returns 0 when
-  // the reset time is unknown (can't compute days-left → don't gate the account).
-  _weeklyReserveFloor(account) {
-    const reset = account.quota.unified7dReset;
-    if (!reset) return 0;
-    const daysToReset = Math.max(0, (reset - Date.now()) / DAY_MS);
-    return Math.min(this.weeklyReserveFloorCap, this.weeklyReservePerDay * daysToReset);
-  }
-
-  // ── D1DX patch #10 (D-2104): pace-to-expiry controller helpers ──────────────
+  // ── pace-to-expiry controller helpers ──────────────
   // expected(t) = fraction of THIS account's own 7d window that has elapsed.
   // 0 just after a reset → 1 at the reset. Per-account (each account's 7d window
   // is anchored independently). Returns null when the reset time is unknown — we
@@ -357,68 +253,37 @@ export class AccountManager {
   }
 
   /**
-   * Pick the best account to (re)bind a session to (pure — no global-sticky side
-   * effects). Spreads sessions across accounts for parallel throughput (load
-   * cap = ceil((active+1)/usable)), drains the account most BEHIND its expected-
-   * utilization line first (expiring accounts first while behind — D-2104), and
-   * loosens the cap by the reset-proximity boost so soon-to-reset budget is
-   * drained aggressively. The 5h hard ceiling (_isUsable) + 429 failover bound
-   * over-stacking. Returns null only when the pool is exhausted.
+   * Pick the account to (re)bind a session to — THE one rule (pace-to-line):
+   *  1. usable accounts only (under the 0.98 hard ceiling, not throttled);
+   *  2. overshoot guard — drop accounts more than paceOvershootGuard AHEAD of
+   *     their line (degrade to all-usable if that would empty the pool);
+   *  3. expiring-first — while any expiring account is still behind its line,
+   *     restrict to that set so its soon-to-vanish budget drains first;
+   *  4. furthest BEHIND its line wins; near-ties (within paceOvershootGuard of the
+   *     top gap) break to the least-loaded account (fewest in-flight, then fewest
+   *     warm sessions) so a burst of new bindings spreads instead of dogpiling one.
+   * Returns null only when the pool is genuinely exhausted.
    */
   _pickAccountForBinding() {
     const usable = this.accounts.filter(a => this._isUsable(a));
     if (usable.length === 0) return this._soonestUsableOrNull();
 
-    // ── D1DX patch #10 (operator 2026-06-10, D-2104): pace-to-expiry controller ──
-    // Rank by how far BEHIND its expected-utilization line an account is (gap =
-    // expected − u7d) instead of weekly-urgency; expiring accounts get absolute
-    // precedence while behind; accounts well ahead of the line are guarded out.
-    // The parallel-spread rails below (load cap × reset-proximity boost, in-flight
-    // cap, least-loaded fallback) are unchanged — only the pool + rank change.
-
-    // Overshoot guard: an account more than paceOvershootGuard AHEAD of its line
-    // stops taking NEW bindings (its warm sessions still hold — cache affinity).
-    // Degrade to all-usable if that would leave nobody (never refuse service).
     const onPace = usable.filter(a => this._paceGap(a) >= -this.paceOvershootGuard);
     const guarded = onPace.length > 0 ? onPace : usable;
 
-    // Expiring-first precedence: while ANY expiring account is behind its line,
-    // restrict new bindings to the expiring-behind set so their soon-to-vanish
-    // budget drains first. Expiring accounts are exempt from the D-1936 reserve
-    // floor (the controller subsumes it). Once they catch up (gap ≤ 0), demand
-    // flows to everyone, with the reserve floor still protecting non-expiring
-    // accounts (degrade to guarded if the floor would empty the pool).
     const expiringBehind = guarded.filter(a => this._isExpiring(a) && this._paceGap(a) > 0);
-    let pool;
-    if (expiringBehind.length > 0) {
-      pool = expiringBehind;
-    } else {
-      const aboveFloor = guarded.filter(a =>
-        this._isExpiring(a) || this._weeklyRemaining(a) > this._weeklyReserveFloor(a));
-      pool = aboveFloor.length > 0 ? aboveFloor : guarded;
-    }
+    const pool = expiringBehind.length > 0 ? expiringBehind : guarded;
 
-    const { counts, active } = this._activeSessionCounts();
-    const baseCap = Math.max(1, Math.ceil((active + 1) / pool.length));
-    // Most BEHIND its pace line first — continuous use-it-or-lose-it (replaces the
-    // weekly-urgency rank; the reset-proximity boost stays on the cap below).
+    // Furthest behind its line first; spread near-ties by load.
     const ranked = pool.slice().sort((a, c) => this._paceGap(c) - this._paceGap(a));
-
-    // D1DX (D-1903): a candidate must be under BOTH the warm-session-count cap
-    // (parallel spread) AND the concurrent in-flight cap (burst spread). The
-    // in-flight check deflects a burst of new binds off an account currently
-    // slammed with concurrent requests even when its session-count is fine.
-    for (const a of ranked) {
-      const cap = baseCap * this._resetProximityBoost(a);
-      if (counts[a.index] < cap && (a._inflight || 0) < this.maxInFlightPerAccount) return a;
-    }
-    // Every usable account is at a cap — keep work flowing by picking the least
-    // loaded: fewest in-flight first (spreads the burst), then fewest warm sessions.
-    return ranked.reduce((best, a) => {
+    const topGap = this._paceGap(ranked[0]);
+    const { counts } = this._activeSessionCounts();
+    const contenders = ranked.filter(a => topGap - this._paceGap(a) <= this.paceOvershootGuard);
+    return contenders.reduce((best, a) => {
       const ai = a._inflight || 0, bi = best._inflight || 0;
       if (ai !== bi) return ai < bi ? a : best;
       return counts[a.index] < counts[best.index] ? a : best;
-    }, ranked[0]);
+    }, contenders[0]);
   }
 
   // ── D1DX patch (D-1903): per-account in-flight accounting ──────────
@@ -448,7 +313,6 @@ export class AccountManager {
     if (soonest && soonestTime <= Date.now()) {
       soonest.status = 'active';
       soonest.rateLimitedUntil = null;
-      if (this._allThrottledStreak > 0) this._recoveryReleaseAt = Date.now() + this.recoveryGapSec * 1000;
       return soonest;
     }
     return null;
@@ -809,39 +673,6 @@ export class AccountManager {
     }).sort((a, c) => c.tokens - a.tokens);
   }
 
-  // ── D1DX patch: two-tier weekly-reserve selection ──────────────
-  // Tier 1 (preferred): weekly utilization below the time-decayed reserve cap.
-  // Tier 2 (reserve):   no preferred account left — dip into the reserve band
-  //                     (below the 0.98 hard ceiling) to KEEP WORKING.
-  // Tier 3 (fallback):  everything hard-capped/throttled — soonest reset / null.
-  // Grounding: accounts sit at 0.75–0.99 weekly almost always, so a
-  // hard reserve floor would refuse service constantly. The cap is a SOFT
-  // preference; switchThreshold (0.98) stays the hard ceiling.
-
-  // Time-decayed weekly cap: hold the full reserve early in the week, release
-  // toward 1.0 as the account's 7d reset approaches (use-it-or-lose-it).
-  _effectiveWeeklyCap(account) {
-    const reset = account.quota.unified7dReset;
-    const tToReset = reset ? Math.max(0, reset - Date.now()) : WEEK_MS;
-    const frac = Math.min(1, tToReset / WEEK_MS);
-    return 1 - this.weeklyReserve * frac;
-  }
-
-  // Below-cap weekly headroom per ms to reset — high = lots of soon-to-be-wasted
-  // weekly budget. Maximize to drain the most about-to-reset account first
-  // (operator's "percent ÷ time-left, prefer the one resetting soonest").
-  _weeklyUrgency(account) {
-    const u7d = account.quota.unified7d ?? 0;
-    const reset = account.quota.unified7dReset;
-    const tToReset = reset ? Math.max(1, reset - Date.now()) : WEEK_MS;
-    return Math.max(0, this._effectiveWeeklyCap(account) - u7d) / tToReset;
-  }
-
-  // Absolute weekly headroom to the hard ceiling (reserve-band tiebreak).
-  _weeklyRemaining(account) {
-    return 1 - (account.quota.unified7d ?? 0);
-  }
-
   _clearExpiredQuotas(account) {
     const q = account.quota;
     const now = Date.now();
@@ -865,21 +696,14 @@ export class AccountManager {
     }
   }
 
-  // Throttled / errored / exhausted — unusable regardless of quota band.
+  // Throttled / errored / exhausted — unusable. A throttle whose window has passed
+  // flips the account back to active immediately (normal 429 failover).
   _isBlocked(account) {
     if (!account) return true;
     if (account.status === 'throttled' && account.rateLimitedUntil) {
       if (Date.now() < account.rateLimitedUntil) return true;
-      // D1DX patch (D-1705 S3): half-open recovery. During an all-throttled
-      // episode, release at most ONE account per `recoveryGapSec` so the pool
-      // re-enters one at a time (the first proves healthy before the next
-      // rejoins) instead of the whole cluster flipping active in one sweep.
-      // Outside an episode (`_allThrottledStreak === 0`) release is immediate,
-      // exactly as before — normal 429-failover is unaffected.
-      if (this._allThrottledStreak > 0 && Date.now() < this._recoveryReleaseAt) return true;
       account.status = 'active';
       account.rateLimitedUntil = null;
-      if (this._allThrottledStreak > 0) this._recoveryReleaseAt = Date.now() + this.recoveryGapSec * 1000;
       console.log(`[TeamClaude] Account "${account.name}" rate limit expired, marking active`);
     }
     if (account.status === 'exhausted' || account.status === 'error') return true;
@@ -901,27 +725,11 @@ export class AccountManager {
     return false;
   }
 
-  // Tier 1 — usable AND weekly utilization below the time-decayed reserve cap.
-  _isPreferred(account) {
-    if (this._isBlocked(account)) return false;
-    this._clearExpiredQuotas(account);
-    if (this._atHardLimit(account)) return false;
-    const q = account.quota;
-    if (q.unified7d != null && q.unified7d >= this._effectiveWeeklyCap(account)) return false;
-    return true;
-  }
-
-  // Tier 2 — usable and below the hard ceiling (may be in the reserve band).
+  // Usable — not blocked and below the 0.98 hard ceiling.
   _isUsable(account) {
     if (this._isBlocked(account)) return false;
     this._clearExpiredQuotas(account);
     return !this._atHardLimit(account);
-  }
-
-  // Back-compat shim: "near quota" === not in the preferred band (updateQuota's
-  // approaching-quota log line still calls this).
-  _isNearQuota(account) {
-    return !this._isPreferred(account);
   }
 
   _switchTo(account, reason) {
@@ -929,73 +737,7 @@ export class AccountManager {
       console.log(`[TeamClaude] Switched to ${reason}`);
     }
     this.currentIndex = account.index;
-    this._sinceRerank = 0; // D1DX: reset the re-rank counter on every (re)selection
     return account;
-  }
-
-  // D1DX patch (§5.1): the highest weekly-urgency preferred account, or null if
-  // none are preferred. Shared by _selectNext (forced switch) and the periodic
-  // re-rank in getActiveAccount so the ranking logic lives in exactly one place.
-  _bestPreferred() {
-    let best = null;
-    for (const a of this.accounts) {
-      if (!this._isPreferred(a)) continue;
-      if (best === null || this._weeklyUrgency(a) > this._weeklyUrgency(best)) best = a;
-    }
-    return best;
-  }
-
-  _selectNext() {
-    // Tier 1 — preferred accounts (weekly utilization below the reserve cap).
-    const best = this._bestPreferred();
-    if (best) {
-      // Return to a remembered home account if it's preferred again (cache-warm).
-      if (this.homeIndex != null) {
-        const home = this.accounts[this.homeIndex];
-        if (home && this._isPreferred(home)) {
-          this.homeIndex = null;
-          return this._switchTo(home, `home account "${home.name}" (cleared, cache-warm)`);
-        }
-      }
-      // Otherwise drain the most about-to-be-wasted weekly budget first.
-      return this._switchTo(best, `account "${best.name}" (max weekly urgency)`);
-    }
-
-    // Tier 2 — reserve band: no preferred account, but keep work alive on the
-    // account with the most weekly headroom below the hard ceiling.
-    const usable = this.accounts.filter(a => this._isUsable(a));
-    if (usable.length > 0) {
-      const target = usable.reduce((best, a) =>
-        this._weeklyRemaining(a) > this._weeklyRemaining(best) ? a : best);
-      return this._switchTo(target, `account "${target.name}" (reserve band — keeping work alive)`);
-    }
-
-    // Tier 3 — everything hard-capped / throttled: take the soonest to reset.
-    let soonestAccount = null;
-    let soonestTime = Infinity;
-    for (const account of this.accounts) {
-      const resetTime = account.rateLimitedUntil
-        || account.quota.unified5hReset
-        || account.quota.unified7dReset
-        || (account.quota.resetsAt ? new Date(account.quota.resetsAt).getTime() : null);
-      if (resetTime && resetTime < soonestTime) {
-        soonestTime = resetTime;
-        soonestAccount = account;
-      }
-    }
-
-    if (soonestAccount && soonestTime <= Date.now()) {
-      soonestAccount.status = 'active';
-      soonestAccount.rateLimitedUntil = null;
-      this.currentIndex = soonestAccount.index;
-      // D1DX patch (D-1705 S3): arm the half-open gate so a subsequent sweep
-      // doesn't flip the rest of the pool active at once — one re-entry at a time.
-      if (this._allThrottledStreak > 0) this._recoveryReleaseAt = Date.now() + this.recoveryGapSec * 1000;
-      console.log(`[TeamClaude] Account "${soonestAccount.name}" reset, switching to it`);
-      return soonestAccount;
-    }
-
-    return null;
   }
 
   /**
@@ -1038,14 +780,10 @@ export class AccountManager {
     account.usage.totalRequests++;
     account.usage.lastUsed = new Date().toISOString();
 
-    // Log when approaching quota
-    if (this._isNearQuota(account)) {
-      const pct = account.quota.unified7d != null
-        ? (account.quota.unified7d * 100).toFixed(1)
-        : account.quota.tokensLimit
-          ? ((1 - account.quota.tokensRemaining / account.quota.tokensLimit) * 100).toFixed(1)
-          : '?';
-      console.log(`[TeamClaude] Account "${account.name}" at ${pct}% usage — will switch on next request`);
+    // Log when an account is near the hard ceiling.
+    const weeklyUtil = account.quota.unified7d;
+    if (weeklyUtil != null && weeklyUtil >= this.switchThreshold - 0.05) {
+      console.log(`[TeamClaude] Account "${account.name}" at ${(weeklyUtil * 100).toFixed(1)}% weekly — near ceiling`);
     }
   }
 
@@ -1073,114 +811,38 @@ export class AccountManager {
   }
 
   /**
-   * Mark an account as rate-limited.
-   *
-   * D1DX patch (D-1728): BOUNDED per-account backoff. A 429 benches this account
-   * for `floor × factor^(streak-1)` seconds (consecutive same-account 429s
-   * escalate), capped at `perAccountBackoffCapSec` — NOT the full unified 5h/7d
-   * reset. Anthropic's 5h limit is a rolling window, so a transient/burst 429
-   * recovers usable headroom long before the nominal reset; benching to the full
-   * reset (the old D-1705 S1 behavior) starved the highest-weekly-urgency account
-   * for hours and made the pool look "exhausted" when it wasn't. A genuinely
-   * capped account is still excluded honestly by `_atHardLimit` (its 429 response
-   * carries unified-5h ≈ 1.0 / status `rejected`), so the short re-probe doesn't
-   * hammer it — it just keeps "all exhausted" REAL. An explicit upstream
-   * `retry-after` is honored but clamped to the same cap for the same reason.
-   * D-1705 S2 per-account stagger + jitter (de-synchronized recovery) is kept.
+   * Mark an account as rate-limited (429). ONE bounded backoff: bench the account
+   * for backoffSec (or an explicit upstream retry-after, clamped to
+   * allThrottledCapSec), plus small random jitter so a burst of 429s doesn't
+   * cluster every account's window on the same instant. A genuinely capped account
+   * is still excluded by _atHardLimit (its 429 carries unified ≈ 1.0 / status
+   * `rejected`), so the short re-probe never hammers a real cap.
    */
   markRateLimited(accountIndex, retryAfterSeconds) {
     const account = this.accounts[accountIndex];
     if (!account) return;
     const now = Date.now();
-
-    // Per-account 429 streak: a fresh 429 after a long quiet gap (> cap) resets it.
-    if (now - (account._rl429At || 0) > this.perAccountBackoffCapSec * 1000) {
-      account._rl429Streak = 0;
-    }
-    account._rl429Streak = (account._rl429Streak || 0) + 1;
-    account._rl429At = now;
-
-    const capMs = this.perAccountBackoffCapSec * 1000;
-    let windowMs;
-    let burstHealthy = false; // header-less 429 on a budget-healthy account → short cooldown
-    if (retryAfterSeconds != null && !isNaN(retryAfterSeconds)) {
-      // Honor an explicit header, but never bench beyond the bounded cap.
-      windowMs = Math.min(retryAfterSeconds * 1000, capMs);
-    } else {
-      // No header. Distinguish a BURST (concurrency) 429 from a genuine
-      // quota/rolling-window 429: an account with comfortable headroom on BOTH
-      // windows that 429s is burst-rate, not out of budget (D-1936). A null
-      // window is treated as healthy for that window (warmer anchors them;
-      // absence must not force the long bench). Healthy → short cooldown so it
-      // rejoins the pool in seconds; near-cap → the existing 60s escalating floor.
-      const q = account.quota;
-      burstHealthy = !this._atHardLimit(account)
-        && (q.unified5h == null || q.unified5h < this.burstHealthyBelow)
-        && (q.unified7d == null || q.unified7d < this.burstHealthyBelow);
-      const floorSec = burstHealthy ? this.burstBackoffFloorSec : this.perAccountBackoffFloorSec;
-      const capSec   = burstHealthy ? this.burstBackoffCapSec   : this.perAccountBackoffCapSec;
-      const sec = Math.min(capSec, floorSec * Math.pow(this.perAccountBackoffFactor, account._rl429Streak - 1));
-      windowMs = sec * 1000;
-    }
-
-    // S2: per-account stagger (deterministic base by index) + jitter (tail), so
-    // a burst of 429s doesn't cluster every account's window on the same instant.
-    // The burst path uses a reduced unit so a healthy account isn't held out by
-    // a long stagger that would undo the short cooldown.
-    const staggerUnit = burstHealthy ? this.burstStaggerSec : this.recoveryStaggerSec;
-    const staggerMs = account.index * staggerUnit * 1000
-      + Math.random() * staggerUnit * 1000;
-
+    const capMs = this.allThrottledCapSec * 1000;
+    const baseMs = (retryAfterSeconds != null && !isNaN(retryAfterSeconds))
+      ? Math.min(retryAfterSeconds * 1000, capMs)
+      : this.backoffSec * 1000;
+    const jitterMs = Math.random() * this.backoffSec * 1000; // de-sync window expiry
     account.status = 'throttled';
-    account.rateLimitedUntil = now + windowMs + staggerMs;
-    // D1DX patch: remember the displaced current account so selection
-    // prefers returning to it (cache-warm) at the next switch once it clears.
-    if (accountIndex === this.currentIndex) this.homeIndex = accountIndex;
-    console.log(`[TeamClaude] Account "${account.name}" rate limited until +${Math.round((windowMs + staggerMs) / 1000)}s (429 streak ${account._rl429Streak}${burstHealthy ? ', burst — short cooldown' : ''})`);
+    account.rateLimitedUntil = now + baseMs + jitterMs;
+    console.log(`[TeamClaude] Account "${account.name}" rate limited +${Math.round((baseMs + jitterMs) / 1000)}s`);
   }
 
-  /**
-   * D1DX patch (D-1728): a successful (<400) response on an account clears its
-   * per-account 429 backoff streak, so the next isolated 429 starts again at the
-   * floor instead of an inflated escalated window.
-   */
-  noteAccountSuccess(accountIndex) {
-    const account = this.accounts[accountIndex];
-    if (!account) return;
-    if (account._rl429Streak) account._rl429Streak = 0;
-  }
+  /** A successful response on an account — no per-account streak state to reset now. */
+  noteAccountSuccess(_accountIndex) { /* no-op: single bounded backoff has no streak */ }
 
   /**
-   * D1DX patch (D-1705 S1+S3): the retry-after (seconds) to hand the client when
-   * EVERY account is throttled. Real-reset-aware (soonest genuine reset across
-   * the pool), clamped to [escalated floor, cap], with UPWARD-ONLY jitter so we
-   * never tell the client to retry *before* the real reset (which would just
-   * earn another 429). Also advances the episode streak (escalating floor on
-   * repeated back-to-back all-throttled states), debounced so concurrent 429s in
-   * one episode count once. Replaces the old free `computeRetryAfter` helper,
-   * which ignored the unified 5h/7d resets and used a blind 60s default.
+   * Retry-after (seconds) to hand the client when EVERY account is throttled.
+   * Real-reset-aware (soonest genuine reset across the pool), clamped to
+   * [backoffSec, allThrottledCapSec], with upward-only jitter so we never tell the
+   * client to retry BEFORE the real reset (which would just earn another 429).
    */
   allThrottledBackoff() {
     const now = Date.now();
-
-    // Episode bookkeeping:
-    //  - a long quiet gap (> cap) since the last all-throttled → fresh episode (streak = 1);
-    //  - a return within the last backoff window → SAME episode (no double-count);
-    //  - a return after the backoff window but within cap → next back-to-back episode (escalate).
-    if (now - this._lastAllThrottledAt > this.allThrottledCapSec * 1000) {
-      this._allThrottledStreak = 1;
-    } else if (this._lastAllThrottledAt === 0 || now - this._lastAllThrottledAt > this._lastBackoffMs) {
-      this._allThrottledStreak += 1;
-    }
-    this._lastAllThrottledAt = now;
-
-    // Escalated floor, capped.
-    const floorSec = Math.min(
-      this.allThrottledCapSec,
-      this.allThrottledFloorSec * Math.pow(this.escalationFactor, Math.max(0, this._allThrottledStreak - 1)),
-    );
-
-    // Soonest genuine reset across the whole pool (ms timestamps, internal form).
     let soonest = Infinity;
     for (const a of this.accounts) {
       const candidates = [
@@ -1193,27 +855,14 @@ export class AccountManager {
         if (t && t > now && t < soonest) soonest = t;
       }
     }
-
-    let secs = soonest === Infinity ? floorSec : (soonest - now) / 1000;
-    secs = Math.max(floorSec, Math.min(this.allThrottledCapSec, secs));
-    secs += Math.random() * secs * this.retryJitterPct; // upward-only de-sync jitter
-    this._lastBackoffMs = Math.ceil(secs) * 1000;
+    let secs = soonest === Infinity ? this.backoffSec : (soonest - now) / 1000;
+    secs = Math.max(this.backoffSec, Math.min(this.allThrottledCapSec, secs));
+    secs += Math.random() * secs * 0.15; // upward-only de-sync jitter
     return Math.max(1, Math.ceil(secs));
   }
 
-  /**
-   * D1DX patch (D-1705 S3): a successful (<400) upstream response ends the
-   * all-throttled episode — open the half-open recovery gate (releases become
-   * immediate again) and reset the escalation streak.
-   */
-  noteSuccess() {
-    if (this._allThrottledStreak !== 0 || this._recoveryReleaseAt !== 0) {
-      this._allThrottledStreak = 0;
-      this._lastAllThrottledAt = 0;
-      this._lastBackoffMs = 0;
-      this._recoveryReleaseAt = 0;
-    }
-  }
+  /** A successful upstream response — no all-throttled episode state to clear now. */
+  noteSuccess() { /* no-op: simplified rails have no episode streak */ }
 
   /**
    * Ensure an OAuth account's token is fresh, refreshing if needed.
@@ -1306,7 +955,6 @@ export class AccountManager {
    */
   removeAccount(index) {
     if (index < 0 || index >= this.accounts.length) return;
-    this.homeIndex = null; // indices shift on removal — drop any stale home pointer
     this.accounts.splice(index, 1);
     this.accounts.forEach((a, i) => a.index = i);
     if (this.currentIndex >= this.accounts.length) {
@@ -1423,7 +1071,6 @@ export class AccountManager {
     return {
       currentAccount: this.accounts[this.currentIndex]?.name,
       switchThreshold: this.switchThreshold,
-      weeklyReserve: this.weeklyReserve,
       system: this.systemSnapshot(),                 // D1DX (D-1728 S8): proxy + host resources
       sessionBindings: this.sessionBindingSummary(), // D1DX (D-1728): live session→account map
       sessionAggregate: this.sessionAggregate(),     // D1DX (D-1728): live dashboard TOTAL
