@@ -23,9 +23,13 @@ const CACHE_READ_MULT = 0.1;
 // session emoji for log/TUI display. Best-effort; never load-bearing for routing.
 const SESSIONS_REGISTRY = join(homedir(), '.claude', 'state', 'sessions.json');
 const PROJECTS_DIR = join(homedir(), '.claude', 'projects');
-const SESSION_ZOMBIE_MS = 12 * 60 * 60 * 1000; // 12h — matches lib-sessions PC_ZOMBIE_THRESHOLD_S (D-2085)
-const SESSION_DEAD_PID_GRACE_MS = 30 * 60 * 1000; // 30m — matches lib-sessions PC_DEAD_PID_GRACE_S (D-2155)
-const PID_START_TOLERANCE_S = 5; // matches lib-sessions PC_PID_START_TOLERANCE_S (D-2196)
+// D-2203: the deck is a LIVE-ACTIVITY view. A session is present iff it did
+// something within this window (transcript touched) — 30m, aligned with
+// `bindingEvictSec` so an idle session drops from the fleet spine and the
+// binding view together. The deck only HIDES (cheap, reversible), so unlike the
+// bash reaper it needs no 12h/grace/pid-identity ceremony — a stale-but-maybe-
+// alive row is safely dropped and reappears the instant it does anything.
+const DECK_PRESENT_MS = 30 * 60 * 1000; // 30m activity window
 
 // macOS "Memory Used" (App + Wired + Compressed), matching Activity Monitor.
 // os.freemem() can't be used here — it excludes reclaimable cache, overstating
@@ -487,68 +491,35 @@ export class AccountManager {
     } catch { return null; }
   }
 
-  // D-2085 + D-2196: a row is PRESENT (keep it in fleet) iff its recorded pid is
-  // alive AND is the ORIGINAL process (identity), OR — when the pid is dead or
-  // RECYCLED — its transcript is not a zombie. Mirrors pc_session_present +
-  // pc_session_is_zombie in lib-sessions.sh. Conservative: unknown transcript →
-  // present. The fresh-transcript guard means a genuinely live session is kept
-  // regardless of pid identity (its transcript stays fresh).
+  // D-2203: a row is PRESENT on the deck iff the session showed ACTIVITY recently.
+  // The deck is a LIVE view, so presence keys on the transcript (the truthful
+  // activity signal — appended every turn/tool/hook), NOT on the recorded pid
+  // (D-2085: a walk-up artifact that is recyclable, so a crashed session's pid
+  // reads "alive" and a pid-only check shows a ghost). Three ways to be present:
+  //   1. a tool is executing right now (the D-1749 inflight marker), OR
+  //   2. the transcript was touched within DECK_PRESENT_MS (recent activity), OR
+  //   3. there is no transcript file yet — a brand-new session whose JSONL has
+  //      not materialised — rescued by an alive pid.
+  // Everything else (transcript stale past the window, or absent with a dead pid)
+  // is hidden. Hiding is reversible: the row reappears the instant the session
+  // does anything. This is deliberately MORE aggressive than the bash reaper,
+  // which DELETES rows and so must stay conservative (pid-identity + 12h, D-2196).
   _present(r) {
-    if (this._pidIdentityOk(r.pid, r.pid_start)) return true; // alive + original → present
-    return !this._isZombie(r);
-  }
-
-  // D-2196: mirror of bash pc_session_is_zombie. Reap (true) iff the transcript
-  // is KNOWN and one of: stale past the 12h walked-away threshold; OR the pid is
-  // dead/recycled AND the transcript is stale past the 30m dead-pid grace. A
-  // fresh transcript (≤ grace) is never a zombie — the live-session guard.
-  _isZombie(r) {
+    if (this._sessionInflight(r.sid)) return true;            // a tool is running now
     const age = this._transcriptAgeMs(r.sid);
-    if (age == null) return false;                            // unknown transcript → never a zombie
-    if (age > SESSION_ZOMBIE_MS) return true;                 // walked-away 12h line
-    if (!this._pidIdentityOk(r.pid, r.pid_start) && age > SESSION_DEAD_PID_GRACE_MS) return true; // D-2155+D-2196
-    return false;
+    if (age == null) return this._pidAlive(r.pid);            // no transcript yet → new-session rescue
+    return age <= DECK_PRESENT_MS;                            // recent activity → present; stale → hide
   }
 
   // D-1739: a process is alive if kill(pid,0) succeeds; EPERM also means alive
   // (someone else's process); only ESRCH (no such process) is dead. No pid →
-  // treat as alive (can't disprove). Mirrors the bash registry's active filter.
-  // NOTE: alive ≠ original — a recycled pid is also "alive". Use _pidIdentityOk
-  // for presence; _pidAlive is only the liveness half.
+  // treat as alive (can't disprove). Used ONLY as the new-session rescue in
+  // _present (a recent pid for a not-yet-materialised transcript) — NOT as a
+  // general presence signal, because an alive pid can be a recycled ghost.
   _pidAlive(pid) {
     if (pid == null || pid === '') return true;
     try { process.kill(Number(pid), 0); return true; }
     catch (e) { return e.code === 'EPERM'; }
-  }
-
-  // D-2196: process start-epoch (seconds) for a pid, from `ps -o lstart` (the
-  // same Darwin source the bash _pc_pid_start_epoch uses; JS Date parses that
-  // format to the identical epoch). Returns null when the pid is invalid / not
-  // running / lstart unparseable.
-  _pidStartEpoch(pid) {
-    if (pid == null || pid === '') return null;
-    try {
-      const ls = execFileSync('ps', ['-o', 'lstart=', '-p', String(pid)], { encoding: 'utf-8' }).trim();
-      if (!ls) return null;
-      const ms = new Date(ls).getTime();
-      return Number.isFinite(ms) ? Math.floor(ms / 1000) : null;
-    } catch { return null; }
-  }
-
-  // D-2196: true iff the recorded pid is alive AND is the SAME process that
-  // registered the row — its current start-epoch matches the stored `pid_start`
-  // within PID_START_TOLERANCE_S. A dead pid OR a recycled pid (alive, started
-  // later) → false. Mirrors lib-sessions.sh _pc_pid_identity_ok. Back-compat:
-  // when pid_start is absent/null (rows written before D-2196) or the live
-  // start-epoch is unreadable, identity cannot be disproved → falls back to
-  // alive==ok (the pre-D-2196 fast-positive). Only ever TIGHTENS presence on
-  // rows that carry a baseline; never weakens the fresh-transcript guard.
-  _pidIdentityOk(pid, storedStart) {
-    if (!this._pidAlive(pid)) return false;                   // dead pid → not original
-    if (storedStart == null || storedStart === '') return true; // no baseline → can't disprove
-    const cur = this._pidStartEpoch(pid);
-    if (cur == null) return true;                             // unreadable → can't disprove
-    return Math.abs(cur - Number(storedStart)) <= PID_START_TOLERANCE_S;
   }
 
   fleetRows() {

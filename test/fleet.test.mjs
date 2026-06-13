@@ -78,62 +78,66 @@ const mk = () => new AccountManager([
   const tui = new TUI(stub);
   ok('_cost honors config.pricing override', Math.abs(tui._cost(1e6, 1e6) - 50) < 1e-9); }
 
-// ── D-2196/D-2198: pid-identity presence (PID-reuse ghost) ────────────────────
-// Helper: write a fake transcript for a uuid and age it `agoSec` into the past.
+// ── D-2203: transcript-activity presence (the deck's live-view filter) ─────────
+const FAKE_PROJ = join(homedir(), '.claude', 'projects', '-test-d2203-fake');
+// Write a fake transcript for a uuid and age its mtime `agoSec` into the past.
 const writeTranscript = (uuid, agoSec) => {
-  const dir = join(homedir(), '.claude', 'projects', '-test-d2198-fake');
-  mkdirSync(dir, { recursive: true });
-  const p = join(dir, `${uuid}.jsonl`);
+  mkdirSync(FAKE_PROJ, { recursive: true });
+  const p = join(FAKE_PROJ, `${uuid}.jsonl`);
   writeFileSync(p, '{}\n');
   const t = Date.now() / 1000 - agoSec;
   utimesSync(p, t, t);
   return p;
 };
+// Write a D-1749 tool-inflight marker for a full sid, `agoSec` old.
+const sessDir = fullSid => join(homedir(), '.claude', 'state', 'sessions', fullSid);
+const setInflight = (fullSid, agoSec = 0) => {
+  mkdirSync(sessDir(fullSid), { recursive: true });
+  writeFileSync(join(sessDir(fullSid), 'tool-inflight'), `${Math.floor(Date.now() / 1000 - agoSec)}\tBash\n`);
+};
 
 { const am = mk();
-  // _pidStartEpoch — our own pid gives a sane recent epoch; bad pids → null.
-  const own = am._pidStartEpoch(process.pid);
-  const now = Math.floor(Date.now() / 1000);
-  ok('_pidStartEpoch: live pid → recent epoch', own != null && own <= now && (now - own) < 86400);
-  ok('_pidStartEpoch: dead pid → null', am._pidStartEpoch(999999) === null);
-  ok('_pidStartEpoch: null pid → null', am._pidStartEpoch(null) === null);
-
-  // _pidIdentityOk — matching baseline ok; recycled / dead → false; no baseline → ok.
-  ok('_pidIdentityOk: alive pid + matching start → true', am._pidIdentityOk(process.pid, own) === true);
-  ok('_pidIdentityOk: alive pid + recycled (stale start) → false', am._pidIdentityOk(process.pid, 1000000000) === false);
-  ok('_pidIdentityOk: dead pid → false', am._pidIdentityOk(999999, own) === false);
-  ok('_pidIdentityOk: alive pid + no baseline → true (back-compat)', am._pidIdentityOk(process.pid, null) === true);
-
-  // _present — identity-ok row is present with no transcript needed.
-  ok('_present: alive original pid → present', am._present({ sid: 'cc-d2198-orig', pid: process.pid, pid_start: own }) === true);
-
-  // Reused-pid ghost: identity fails (recycled start) + stale transcript past grace → dropped.
-  const ghostUuid = 'd2198aaa-0000-0000-0000-000000000001';
+  const cleanupSids = [];
   try {
-    writeTranscript(ghostUuid, 40 * 60); // 40 min stale
-    const ghost = { sid: `cc-${ghostUuid}`, pid: process.pid, pid_start: 1000000000 };
-    ok('_present: reused pid + transcript past grace → absent (D-2198)', am._present(ghost) === false);
-    ok('_isZombie: reused pid + transcript past grace → zombie', am._isZombie(ghost) === true);
-    // Fresh transcript protects even a recycled pid (live-session guard).
-    writeTranscript(ghostUuid, 5); // 5s fresh
-    ok('_present: reused pid + FRESH transcript → present (guard)', am._present(ghost) === true);
-  } finally { try { rmSync(join(homedir(), '.claude', 'projects', '-test-d2198-fake'), { recursive: true, force: true }); } catch {} }
+    // Fresh transcript → present (the pid is irrelevant when there's recent activity).
+    const freshU = 'd2203aaa-0000-0000-0000-000000000001';
+    writeTranscript(freshU, 60); // 1 min ago
+    ok('_present: fresh transcript (1m) → present', am._present({ sid: `cc-${freshU}`, pid: process.pid }) === true);
 
-  // Back-compat: no pid_start, alive pid, stale transcript → present (pre-D-2196 alive==present).
-  const bcUuid = 'd2198bbb-0000-0000-0000-000000000002';
-  try {
-    writeTranscript(bcUuid, 40 * 60);
-    ok('_present: no pid_start + alive pid + stale transcript → present (back-compat)',
-      am._present({ sid: `cc-${bcUuid}`, pid: process.pid, pid_start: null }) === true);
-  } finally { try { rmSync(join(homedir(), '.claude', 'projects', '-test-d2198-fake'), { recursive: true, force: true }); } catch {} }
+    // Stale transcript (>30m window) + alive pid → HIDE. This is the operator's
+    // "not active" row: an alive (possibly recycled) pid no longer keeps it.
+    const staleU = 'd2203bbb-0000-0000-0000-000000000002';
+    writeTranscript(staleU, 40 * 60); // 40 min ago
+    ok('_present: stale transcript (40m) + alive pid → hide', am._present({ sid: `cc-${staleU}`, pid: process.pid }) === false);
 
-  // Dead-pid + stale transcript past grace → absent (D-2155 line, unchanged).
-  const deadUuid = 'd2198ccc-0000-0000-0000-000000000003';
-  try {
-    writeTranscript(deadUuid, 40 * 60);
-    ok('_present: dead pid + transcript past grace → absent (D-2155)',
-      am._present({ sid: `cc-${deadUuid}`, pid: 999999, pid_start: null }) === false);
-  } finally { try { rmSync(join(homedir(), '.claude', 'projects', '-test-d2198-fake'), { recursive: true, force: true }); } catch {} } }
+    // Tool-inflight marker overrides a stale transcript → present (long foreground tool).
+    const inflU = 'd2203ccc-0000-0000-0000-000000000003';
+    writeTranscript(inflU, 40 * 60);
+    setInflight(`cc-${inflU}`, 0); cleanupSids.push(`cc-${inflU}`);
+    ok('_present: stale transcript + fresh inflight marker → present', am._present({ sid: `cc-${inflU}`, pid: 999999 }) === true);
+
+    // Expired inflight marker (>120s, the D-1749 fresh-guard) does NOT rescue a stale row.
+    const expU = 'd2203ddd-0000-0000-0000-000000000004';
+    writeTranscript(expU, 40 * 60);
+    setInflight(`cc-${expU}`, 300); cleanupSids.push(`cc-${expU}`);
+    ok('_present: stale transcript + EXPIRED inflight marker → hide', am._present({ sid: `cc-${expU}`, pid: 999999 }) === false);
+
+    // No transcript file yet + alive pid → present (brand-new-session rescue).
+    ok('_present: no transcript + alive pid → present (new-session rescue)',
+      am._present({ sid: 'cc-d2203eee-0000-0000-000000000005', pid: process.pid }) === true);
+
+    // No transcript file + dead pid → hide (unmappable stale row).
+    ok('_present: no transcript + dead pid → hide',
+      am._present({ sid: 'cc-d2203fff-0000-0000-000000000006', pid: 999999 }) === false);
+
+    // Dead pid + fresh transcript → present (just-finished/crashed but recently active).
+    const jdU = 'd2203999-0000-0000-0000-000000000007';
+    writeTranscript(jdU, 60);
+    ok('_present: dead pid + fresh transcript → present (recent activity)', am._present({ sid: `cc-${jdU}`, pid: 999999 }) === true);
+  } finally {
+    try { rmSync(FAKE_PROJ, { recursive: true, force: true }); } catch {}
+    for (const s of cleanupSids) { try { rmSync(sessDir(s), { recursive: true, force: true }); } catch {} }
+  } }
 
 console.log(`\n${pass} passed, ${fail} failed`);
 if (fail > 0) process.exit(1);
