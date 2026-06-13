@@ -12,7 +12,7 @@ const mk = (opts) => new AccountManager([
   { name: 'a0', type: 'oauth', accessToken: 'x', refreshToken: 'r', expiresAt: Date.now() + 1e9 },
   { name: 'a1', type: 'oauth', accessToken: 'x', refreshToken: 'r', expiresAt: Date.now() + 1e9 },
   { name: 'a2', type: 'oauth', accessToken: 'x', refreshToken: 'r', expiresAt: Date.now() + 1e9 },
-], 0.98, 0.20, 10, 1.3, opts || {});
+], 0.98, opts || {});
 const H = 3600 * 1000, D = 24 * H;
 
 // ── S1: warm-stick — a warm session reuses its bound account (no switch) ──────
@@ -21,14 +21,13 @@ const H = 3600 * 1000, D = 24 * H;
   const again = am.getAccountForSession('S1');
   ok('warm session reuses its bound account (no switch)', first.name === again.name && am.sessionBindings.size === 1); }
 
-// warm-stick beats urgency: a more-urgent account must NOT pull a warm session.
+// warm-stick beats load balancing: a less-loaded account must NOT pull a warm session.
 { const am = mk();
-  const bound = am.getAccountForSession('S1');               // binds (equal urgency → a0)
+  const bound = am.getAccountForSession('S1');               // binds least-loaded
   const other = am.accounts.find(a => a.index !== bound.index);
-  other.quota.unified7dReset = Date.now() + 1 * H;            // make another account far more urgent
-  other.quota.unified7d = 0.05;
+  other._inflight = 0; bound._inflight = 5;                   // make another account less loaded
   const again = am.getAccountForSession('S1');                // still warm → must stay put
-  ok('non-urgent balancing does NOT cut a warm session mid-window', again.name === bound.name); }
+  ok('load balancing does NOT cut a warm session mid-window', again.name === bound.name); }
 
 // ── no-sid fallback → global selector (warmer / health / non-CC) ──────────────
 { const am = mk();
@@ -42,16 +41,16 @@ const H = 3600 * 1000, D = 24 * H;
   const rebind = am.getAccountForSession('S1');               // bound blocked → switch now
   ok('blocker (429) rebinds the session immediately to a different account', rebind.name !== bound.name); }
 
-// ── window lapsed → rebind allowed; picks the now-more-urgent account ─────────
+// ── window lapsed → rebind allowed; lands on a usable account ─────────────────
 { const am = mk();
   const bound = am.getAccountForSession('S1');
   const b = am.sessionBindings.get('S1');
   b.lastUsedAt = Date.now() - am.cacheAffinityWindowMs - 5000; // idle past the cache window
   const other = am.accounts.find(a => a.index !== bound.index);
-  other.quota.unified7dReset = Date.now() + 2 * H;             // other now most urgent
-  other.quota.unified7d = 0.05;
+  bound._inflight = 5;                                          // bound now most loaded → least-loaded rebinds away
+  other._inflight = 0;
   const rebind = am.getAccountForSession('S1');
-  ok('window lapsed → rebinds to the now-highest-urgency account', rebind.name === other.name); }
+  ok('window lapsed → rebinds off the most-loaded account to a less-loaded one', rebind.name !== bound.name); }
 
 // ── S2: distribution spreads sessions across accounts (no reset bias) ─────────
 { const am = mk();
@@ -60,42 +59,9 @@ const H = 3600 * 1000, D = 24 * H;
   const max = Math.max(...counts), min = Math.min(...counts);
   ok('6 sessions spread evenly across 3 accounts (parallel capacity)', max - min <= 1 && counts.reduce((s, c) => s + c, 0) === 6); }
 
-// ── S2: reset-proximity boost — soon-to-reset account absorbs MORE sessions ───
-{ const am = mk();
-  const now = Date.now();
-  am.accounts[0].quota.unified7dReset = now + 6 * H;  am.accounts[0].quota.unified7d = 0.10; // imminent + headroom
-  am.accounts[1].quota.unified7dReset = now + 6 * D;  am.accounts[1].quota.unified7d = 0.10; // far
-  am.accounts[2].quota.unified7dReset = now + 6 * D;  am.accounts[2].quota.unified7d = 0.10; // far
-  for (let i = 0; i < 6; i++) am.getAccountForSession('S' + i);
-  const { counts } = am._activeSessionCounts();
-  ok('reset-proximity boost drains the soon-to-reset account harder', counts[0] > counts[1] && counts[0] > counts[2]); }
-
-// boost is gated on headroom: a soon-to-reset account with NO weekly headroom is not boosted.
-{ const am = mk();
-  am.accounts[0].quota.unified7dReset = Date.now() + 6 * H;
-  am.accounts[0].quota.unified7d = 1.0;               // imminent but no headroom
-  ok('reset-proximity boost is 1 when the account has no weekly headroom', am._resetProximityBoost(am.accounts[0]) === 1); }
-
-// ── S3: bounded per-account backoff — escalates, caps, resets on success ──────
-// D-1936: the SUSTAINED path (near-cap account) keeps the 60s floor. A headerless
-// 429 on a near-cap account is genuine pressure, not burst → long backoff. (The
-// budget-healthy burst path → short cooldown is covered in burst-recovery.test.mjs.)
-{ const am = mk({ perAccountBackoffFloorSec: 60, perAccountBackoffFactor: 1.5, perAccountBackoffCapSec: 600, recoveryStaggerSec: 0 });
-  am.accounts[0].quota.unified7d = 0.90;             // near-cap → sustained (long) backoff path
-  const now = Date.now();
-  am.markRateLimited(0, null); const w1 = Math.round((am.accounts[0].rateLimitedUntil - now) / 1000);
-  am.markRateLimited(0, null); const w2 = Math.round((am.accounts[0].rateLimitedUntil - now) / 1000);
-  am.markRateLimited(0, null); const w3 = Math.round((am.accounts[0].rateLimitedUntil - now) / 1000);
-  ok('headerless 429 on a near-cap account escalates bounded 60→90→135 (not the full 5h reset)', w1 === 60 && w2 === 90 && w3 === 135);
-  am.noteAccountSuccess(0);
-  am.markRateLimited(0, null); const w4 = Math.round((am.accounts[0].rateLimitedUntil - now) / 1000);
-  ok('a success resets the per-account 429 streak back to the floor', w4 === 60); }
-
-{ const am = mk({ perAccountBackoffCapSec: 600, recoveryStaggerSec: 0 });
-  const now = Date.now();
-  am.markRateLimited(0, 3600);                          // explicit 1h header → clamped to the cap
-  const w = Math.round((am.accounts[0].rateLimitedUntil - now) / 1000);
-  ok('an explicit long retry-after is clamped to the bounded cap (600s)', w === 600); }
+// (D-2179) reset-proximity boost + the old per-account backoff escalation are
+// removed — the escalating 429 ladder, streak reset, and retry-after clamp are
+// covered in escalating-backoff.test.mjs.
 
 // ── eviction: idle bindings are dropped ───────────────────────────────────────
 { const am = mk({ bindingEvictSec: 1 });

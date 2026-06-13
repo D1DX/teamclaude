@@ -646,6 +646,16 @@ export class TUI {
         // D-2169: visual health panel (proxy summary + RAM/CPU gauge bars)
         for (const hl of this._healthPanel(sys)) lines.push(hl);
 
+        // D-2179: pool capacity chip — what an orchestrator reads to gate launches.
+        if (this.am.computeCapacity) {
+          const cap = this.am.computeCapacity();
+          const vcol = cap.verdict === 'green' ? green : cap.verdict === 'yellow' ? yellow : red;
+          let cH = ` Cap    ${vcol(String(cap.verdict).toUpperCase())} · ${cyan(cap.headroom + ' headroom')} · ${cap.liveAccounts}/${cap.total} live`;
+          if (cap.benched > 0) cH += ` · ${yellow(cap.benched + ' benched')}`;
+          if (cap.soonestResetSec > 0) cH += ` · ${gray('next ' + fmtDur(cap.soonestResetSec))}`;
+          lines.push(cH);
+        }
+
         // fleet summary left: agent breakdown + attention signals
         let sH = ` Fleet  ${cyan(agents.length + ' agents')}`;
         if (numUmbrellas > 0) {

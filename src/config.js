@@ -17,14 +17,18 @@ export function createDefaultConfig() {
     },
     upstream: 'https://api.anthropic.com',
     warmOnStartup: true,           // ping each account at boot to anchor rate-limit windows
-    // ── Routing (D1DX) — 5 knobs ──
-    switchThreshold: 0.98,         // HARD ceiling — never route past this (real-429 guard)
+    // ── Routing (D1DX, D-2179) — capacity-aware ──
+    switchThreshold: 0.98,         // HARD ceiling — header path only (Max OAuth sends none)
     cacheAffinityWindowSec: 300,   // a session sticks to its account while used within this window
     bindingEvictSec: 1800,         // drop an idle session binding after this long
-    backoffSec: 60,                // a 429 benches the account this long (+ jitter), then re-probe
-    expiringAccounts: [],          // names whose subscription ends soon — drain to their pace line first
-    paceOvershootGuard: 0.05,      // an account >this far AHEAD of its pace line takes no new work (5 pts)
+    backoffSec: 60,                // 429 escalating-backoff base: streak-1 bench (+ jitter)
+    backoffFactor: 4,              // ×per consecutive 429 (60s → 4m → 15m)
+    backoffCapSec: 900,            // escalating-backoff ceiling (15m)
     allThrottledCapSec: 600,       // max client retry-after when EVERY account is throttled
+    // ── Capacity model (D-2179) ──
+    capEmaAlpha: 0.3,              // EMA weight when learning an account's 5h cap from 429s
+    capSoftCeiling: 0.75,          // publish headroom below this fraction of the learned cap
+    softConcurrencyPerAccount: 3,  // warm sessions per live account before headroom runs out
     // ── Logs + ledger (observability) ──
     logRequests: false,            // per-request full-body dumps (verbose) — debug only
     logRetentionHours: 24,         // auto-delete log files older than this (0 = never)

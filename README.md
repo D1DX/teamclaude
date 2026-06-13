@@ -8,8 +8,9 @@ Sits transparently between Claude Code and the Anthropic API, managing multiple 
 
 ## Features
 
-- **Automatic account rotation** — switches to the next account when session (5h) or weekly (7d) quota reaches the configured threshold (default 98%)
-- **Auto-retry on 429** — waits the `retry-after` duration and retries the same account; switches to the next on persistent errors
+- **Session-sticky + least-loaded routing** — each client session sticks to one account (keeping its prompt cache warm); new/rebound sessions go to the least-loaded usable account
+- **Escalating 429 backoff** — a 429 benches the account (honoring `retry-after` when present, else an escalating ladder by consecutive-429 streak that resets on any success), then fails over; clients only see a 429 once every account is throttled
+- **Capacity endpoint** — `GET /capacity` (and `teamclaude capacity`) report a pool verdict (green/yellow/red) + spare concurrency headroom + soonest-reset, learned from per-account burn, so a launcher can gate how much concurrent work it starts
 - **Interactive TUI** — real-time dashboard with color-coded quota bars, reset countdowns, activity log, and keyboard controls
 - **OAuth token management** — automatically refreshes tokens nearing expiry and persists them to config; client token refreshes pass through untouched
 - **Hot-reload accounts** — add accounts via `import` or `login` while the server is running, press **R** to pick them up
@@ -134,6 +135,7 @@ claude
 teamclaude accounts          # List accounts with subscription tier and token status
 teamclaude accounts -v       # Also show token expiry times
 teamclaude status            # Show live proxy status (requires running server)
+teamclaude capacity          # Pool capacity verdict/headroom/reset; --json for scripts (exit 0/10/20)
 teamclaude remove <name>     # Remove an account
 teamclaude api <path>        # Call an API endpoint with account credentials
 teamclaude help              # Show all commands
@@ -192,12 +194,13 @@ TEAMCLAUDE_CONFIG=./my-config.json teamclaude server
 1. Claude Code connects to the local proxy instead of `api.anthropic.com`
 2. The proxy selects the active account and forwards requests with that account's credentials
 3. OAuth tokens expiring within 5 minutes are automatically refreshed and persisted to config
-4. Rate limit headers from the API (`anthropic-ratelimit-unified-*`) track session (5h) and weekly (7d) quota utilization
-5. When usage reaches the threshold, the proxy switches to the next available account via round-robin
-6. On 429 responses, the proxy waits the `retry-after` duration and retries; on persistent errors, it switches accounts
-7. Transient network errors (connection reset, timeout) drop the connection so the client can retry
-8. If all accounts are exhausted, returns 429 with the soonest reset time
-9. Client token refresh requests (`/v1/oauth/token`) are relayed to upstream untouched — the proxy and client manage their own token lifecycles independently
+4. Each client session (by `x-claude-code-session-id`) binds to one account and stays cache-warm on it; new/rebound sessions pick the least-loaded usable account (fewest in-flight, then fewest warm sessions)
+5. Rate limit headers (`anthropic-ratelimit-unified-*`), when the upstream provides them, refine selection and engage the `switchThreshold` hard ceiling; without them the proxy routes reactively
+6. On a 429 the account is benched — to the server `retry-after` if present, otherwise an escalating ladder keyed to the consecutive-429 streak (capped), reset on any success — then the request fails over to another account
+7. A per-account capacity model learns each account's cap from its burn at 429 time and exposes pool headroom via `/capacity`
+8. Transient network errors (connection reset, timeout) drop the connection so the client can retry
+9. If all accounts are throttled, the proxy holds the request and polls for capacity, then returns a reset-aware 429 if the hold budget is spent
+10. Client token refresh requests (`/v1/oauth/token`) are relayed to upstream untouched — the proxy and client manage their own token lifecycles independently
 
 ## License
 

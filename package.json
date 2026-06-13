@@ -12,7 +12,7 @@
   ],
   "scripts": {
     "start": "node src/index.js",
-    "test": "node test/selection.test.mjs && node test/all-throttled.test.mjs && node test/session-routing.test.mjs && node test/all-throttled-hold.test.mjs && node test/fleet.test.mjs && node test/tree.test.mjs && node test/inflight-cap.test.mjs && node test/weekly-reserve-floor.test.mjs && node test/burst-recovery.test.mjs && node test/pace-controller.test.mjs"
+    "test": "node test/selection.test.mjs && node test/escalating-backoff.test.mjs && node test/capacity.test.mjs && node test/session-routing.test.mjs && node test/all-throttled-hold.test.mjs && node test/fleet.test.mjs && node test/tree.test.mjs"
   },
   "keywords": [
     "claude",

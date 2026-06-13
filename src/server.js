@@ -57,6 +57,14 @@ export function createProxyServer(accountManager, config, hooks = {}) {
         return;
       }
 
+      // D-2179: capacity endpoint — orchestrators gate worker launches on this
+      // (verdict / headroom / soonestResetSec). Localhost-only like /status.
+      if (req.method === 'GET' && (req.url === '/teamclaude/capacity' || req.url === '/capacity')) {
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify(accountManager.computeCapacity(), null, 2));
+        return;
+      }
+
       // D1DX patch (D-1903): local health endpoint. A bare `GET`/`HEAD /` (and
       // `/health`) is a connectivity probe Claude Code / monitors fire ~every 30s.
       // Anthropic returns 404 for it, so WITHOUT this short-circuit every probe is
@@ -510,7 +518,7 @@ async function holdForThrottle(req, res, body, accountManager, upstream, hooks, 
   // hard-capped (its quota has headroom), so it is held for; a genuinely capped
   // pool (quota ≥ ceiling / status rejected) resets hours out, so holding the
   // full budget would just hang the agent before erroring anyway.
-  if (remainingMs <= 0 || res.destroyed || allHardCapped(accountManager)) {
+  if (remainingMs <= 0 || res.destroyed || accountManager.allHardCapped()) {
     if (res.destroyed) return;
     return sendAllThrottled429(res, accountManager, ctx);
   }
@@ -530,28 +538,8 @@ async function holdForThrottle(req, res, body, accountManager, upstream, hooks, 
   return forwardRequest(req, res, body, accountManager, upstream, 0, hooks, reqId, ctx, logDir);
 }
 
-// D1DX patch (D-1741): true when EVERY account is at a genuine hard limit (real
-// quota exhaustion, not a transient bounded backoff). Read-only over public quota
-// fields — deliberately a local copy of AccountManager._atHardLimit, NOT an edit
-// to account-manager.js, because D-1741 shares that file with a live sibling
-// session (D-1739). Fold into an AccountManager.allHardCapped() method once the
-// sibling work lands (see the D-1741 issue thread).
-function allHardCapped(accountManager) {
-  const accounts = accountManager.accounts;
-  if (!accounts || accounts.length === 0) return false;
-  const thr = accountManager.switchThreshold ?? 0.98;
-  return accounts.every(a => {
-    const q = a.quota || {};
-    if (q.unifiedStatus === 'rejected') return true;
-    if (q.unified5h != null && q.unified5h >= thr) return true;
-    if (q.unified7d != null && q.unified7d >= thr) return true;
-    if (q.tokensLimit != null && q.tokensRemaining != null &&
-        (1 - q.tokensRemaining / q.tokensLimit) >= thr) return true;
-    if (q.requestsLimit != null && q.requestsRemaining != null &&
-        (1 - q.requestsRemaining / q.requestsLimit) >= thr) return true;
-    return false;
-  });
-}
+// D1DX (D-2179): allHardCapped folded into AccountManager.allHardCapped() — the
+// D-1741 local copy is gone now the sibling work has landed.
 
 // The last-resort all-throttled 429 (unchanged behavior — real-reset-aware
 // retry-after via AccountManager.allThrottledBackoff()).

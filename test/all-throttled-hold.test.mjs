@@ -19,6 +19,7 @@ function makeAM({ account = null, hardCapped = false, backoff = 1 } = {}) {
     _account: account,
     getAccountForSession() { return this._account; },
     allThrottledBackoff() { return backoff; },
+    allHardCapped() { return hardCapped; }, // D1DX (D-2179): folded into the class
     ensureTokenFresh() {}, updateQuota() {}, markRateLimited() {},
     noteSuccess() {}, noteAccountSuccess() {}, updateUsage() {}, getStatus() { return {}; },
     noteInflightStart() {}, noteInflightEnd() {}, // D1DX (D-1903)

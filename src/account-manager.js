@@ -4,8 +4,6 @@ import { homedir, totalmem, freemem, loadavg, cpus, platform } from 'node:os';
 import { execFileSync } from 'node:child_process';
 import { join } from 'node:path';
 
-const WEEK_MS = 7 * 24 * 60 * 60 * 1000;
-
 // D1DX (D-2169): per-model API pricing, $/Mtok [input, output]. The Messages API
 // returns no cost field — we compute the API-equivalent cost from token usage +
 // the response's `model`. Cache multipliers (of the INPUT rate): write-5m 1.25×,
@@ -112,10 +110,17 @@ function emptyQuota() {
 }
 
 export class AccountManager {
-  // D1DX — simplified routing (D-2165). ONE selection rule: pace-to-line. Each
-  // account aims for an expected-utilization line = fraction of its OWN 7d window
-  // elapsed; new work goes to the account furthest BEHIND its line. switchThreshold
-  // (0.98) is the hard ceiling that is never crossed (the real-429 guard).
+  // D1DX — capacity-aware routing (D-2179). Max OAuth accounts send NO rate-limit
+  // headers (anthropic-ratelimit-unified-*), so the prior pace-to-line model ran
+  // blind. The model is now reactive with an optional header refinement:
+  //   • SELECT: session-sticky (per-account prompt cache) + least-in-flight spread.
+  //   • THROTTLE: a 429 benches the account on an ESCALATING ladder keyed to the
+  //     consecutive-429 streak (reset on any success) — a real cap stops being
+  //     re-probed every 60s; a header retry-after / known reset overrides it.
+  //   • CAPACITY: per-account rolling 5h/7d burn + a learned cap (EMA of burn at
+  //     the first 429 of each streak) → forward headroom, published via
+  //     computeCapacity() so orchestrators gate launches instead of saturating.
+  // switchThreshold (0.98) stays as the header-path hard ceiling when headers exist.
   constructor(accounts, switchThreshold = 0.98, opts = {}) {
     this.accounts = accounts.map((acct, index) => ({
       index,
@@ -134,33 +139,44 @@ export class AccountManager {
         lastUsed: null,
       },
       rateLimitedUntil: null,
-      _inflight: 0, // live concurrent upstream requests (spread tiebreak + display)
+      _inflight: 0,        // live concurrent upstream requests (spread tiebreak + display)
+      _429streak: 0,       // consecutive 429s (drives the escalating backoff ladder)
+      _lastBenchSec: 0,    // last bench duration in seconds (display + capacity)
+      _burn: null,         // Map(hourEpoch → tokens) — rolling burn buckets (≤168 = 7d)
+      _capEst5h: null,     // learned 5h cap: EMA of burn5h at the first 429 of each streak
     }));
     this.currentIndex = 0;
     this.switchThreshold = switchThreshold; // hard ceiling — 5h axis + real weekly limit
     this._didBootSelect = false;            // first selection picks best, not config index 0
 
-    // ── Selection: pace-to-line ──
-    // expiringAccounts (subscriptions ending) drain to their line FIRST. An account
-    // more than paceOvershootGuard AHEAD of its line takes no new bindings — and a
-    // warm session bound to it is released at its next message (lazy eviction).
-    this.expiringAccounts   = opts.expiringAccounts   ?? [];
-    this.paceOvershootGuard = opts.paceOvershootGuard ?? 0.05;
-
-    // ── Cache-affinity ──
-    // A session sticks to one account (per-account prompt cache) until a blocker,
-    // the idle window lapses, or the account runs past its pace line.
+    // ── Selection: session-sticky + least-loaded ──
+    // A session sticks to one account (per-account prompt cache) until a blocker
+    // or the idle window lapses. New/rebound work spreads to the least-in-flight
+    // usable account. (Pace-to-line removed in D-2179 — it required the unified
+    // rate-limit headers Max OAuth never sends, so it ran inert.)
     this.sessionBindings = new Map(); // sid -> { index, lastUsedAt, boundAt, ... }
     this.cacheAffinityWindowMs = (opts.cacheAffinityWindowSec ?? 300) * 1000; // warm-stick window
     this.bindingEvictMs        = (opts.bindingEvictSec        ?? 1800) * 1000; // drop idle bindings
 
-    // ── 429 handling: one bounded backoff ──
-    // A throttled account is benched for backoffSec (+ small de-sync jitter), then
-    // re-probed; a genuinely capped account is still excluded honestly by
-    // _atHardLimit. allThrottledCapSec bounds the client retry-after when EVERY
-    // account is throttled (the server hold-loop re-polls within that window).
-    this.backoffSec         = opts.backoffSec         ?? 60;
-    this.allThrottledCapSec = opts.allThrottledCapSec ?? 600;
+    // ── 429 handling: escalating backoff (D-2179) ──
+    // A 429 with a server retry-after (or a known unified reset) benches until that
+    // instant. Header-blind (the Max OAuth norm), it benches on an escalating ladder
+    // keyed to consecutive 429s: backoffBaseSec * backoffFactor^(streak-1), capped at
+    // backoffCapSec, + de-sync jitter. Any success resets the streak — so a transient
+    // 429 recovers fast while a genuine cap stops being re-probed every 60s.
+    this.backoffBaseSec     = opts.backoffSec         ?? 60;   // streak-1 bench
+    this.backoffFactor      = opts.backoffFactor      ?? 4;    // ×per consecutive 429
+    this.backoffCapSec      = opts.backoffCapSec      ?? 900;  // ladder ceiling (15m)
+    this.allThrottledCapSec = opts.allThrottledCapSec ?? 600;  // client retry-after cap
+    this.backoffJitterSec   = opts.backoffJitterSec   ?? this.backoffBaseSec; // de-sync spread (0 = deterministic)
+
+    // ── Capacity model (D-2179) ──
+    // Per-account hourly burn buckets (≤168 = 7d) feed a learned 5h cap (EMA of
+    // burn5h at the first 429 of each streak). headroom is published below the
+    // learned cap by capSoftCeiling; concurrency by softConcurrencyPerAccount.
+    this.capEmaAlpha               = opts.capEmaAlpha               ?? 0.3;
+    this.capSoftCeiling            = opts.capSoftCeiling            ?? 0.75;
+    this.softConcurrencyPerAccount = opts.softConcurrencyPerAccount ?? 3;
 
     this._sessionTagCache = { at: 0, rows: null }; // cached sessions.json read for emoji tags
 
@@ -211,15 +227,14 @@ export class AccountManager {
   getActiveAccount() {
     this._sweepAll();
     const current = this.accounts[this.currentIndex];
-    // Sticky while the current account is usable AND still on (or behind) its pace
-    // line; otherwise (re)pick by the one rule. First-ever call always picks.
-    if (this._didBootSelect && current && this._isUsable(current)
-        && this._paceGap(current) >= -this.paceOvershootGuard) {
+    // Sticky while the current account is usable; otherwise (re)pick the
+    // least-loaded usable account. First-ever call always picks.
+    if (this._didBootSelect && current && this._isUsable(current)) {
       return current; // stay cache-warm
     }
     this._didBootSelect = true;
     const chosen = this._pickAccountForBinding();
-    if (chosen) this._switchTo(chosen, `account "${chosen.name}" (pace-to-line)`);
+    if (chosen) this._switchTo(chosen, `account "${chosen.name}" (least-loaded)`);
     return chosen;
   }
 
@@ -244,27 +259,22 @@ export class AccountManager {
     if (b) {
       const acct = this.accounts[b.index];
       const warm = now - b.lastUsedAt < this.cacheAffinityWindowMs;
-      const onPace = acct && this._paceGap(acct) >= -this.paceOvershootGuard;
-      // Warm + usable + still on (or behind) its pace line → stay put (don't churn
-      // the cache). If the bound account has run PAST its line, fall through and
-      // rebind (lazy over-pace eviction — the next pick rebalances to a more-behind
-      // account). A blocked / hard-capped account also falls through (immediate).
-      if (acct && warm && onPace && !this._isBlocked(acct) && !this._atHardLimit(acct)) {
+      // Warm + not blocked / hard-capped → stay put (don't churn the per-account
+      // prompt cache). A blocked / hard-capped account falls through and rebinds.
+      if (acct && warm && !this._isBlocked(acct) && !this._atHardLimit(acct)) {
         b.lastUsedAt = now;
         return acct;
       }
     }
 
-    // (Re)bind: no binding, window lapsed, bound account blocked/capped, or over its line.
+    // (Re)bind: no binding, window lapsed, or bound account blocked/capped.
     const chosen = this._pickAccountForBinding();
     if (!chosen) return null; // genuinely exhausted — server returns an honest 429
 
-    const prevAcct = b ? this.accounts[b.index] : null;
     const prevIdx = b?.index;
     const stillWarm = b && now - b.lastUsedAt < this.cacheAffinityWindowMs;
     const reason = !b ? 'new session'
       : !stillWarm ? 'window lapsed'
-      : (prevAcct && this._paceGap(prevAcct) < -this.paceOvershootGuard) ? 'over pace line'
       : 'blocker'; // was warm; bound acct blocked/capped
     // Preserve per-session stats across a rebind — a session's work spans its
     // account switches (firstSeenAt = the session's true start, not the latest bind).
@@ -297,67 +307,44 @@ export class AccountManager {
     return { counts, active };
   }
 
-  // ── pace-to-expiry controller helpers ──────────────
-  // expected(t) = fraction of THIS account's own 7d window that has elapsed.
-  // 0 just after a reset → 1 at the reset. Per-account (each account's 7d window
-  // is anchored independently). Returns null when the reset time is unknown — we
-  // can't place the line, so the gap is treated as neutral (0) by _paceGap.
-  _paceExpected(account) {
-    const reset = account.quota.unified7dReset;
-    if (!reset) return null;
-    const tToReset = Math.max(0, reset - Date.now());
-    return 1 - Math.min(1, tToReset / WEEK_MS);
+  // ── Capacity model helpers (D-2179) ──────────────────
+  // Per-account hourly burn buckets: Map(hourEpoch → tokens), pruned to 7d. Cheap
+  // (≤168 entries) and the only forward signal we have when Max OAuth sends no
+  // rate-limit headers — the learned cap is derived from these at 429 time.
+  _recordBurn(account, tokens) {
+    if (!account || !tokens) return;
+    const hr = Math.floor(Date.now() / 3600000);
+    if (!account._burn) account._burn = new Map();
+    account._burn.set(hr, (account._burn.get(hr) || 0) + tokens);
+    const cutoff = hr - 168; // keep 7d
+    for (const k of account._burn.keys()) if (k < cutoff) account._burn.delete(k);
   }
 
-  // Signed distance from the expected line: expected − weekly-used.
-  //   > 0  → BEHIND the line (under-utilized; wants more bindings)
-  //   < 0  → AHEAD of the line (over-utilized; overshoot guard may exclude it)
-  //   = 0  → on the line, or the reset is unknown (neutral — neither promoted nor guarded)
-  _paceGap(account) {
-    const expected = this._paceExpected(account);
-    if (expected == null) return 0;
-    const u7d = account.quota.unified7d ?? 0;
-    return expected - u7d;
-  }
-
-  // Subscription ending soon — drain before expiry. Names come from config
-  // (expiringAccounts); empty by default ⇒ no account gets precedence.
-  _isExpiring(account) {
-    return this.expiringAccounts.includes(account.name);
+  // Sum of burn (tokens) over the last `hours` whole-hour buckets.
+  _burnWindow(account, hours) {
+    if (!account || !account._burn) return 0;
+    const cutoff = Math.floor(Date.now() / 3600000) - hours;
+    let sum = 0;
+    for (const [k, v] of account._burn) if (k >= cutoff) sum += v;
+    return sum;
   }
 
   /**
-   * Pick the account to (re)bind a session to — THE one rule (pace-to-line):
-   *  1. usable accounts only (under the 0.98 hard ceiling, not throttled);
-   *  2. overshoot guard — drop accounts more than paceOvershootGuard AHEAD of
-   *     their line (degrade to all-usable if that would empty the pool);
-   *  3. expiring-first — while any expiring account is still behind its line,
-   *     restrict to that set so its soon-to-vanish budget drains first;
-   *  4. furthest BEHIND its line wins; near-ties (within paceOvershootGuard of the
-   *     top gap) break to the least-loaded account (fewest in-flight, then fewest
-   *     warm sessions) so a burst of new bindings spreads instead of dogpiling one.
-   * Returns null only when the pool is genuinely exhausted.
+   * Pick the least-loaded usable account to (re)bind a session to:
+   *  1. usable accounts only (not blocked, under the header hard ceiling);
+   *  2. fewest in-flight requests, then fewest warm sessions — spreads a burst
+   *     instead of dogpiling one account.
+   * Returns null only when the pool is genuinely exhausted (→ _soonestUsableOrNull).
    */
   _pickAccountForBinding() {
     const usable = this.accounts.filter(a => this._isUsable(a));
     if (usable.length === 0) return this._soonestUsableOrNull();
-
-    const onPace = usable.filter(a => this._paceGap(a) >= -this.paceOvershootGuard);
-    const guarded = onPace.length > 0 ? onPace : usable;
-
-    const expiringBehind = guarded.filter(a => this._isExpiring(a) && this._paceGap(a) > 0);
-    const pool = expiringBehind.length > 0 ? expiringBehind : guarded;
-
-    // Furthest behind its line first; spread near-ties by load.
-    const ranked = pool.slice().sort((a, c) => this._paceGap(c) - this._paceGap(a));
-    const topGap = this._paceGap(ranked[0]);
     const { counts } = this._activeSessionCounts();
-    const contenders = ranked.filter(a => topGap - this._paceGap(a) <= this.paceOvershootGuard);
-    return contenders.reduce((best, a) => {
+    return usable.reduce((best, a) => {
       const ai = a._inflight || 0, bi = best._inflight || 0;
       if (ai !== bi) return ai < bi ? a : best;
       return counts[a.index] < counts[best.index] ? a : best;
-    }, contenders[0]);
+    }, usable[0]);
   }
 
   // ── D1DX patch (D-1903): per-account in-flight accounting ──────────
@@ -884,6 +871,12 @@ export class AccountManager {
     if (inputTokens) account.usage.totalInputTokens += inputTokens;
     if (outputTokens) account.usage.totalOutputTokens += outputTokens;
 
+    // D-2179: feed the rolling burn buckets (capacity model). Count the billable
+    // load that pushes toward the rate limit — uncached input + cache writes +
+    // output; cache reads are ~free, so they're excluded.
+    this._recordBurn(account,
+      (inputTokens || 0) + (opts.cacheCreate5m || 0) + (opts.cacheCreate1h || 0) + (outputTokens || 0));
+
     const sb = sessionId ? this.sessionBindings.get(sessionId) : null;
     // Resolve the model for pricing: explicit (message_start) → remember it;
     // else the binding's last-seen model (message_delta) → else null (→ opus).
@@ -928,18 +921,50 @@ export class AccountManager {
     const account = this.accounts[accountIndex];
     if (!account) return;
     const now = Date.now();
-    const capMs = this.allThrottledCapSec * 1000;
-    const baseMs = (retryAfterSeconds != null && !isNaN(retryAfterSeconds))
-      ? Math.min(retryAfterSeconds * 1000, capMs)
-      : this.backoffSec * 1000;
-    const jitterMs = Math.random() * this.backoffSec * 1000; // de-sync window expiry
+    account._429streak = (account._429streak || 0) + 1;
+
+    // D-2179: learn this account's 5h cap from the burn at the FIRST 429 of a
+    // streak (the moment it hit the wall). EMA across cap events; later 429s in the
+    // same streak don't re-teach (burn keeps climbing while benched-then-probed).
+    if (account._429streak === 1) {
+      const burn5h = this._burnWindow(account, 5);
+      if (burn5h > 0) {
+        account._capEst5h = account._capEst5h == null
+          ? burn5h
+          : account._capEst5h * (1 - this.capEmaAlpha) + burn5h * this.capEmaAlpha;
+      }
+    }
+
+    const capMs = this.backoffCapSec * 1000;
+    let baseMs, why;
+    if (retryAfterSeconds != null && !isNaN(retryAfterSeconds)) {
+      baseMs = Math.min(retryAfterSeconds * 1000, capMs);          // server told us exactly
+      why = 'retry-after';
+    } else {
+      // Optional header refinement: a known unified reset → bench to it.
+      const resets = [account.quota.unified5hReset, account.quota.unified7dReset].filter(Boolean);
+      const reset = resets.length ? Math.min(...resets) : null;
+      if (reset && reset > now) {
+        baseMs = Math.min(reset - now, capMs);
+        why = 'reset';
+      } else {
+        // Header-blind (the Max OAuth norm): escalating ladder by consecutive 429s.
+        baseMs = Math.min(this.backoffBaseSec * 1000 * this.backoffFactor ** (account._429streak - 1), capMs);
+        why = `ladder×${account._429streak}`;
+      }
+    }
+    const jitterMs = Math.random() * this.backoffJitterSec * 1000; // de-sync window expiry
     account.status = 'throttled';
     account.rateLimitedUntil = now + baseMs + jitterMs;
-    console.log(`[TeamClaude] Account "${account.name}" rate limited +${Math.round((baseMs + jitterMs) / 1000)}s`);
+    account._lastBenchSec = Math.round((baseMs + jitterMs) / 1000);
+    console.log(`[TeamClaude] Account "${account.name}" rate limited +${account._lastBenchSec}s (${why}, streak ${account._429streak})`);
   }
 
-  /** A successful response on an account — no per-account streak state to reset now. */
-  noteAccountSuccess(_accountIndex) { /* no-op: single bounded backoff has no streak */ }
+  /** A successful response on an account — reset its 429 streak (ends the ladder). */
+  noteAccountSuccess(accountIndex) {
+    const a = this.accounts[accountIndex];
+    if (a && a._429streak) { a._429streak = 0; a._lastBenchSec = 0; }
+  }
 
   /**
    * Retry-after (seconds) to hand the client when EVERY account is throttled.
@@ -961,14 +986,74 @@ export class AccountManager {
         if (t && t > now && t < soonest) soonest = t;
       }
     }
-    let secs = soonest === Infinity ? this.backoffSec : (soonest - now) / 1000;
-    secs = Math.max(this.backoffSec, Math.min(this.allThrottledCapSec, secs));
-    secs += Math.random() * secs * 0.15; // upward-only de-sync jitter
+    let secs = soonest === Infinity ? this.backoffBaseSec : (soonest - now) / 1000;
+    secs = Math.max(this.backoffBaseSec, Math.min(this.allThrottledCapSec, secs));
+    if (this.backoffJitterSec > 0) secs += Math.random() * secs * 0.15; // upward-only de-sync jitter
     return Math.max(1, Math.ceil(secs));
   }
 
   /** A successful upstream response — no all-throttled episode state to clear now. */
   noteSuccess() { /* no-op: simplified rails have no episode streak */ }
+
+  /**
+   * D-2179: capacity snapshot for orchestrators (served by GET /capacity +
+   * `teamclaude capacity`). Header-blind by design — derives a verdict from live
+   * state + the learned per-account cap, so a launcher gates worker spawns on real
+   * pool headroom instead of saturating it. An account is "live" when it is not
+   * benched, not errored/exhausted, not over the header hard ceiling, and not past
+   * its learned soft cap. headroom = spare concurrent-session slots across the pool.
+   */
+  computeCapacity() {
+    this._sweepAll();
+    const now = Date.now();
+    const accounts = this.accounts.map(a => {
+      const benched = a.status === 'throttled' && a.rateLimitedUntil != null && now < a.rateLimitedUntil;
+      const benchSec = benched ? Math.ceil((a.rateLimitedUntil - now) / 1000) : 0;
+      const burn5h = this._burnWindow(a, 5);
+      const cap = a._capEst5h ?? null;
+      const headroomTok = cap != null ? Math.max(0, Math.round(cap * this.capSoftCeiling - burn5h)) : null;
+      const nearCap = cap != null && burn5h >= cap * this.capSoftCeiling;
+      const dead = a.status === 'error' || a.status === 'exhausted';
+      return {
+        name: a.name, status: a.status,
+        benched, benchSec, streak: a._429streak || 0, inflight: a._inflight || 0,
+        burn5h, capEst5h: cap, headroomTok, nearCap,
+        live: !benched && !dead && !this._atHardLimit(a) && !nearCap,
+      };
+    });
+    const live = accounts.filter(a => a.live);
+    const benchedAll = accounts.filter(a => a.benched);
+    const { active: warmSessions } = this._activeSessionCounts();
+    const slotHeadroom = Math.max(0, live.length * this.softConcurrencyPerAccount - warmSessions);
+    const soonestResetSec = benchedAll.length ? Math.min(...benchedAll.map(a => a.benchSec)) : 0;
+
+    let verdict;
+    if (live.length === 0) verdict = 'red';
+    else if (benchedAll.length > 0 || accounts.some(a => a.streak >= 2) || slotHeadroom <= 1) verdict = 'yellow';
+    else verdict = 'green';
+
+    return {
+      verdict,
+      headroom: slotHeadroom,   // est. more concurrent sessions the pool can absorb now
+      liveAccounts: live.length,
+      benched: benchedAll.length,
+      total: this.accounts.length,
+      warmSessions,
+      soonestResetSec,          // when the next benched account frees (RED scheduling)
+      accounts,
+      at: new Date(now).toISOString(),
+    };
+  }
+
+  /**
+   * True when EVERY account is at a genuine hard limit (the header path). Used by
+   * the server hold-loop to stop holding a genuinely-capped pool. Folds the former
+   * server.js local copy (the D-1741 TODO) into the class.
+   */
+  allHardCapped() {
+    if (!this.accounts.length) return false;
+    return this.accounts.every(a => this._atHardLimit(a));
+  }
 
   /**
    * Ensure an OAuth account's token is fresh, refreshing if needed.
@@ -1177,6 +1262,7 @@ export class AccountManager {
     return {
       currentAccount: this.accounts[this.currentIndex]?.name,
       switchThreshold: this.switchThreshold,
+      capacity: this.computeCapacity(),              // D1DX (D-2179): pool capacity verdict
       system: this.systemSnapshot(),                 // D1DX (D-1728 S8): proxy + host resources
       sessionBindings: this.sessionBindingSummary(), // D1DX (D-1728): live session→account map
       sessionAggregate: this.sessionAggregate(),     // D1DX (D-1728): live dashboard TOTAL
@@ -1186,6 +1272,11 @@ export class AccountManager {
         type: a.type,
         status: a.status,
         inflight: a._inflight || 0, // D1DX (D-1903): live concurrent in-flight count
+        streak: a._429streak || 0,  // D1DX (D-2179): consecutive-429 ladder depth
+        benchSec: (a.status === 'throttled' && a.rateLimitedUntil)
+          ? Math.max(0, Math.ceil((a.rateLimitedUntil - Date.now()) / 1000)) : 0,
+        burn5h: this._burnWindow(a, 5),   // D1DX (D-2179): rolling 5h token burn
+        capEst5h: a._capEst5h ?? null,    // D1DX (D-2179): learned 5h cap
         quota: { ...a.quota },
         usage: { ...a.usage },
         rateLimitedUntil: a.rateLimitedUntil
