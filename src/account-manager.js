@@ -180,6 +180,12 @@ export class AccountManager {
     // farOverLineThreshold = control law #6: a warm session is rebound for pacing
     // ONLY when its account is this far past its weekly line (cache yields late).
     this.fiveHourSoftCeiling  = opts.fiveHourSoftCeiling  ?? 0.90;
+    // Graduated 5h admission (D-2104): a proven account whose 5h-utilization is in
+    // the warn band [fiveHourWarnCeiling, fiveHourSoftCeiling) drops to an in-flight
+    // cap of 1 — it drains one-at-a-time instead of taking a burst, so its 5h
+    // header updates between requests and it gets excluded (≥ soft ceiling) before
+    // a burst overshoots into a 429. Below the warn ceiling → full cap.
+    this.fiveHourWarnCeiling  = opts.fiveHourWarnCeiling  ?? 0.75;
     this.farOverLineThreshold = opts.farOverLineThreshold ?? 0.10;
     // Anti-dogpile (D-2104 hardening): without these, a concurrent burst all
     // picks the single most-behind account and 429s it (thundering herd).
@@ -391,6 +397,19 @@ export class AccountManager {
     return true;
   }
 
+  // Graduated in-flight cap for new binds (D-2104):
+  //   unproven (no 200 this spell) → 1 (probe-gate);
+  //   proven but in the 5h warn band [warnCeiling, softCeiling) → 1 (slow-drain,
+  //     so a near-cap account can't take a burst that overshoots before its header
+  //     updates and the 5h rail excludes it);
+  //   proven with ample 5h headroom → maxInflightPerAccount.
+  _inflightCapFor(account) {
+    if (!account._proven) return 1;
+    const u5h = account.quota.unified5h;
+    if (u5h != null && u5h >= this.fiveHourWarnCeiling) return 1;
+    return this.maxInflightPerAccount;
+  }
+
   // End-of-cycle ramp (control law #3): as the account nears its 7d-reset, escalate
   // preference to drain unused weekly quota before it resets (use-it-or-lose-it).
   // Boost = unusedWeeklyFraction × tierWeight(hoursToReset). 0 outside all tiers.
@@ -442,9 +461,10 @@ export class AccountManager {
    * _soonestUsableOrNull at the top):
    *   1. usable (not blocked, under the 0.98 hard ceiling);
    *   2. 5h never-stall rail — below the 5h soft ceiling;
-   *   3. probe-gate in-flight cap — under 1 concurrent request while UNPROVEN
-   *      (no 200 yet this spell), opening to maxInflightPerAccount once proven;
-   *      so we never pile sessions onto an account we haven't confirmed healthy;
+   *   3. graduated in-flight cap (_inflightCapFor) — 1 while UNPROVEN (probe-gate)
+   *      or in the 5h warn band, opening to maxInflightPerAccount only when proven
+   *      with ample 5h headroom; so we never pile onto an unconfirmed or near-cap
+   *      account, and a near-cap account drains one-at-a-time without overshooting;
    *   4. session cap — under maxSessionsPerAccount bound warm sessions.
    * Then within the surviving pool, a PACE TIE-BAND: accounts within paceTieBand
    * of the best paceScore are "equally behind" → spread a concurrent burst across
@@ -459,8 +479,9 @@ export class AccountManager {
     const { counts } = this._activeSessionCounts();
     const fiveHourOk = usable.filter(a => this._fiveHourEligible(a));
     const base = fiveHourOk.length ? fiveHourOk : usable;
-    // Probe-gate: cap = 1 until the account is proven (returned a 200), then opens.
-    const underCap = base.filter(a => (a._inflight || 0) < (a._proven ? this.maxInflightPerAccount : 1));
+    // Probe-gate + graduated 5h cap: 1 while unproven, 1 in the 5h warn band,
+    // maxInflightPerAccount when proven with ample headroom (see _inflightCapFor).
+    const underCap = base.filter(a => (a._inflight || 0) < this._inflightCapFor(a));
     const capped = underCap.length ? underCap : base;
     // Hard session cap (instances limit) — a burst spills beyond maxSessionsPerAccount.
     const underSession = capped.filter(a => (counts[a.index] || 0) < this.maxSessionsPerAccount);

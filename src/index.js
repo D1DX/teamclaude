@@ -104,6 +104,7 @@ async function serverCommand() {
     bindingEvictSec: config.bindingEvictSec ?? 1800,
     // Pace-to-weekly-line controller (D-2104, real-data rebuild)
     fiveHourSoftCeiling: config.fiveHourSoftCeiling ?? 0.90,   // never-stall rail: no new load at/over this 5h util
+    fiveHourWarnCeiling: config.fiveHourWarnCeiling ?? 0.75,   // in-flight cap drops to 1 in [warn, soft) — slow-drain a near-cap account
     farOverLineThreshold: config.farOverLineThreshold ?? 0.10, // rebind a warm session only when this far past its weekly line
     rampTiers: config.rampTiers ?? undefined,                  // hours→weight ramp before 7d-reset (constructor default)
     paceTieBand: config.paceTieBand ?? 0.10,                   // anti-dogpile: accounts within this of the best paceScore spread by load

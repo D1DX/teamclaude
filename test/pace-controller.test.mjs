@@ -158,5 +158,19 @@ const bind = (am, sid, i) => {
   for (let i = 0; i < am.maxSessionsPerAccount; i++) bind(am, `cap${i}`, 0); // a0 at the session cap
   ok('session cap excludes a maxed account (spills off a0 despite most-behind)', am._pickAccountForBinding().name !== 'a0'); }
 
+// ── graduated 5h cap: a proven account in the warn band tightens to 1 in-flight ──
+{ const am = mk();
+  q(am, 0, { u7d: 0.0,  u5h: 0.80 }); // most behind, proven, but 5h in [0.75,0.90) warn band
+  q(am, 1, { u7d: 0.20, u5h: 0.10 });
+  am.accounts[0]._proven = true; am.accounts[0]._inflight = 1; // warn-band cap is 1 → already full
+  ok('5h warn band tightens a proven account to in-flight cap 1 (spills off a0)', am._pickAccountForBinding().name !== 'a0'); }
+
+// ── ample 5h headroom keeps the full cap ───────────────────────────────────────
+{ const am = mk();
+  q(am, 0, { u7d: 0.0,  u5h: 0.50 }); // most behind, proven, ample 5h headroom (<0.75)
+  q(am, 1, { u7d: 0.30, u5h: 0.10 });
+  am.accounts[0]._proven = true; am.accounts[0]._inflight = 2; // cap is maxInflightPerAccount (3); 2 < 3
+  ok('ample 5h headroom keeps full in-flight cap (a0 still picked at 2 in-flight)', am._pickAccountForBinding().name === 'a0'); }
+
 console.log(`\n${pass} passed, ${fail} failed`);
 if (fail) process.exit(1);

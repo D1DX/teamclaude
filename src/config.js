@@ -22,6 +22,7 @@ export function createDefaultConfig() {
     cacheAffinityWindowSec: 300,   // a session sticks to its account while used within this window
     bindingEvictSec: 1800,         // drop an idle session binding after this long
     fiveHourSoftCeiling: 0.90,     // never-stall rail: no NEW load at/over this 5h utilization
+    fiveHourWarnCeiling: 0.75,     // in-flight cap drops to 1 in [warn, soft) — slow-drain a near-cap account, no burst overshoot
     farOverLineThreshold: 0.10,    // rebind a warm session only when this far past its weekly pace line
     paceTieBand: 0.10,             // anti-dogpile: accounts within this of the best paceScore spread by load
     maxInflightPerAccount: 3,      // proven-account in-flight cap (unproven = 1, the probe-gate)
