@@ -1,7 +1,10 @@
 import { AccountManager } from '../src/account-manager.js';
+import { mkdtempSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 
 // D-2179: capacity snapshot for orchestrators — verdict / headroom / soonestReset
-// + allHardCapped. No network — in-memory accounts.
+// + allHardCapped + restart persistence. No network — in-memory accounts.
 let pass = 0, fail = 0;
 const ok = (name, cond) => { if (cond) { pass++; console.log('  ok  ', name); } else { fail++; console.log('  FAIL', name); } };
 const mk = (opts = {}) => new AccountManager([
@@ -62,6 +65,40 @@ const mk = (opts = {}) => new AccountManager([
   ok('allHardCapped is false when accounts carry no header limits', am.allHardCapped() === false);
   for (const a of am.accounts) a.quota.unifiedStatus = 'rejected';
   ok('allHardCapped is true when every account is header-rejected', am.allHardCapped() === true); }
+
+// ── persistence: per-account usage + capacity model survive a restart ─────────
+{ const dir = mkdtempSync(join(tmpdir(), 'tc-cap-'));
+  const p = join(dir, 'usage-ledger.json');
+  const am = mk(); am.setLedgerPath(p);
+  am.updateUsage(0, 50000, 10000, 'S1');                  // account usage + burn (60k)
+  am._recordBurn(am.accounts[0], 140000);                 // push 5h burn to ~200k
+  am.markRateLimited(0, null);                            // learn a 5h cap from the burn
+  const cap = am.accounts[0]._capEst5h;
+  const burn5h = am._burnWindow(am.accounts[0], 5);
+  am.saveLedger();
+  const am2 = mk(); am2.setLedgerPath(p); am2.loadLedger(); // restart simulation
+  ok('per-account cumulative usage survives restart',
+     am2.accounts[0].usage.totalInputTokens === 50000 && am2.accounts[0].usage.totalOutputTokens === 10000);
+  ok('learned 5h cap survives restart', am2.accounts[0]._capEst5h === cap && cap === 200000);
+  ok('burn buckets survive restart', am2._burnWindow(am2.accounts[0], 5) === burn5h && burn5h === 200000);
+  ok('the 429 streak is NOT persisted (reset on restart)', am2.accounts[0]._429streak === 0);
+  ok('the per-issue ledger still round-trips alongside', am2.ledgerByIssue().reduce((s, g) => s + g.tokens, 0) === 60000);
+  rmSync(dir, { recursive: true, force: true }); }
+
+// ── back-compat: a v1 ledger file (no accounts section) loads cleanly ─────────
+{ const dir = mkdtempSync(join(tmpdir(), 'tc-cap-v1-'));
+  const p = join(dir, 'usage-ledger.json');
+  const am = mk(); am.setLedgerPath(p);
+  am.updateUsage(0, 1000, 0, 'S1'); am.saveLedger();
+  // rewrite as a v1 payload (strip the accounts section)
+  const fs = await import('node:fs');
+  const data = JSON.parse(fs.readFileSync(p, 'utf-8')); delete data.accounts; data.version = 1;
+  fs.writeFileSync(p, JSON.stringify(data));
+  const am2 = mk(); am2.setLedgerPath(p);
+  let threw = false; try { am2.loadLedger(); } catch { threw = true; }
+  ok('a v1 ledger (no accounts) loads without error', threw === false);
+  ok('v1 per-issue ledger still restores', am2.ledgerByIssue().reduce((s, g) => s + g.tokens, 0) === 1000);
+  rmSync(dir, { recursive: true, force: true }); }
 
 console.log(`\n${pass} passed, ${fail} failed`);
 process.exit(fail === 0 ? 0 : 1);

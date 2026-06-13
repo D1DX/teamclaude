@@ -10,7 +10,7 @@ Sits transparently between Claude Code and the Anthropic API, managing multiple 
 
 - **Session-sticky + least-loaded routing** — each client session sticks to one account (keeping its prompt cache warm); new/rebound sessions go to the least-loaded usable account
 - **Escalating 429 backoff** — a 429 benches the account (honoring `retry-after` when present, else an escalating ladder by consecutive-429 streak that resets on any success), then fails over; clients only see a 429 once every account is throttled
-- **Capacity endpoint** — `GET /capacity` (and `teamclaude capacity`) report a pool verdict (green/yellow/red) + spare concurrency headroom + soonest-reset, learned from per-account burn, so a launcher can gate how much concurrent work it starts
+- **Capacity endpoint** — `GET /capacity` (and `teamclaude capacity`) report a pool verdict (green/yellow/red) + spare concurrency headroom + soonest-reset, learned from per-account burn, so a launcher can gate how much concurrent work it starts. Per-account usage + the learned caps persist to disk, so a restart doesn't blank the model
 - **Interactive TUI** — real-time dashboard with color-coded quota bars, reset countdowns, activity log, and keyboard controls
 - **OAuth token management** — automatically refreshes tokens nearing expiry and persists them to config; client token refreshes pass through untouched
 - **Hot-reload accounts** — add accounts via `import` or `login` while the server is running, press **R** to pick them up

@@ -668,6 +668,28 @@ export class AccountManager {
       for (const e of entries) {
         if (e && e.sid != null) this.usageLedger.set(`${e.sid}::${e.issue || ''}`, e);
       }
+      // D-2179: restore per-account usage + capacity model (v2, keyed by name;
+      // absent in a v1 file → skipped). The 429 streak is NOT persisted — a cold
+      // boot has no recent 429s, so resetting it to 0 is correct.
+      const accounts = (data && typeof data.accounts === 'object') ? data.accounts : null;
+      if (accounts) {
+        const hr = Math.floor(Date.now() / 3600000);
+        for (const a of this.accounts) {
+          const s = accounts[a.name];
+          if (!s) continue;
+          if (s.usage) {
+            a.usage.totalInputTokens  = s.usage.totalInputTokens  || 0;
+            a.usage.totalOutputTokens = s.usage.totalOutputTokens || 0;
+            a.usage.totalRequests     = s.usage.totalRequests     || 0;
+            a.usage.totalCost         = s.usage.totalCost         || 0;
+            a.usage.lastUsed          = s.usage.lastUsed          || null;
+          }
+          if (Array.isArray(s.burn) && s.burn.length) {
+            a._burn = new Map(s.burn.filter(([k]) => k >= hr - 168)); // re-prune to 7d
+          }
+          if (s.capEst5h != null) a._capEst5h = s.capEst5h;
+        }
+      }
     } catch { /* missing/corrupt → start empty */ }
     this._pruneLedger();
   }
@@ -677,8 +699,18 @@ export class AccountManager {
     if (!this.ledgerPath) return;
     try {
       const entries = [...this.usageLedger.values()];
+      // D-2179: per-account durable state (cumulative usage + capacity model),
+      // keyed by name so it survives an account reorder across restarts.
+      const accounts = {};
+      for (const a of this.accounts) {
+        accounts[a.name] = {
+          usage: { ...a.usage },
+          burn: a._burn ? [...a._burn] : [],
+          capEst5h: a._capEst5h ?? null,
+        };
+      }
       const tmp = this.ledgerPath + '.tmp';
-      writeFileSync(tmp, JSON.stringify({ version: 1, savedAt: Date.now(), entries }), { mode: 0o600 });
+      writeFileSync(tmp, JSON.stringify({ version: 2, savedAt: Date.now(), entries, accounts }), { mode: 0o600 });
       renameSync(tmp, this.ledgerPath);
       this._ledgerDirty = false;
       this._ledgerLastSaveAt = Date.now();
@@ -958,6 +990,7 @@ export class AccountManager {
     account.rateLimitedUntil = now + baseMs + jitterMs;
     account._lastBenchSec = Math.round((baseMs + jitterMs) / 1000);
     console.log(`[TeamClaude] Account "${account.name}" rate limited +${account._lastBenchSec}s (${why}, streak ${account._429streak})`);
+    this._ledgerDirty = true; this._maybeSaveLedger(); // D-2179: persist the learned cap
   }
 
   /** A successful response on an account — reset its 429 streak (ends the ladder). */
