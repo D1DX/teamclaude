@@ -1,6 +1,6 @@
 import { AccountManager } from '../src/account-manager.js';
 import { TUI } from '../src/tui.js';
-import { mkdirSync, writeFileSync, rmSync } from 'node:fs';
+import { mkdirSync, writeFileSync, rmSync, utimesSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
 
@@ -77,6 +77,63 @@ const mk = () => new AccountManager([
 { const stub = { accountManager: {}, config: { pricing: { inPerMtok: 10, outPerMtok: 40 } }, saveConfig() {}, syncAccounts() {}, onQuit() {} };
   const tui = new TUI(stub);
   ok('_cost honors config.pricing override', Math.abs(tui._cost(1e6, 1e6) - 50) < 1e-9); }
+
+// ── D-2196/D-2198: pid-identity presence (PID-reuse ghost) ────────────────────
+// Helper: write a fake transcript for a uuid and age it `agoSec` into the past.
+const writeTranscript = (uuid, agoSec) => {
+  const dir = join(homedir(), '.claude', 'projects', '-test-d2198-fake');
+  mkdirSync(dir, { recursive: true });
+  const p = join(dir, `${uuid}.jsonl`);
+  writeFileSync(p, '{}\n');
+  const t = Date.now() / 1000 - agoSec;
+  utimesSync(p, t, t);
+  return p;
+};
+
+{ const am = mk();
+  // _pidStartEpoch — our own pid gives a sane recent epoch; bad pids → null.
+  const own = am._pidStartEpoch(process.pid);
+  const now = Math.floor(Date.now() / 1000);
+  ok('_pidStartEpoch: live pid → recent epoch', own != null && own <= now && (now - own) < 86400);
+  ok('_pidStartEpoch: dead pid → null', am._pidStartEpoch(999999) === null);
+  ok('_pidStartEpoch: null pid → null', am._pidStartEpoch(null) === null);
+
+  // _pidIdentityOk — matching baseline ok; recycled / dead → false; no baseline → ok.
+  ok('_pidIdentityOk: alive pid + matching start → true', am._pidIdentityOk(process.pid, own) === true);
+  ok('_pidIdentityOk: alive pid + recycled (stale start) → false', am._pidIdentityOk(process.pid, 1000000000) === false);
+  ok('_pidIdentityOk: dead pid → false', am._pidIdentityOk(999999, own) === false);
+  ok('_pidIdentityOk: alive pid + no baseline → true (back-compat)', am._pidIdentityOk(process.pid, null) === true);
+
+  // _present — identity-ok row is present with no transcript needed.
+  ok('_present: alive original pid → present', am._present({ sid: 'cc-d2198-orig', pid: process.pid, pid_start: own }) === true);
+
+  // Reused-pid ghost: identity fails (recycled start) + stale transcript past grace → dropped.
+  const ghostUuid = 'd2198aaa-0000-0000-0000-000000000001';
+  try {
+    writeTranscript(ghostUuid, 40 * 60); // 40 min stale
+    const ghost = { sid: `cc-${ghostUuid}`, pid: process.pid, pid_start: 1000000000 };
+    ok('_present: reused pid + transcript past grace → absent (D-2198)', am._present(ghost) === false);
+    ok('_isZombie: reused pid + transcript past grace → zombie', am._isZombie(ghost) === true);
+    // Fresh transcript protects even a recycled pid (live-session guard).
+    writeTranscript(ghostUuid, 5); // 5s fresh
+    ok('_present: reused pid + FRESH transcript → present (guard)', am._present(ghost) === true);
+  } finally { try { rmSync(join(homedir(), '.claude', 'projects', '-test-d2198-fake'), { recursive: true, force: true }); } catch {} }
+
+  // Back-compat: no pid_start, alive pid, stale transcript → present (pre-D-2196 alive==present).
+  const bcUuid = 'd2198bbb-0000-0000-0000-000000000002';
+  try {
+    writeTranscript(bcUuid, 40 * 60);
+    ok('_present: no pid_start + alive pid + stale transcript → present (back-compat)',
+      am._present({ sid: `cc-${bcUuid}`, pid: process.pid, pid_start: null }) === true);
+  } finally { try { rmSync(join(homedir(), '.claude', 'projects', '-test-d2198-fake'), { recursive: true, force: true }); } catch {} }
+
+  // Dead-pid + stale transcript past grace → absent (D-2155 line, unchanged).
+  const deadUuid = 'd2198ccc-0000-0000-0000-000000000003';
+  try {
+    writeTranscript(deadUuid, 40 * 60);
+    ok('_present: dead pid + transcript past grace → absent (D-2155)',
+      am._present({ sid: `cc-${deadUuid}`, pid: 999999, pid_start: null }) === false);
+  } finally { try { rmSync(join(homedir(), '.claude', 'projects', '-test-d2198-fake'), { recursive: true, force: true }); } catch {} } }
 
 console.log(`\n${pass} passed, ${fail} failed`);
 if (fail > 0) process.exit(1);

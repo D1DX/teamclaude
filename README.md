@@ -97,7 +97,7 @@ When running from a TTY, shows an interactive **fleet control plane** (the "Deck
 - **Per-session row** — emoji · pinned issue (or sid) · issue-status chip (`work`/`todo`/`queued`/`block`/`review`) · live/idle · **activity glyph** (`⚙` a tool is executing, `~` the session is live/LLM responding, blank idle) · token burn · `$` cost · activity/intent line. `►` marks sessions that need the operator (blocked / in-review). All rows sorted by token count descending.
 - **Fleet header** — one-glance `N agents · M warm · K needs-you · total tokens · $burn`.
 - **By issue** — active issues only (those with a live session), each prefixed with its session emoji(s), sorted by token count descending. Press `i` to expand the full list. Historical/closed-issue usage lives in the task tracker, not here.
-- Dead sessions (pid no longer alive) are filtered out automatically, so no zombie rows.
+- Dead **or recycled** sessions are filtered out automatically, so no zombie rows. Presence keys on **pid identity** (the recorded pid is alive AND its start-epoch matches the one captured at register — a PID-reuse ghost, where a crashed session's pid was recycled by a new process, is detected and dropped), gated by the transcript: a dead/recycled pid only drops once the transcript is also stale past a 30m grace, while a fresh transcript always keeps a live session.
 - Real-time activity log with request tracking.
 
 Falls back to plain log output when not a TTY (e.g. running as a service).
