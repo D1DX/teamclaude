@@ -102,6 +102,10 @@ async function serverCommand() {
     // Cache-affinity (selection)
     cacheAffinityWindowSec: config.cacheAffinityWindowSec ?? 300,
     bindingEvictSec: config.bindingEvictSec ?? 1800,
+    // Pace-to-weekly-line controller (D-2104, real-data rebuild)
+    fiveHourSoftCeiling: config.fiveHourSoftCeiling ?? 0.90,   // never-stall rail: no new load at/over this 5h util
+    farOverLineThreshold: config.farOverLineThreshold ?? 0.10, // rebind a warm session only when this far past its weekly line
+    rampTiers: config.rampTiers ?? undefined,                  // hours→weight ramp before 7d-reset (constructor default)
     // 429 handling — escalating backoff
     backoffSec: config.backoffSec ?? 60,           // streak-1 bench (ladder base)
     backoffFactor: config.backoffFactor ?? 4,      // ×per consecutive 429

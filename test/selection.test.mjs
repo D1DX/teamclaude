@@ -1,7 +1,10 @@
 import { AccountManager } from '../src/account-manager.js';
 
-// D-2179: selection = eager throttle/quota sweep + session-sticky + least-loaded
-// pick (pace-to-line removed). No network — in-memory accounts.
+// Selection = eager throttle/quota sweep + session-sticky + (when no unified
+// headers are present yet) least-loaded spread. The pace-to-weekly-line behavior
+// on real utilization is covered in pace-controller.test.mjs (D-2104); these
+// cases exercise the sweep, stickiness, failover, and the no-data fallback.
+// No network — in-memory accounts.
 let pass = 0, fail = 0;
 const ok = (name, cond) => { if (cond) { pass++; console.log('  ok  ', name); } else { fail++; console.log('  FAIL', name); } };
 const mk = () => new AccountManager([

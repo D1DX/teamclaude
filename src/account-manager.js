@@ -162,14 +162,34 @@ export class AccountManager {
     this.switchThreshold = switchThreshold; // hard ceiling — 5h axis + real weekly limit
     this._didBootSelect = false;            // first selection picks best, not config index 0
 
-    // ── Selection: session-sticky + least-loaded ──
-    // A session sticks to one account (per-account prompt cache) until a blocker
-    // or the idle window lapses. New/rebound work spreads to the least-in-flight
-    // usable account. (Pace-to-line removed in D-2179 — it required the unified
-    // rate-limit headers Max OAuth never sends, so it ran inert.)
+    // ── Selection: session-sticky + pace-to-weekly-line (D-2104, real-data) ──
+    // A session sticks to one account (per-account prompt cache) until a blocker,
+    // the idle window, the 5h never-stall rail, or being far past its weekly line.
+    // New/rebound work goes to the account furthest BEHIND its weekly pace line.
+    // Anthropic returns unified-5h/7d-utilization on every Max OAuth response
+    // (proven live; D-2179's "headers never sent → pace inert" premise was false —
+    // it grepped logs that weren't capturing response headers). So pacing runs on
+    // real per-account utilization, not an estimate.
     this.sessionBindings = new Map(); // sid -> { index, lastUsedAt, boundAt, ... }
     this.cacheAffinityWindowMs = (opts.cacheAffinityWindowSec ?? 300) * 1000; // warm-stick window
     this.bindingEvictMs        = (opts.bindingEvictSec        ?? 1800) * 1000; // drop idle bindings
+
+    // Pace controller knobs. fiveHourSoftCeiling = never-stall rail (control law
+    // #1, TOP priority): an account at/over this 5h utilization takes no new load.
+    // farOverLineThreshold = control law #6: a warm session is rebound for pacing
+    // ONLY when its account is this far past its weekly line (cache yields late).
+    this.fiveHourSoftCeiling  = opts.fiveHourSoftCeiling  ?? 0.90;
+    this.farOverLineThreshold = opts.farOverLineThreshold ?? 0.10;
+    // End-of-cycle ramp (control law #3): weight by hours-to-7d-reset, applied to
+    // the account's unused weekly fraction → drains quota before it resets.
+    // First tier (ascending hours) whose bound ≥ hoursToReset wins.
+    this.rampTiers = opts.rampTiers ?? [
+      { hours: 8,  weight: 100 }, // ≤8h  → put all it can take on it
+      { hours: 16, weight: 8 },   // ≤16h → almost all
+      { hours: 24, weight: 4 },   // ≤24h → prefer aggressively
+      { hours: 48, weight: 2 },   // ≤48h → push
+      { hours: 72, weight: 1 },   // ≤72h → push where possible
+    ];
 
     // ── 429 handling: escalating backoff (D-2179) ──
     // A 429 with a server retry-after (or a known unified reset) benches until that
@@ -242,12 +262,12 @@ export class AccountManager {
     const current = this.accounts[this.currentIndex];
     // Sticky while the current account is usable; otherwise (re)pick the
     // least-loaded usable account. First-ever call always picks.
-    if (this._didBootSelect && current && this._isUsable(current)) {
-      return current; // stay cache-warm
+    if (this._didBootSelect && current && this._isUsable(current) && this._fiveHourEligible(current)) {
+      return current; // stay cache-warm (until it nears its 5h ceiling — never-stall)
     }
     this._didBootSelect = true;
     const chosen = this._pickAccountForBinding();
-    if (chosen) this._switchTo(chosen, `account "${chosen.name}" (least-loaded)`);
+    if (chosen) this._switchTo(chosen, `account "${chosen.name}" (pace: behind weekly line)`);
     return chosen;
   }
 
@@ -272,9 +292,13 @@ export class AccountManager {
     if (b) {
       const acct = this.accounts[b.index];
       const warm = now - b.lastUsedAt < this.cacheAffinityWindowMs;
-      // Warm + not blocked / hard-capped → stay put (don't churn the per-account
-      // prompt cache). A blocked / hard-capped account falls through and rebinds.
-      if (acct && warm && !this._isBlocked(acct) && !this._atHardLimit(acct)) {
+      // Stay put while warm AND safe AND not far past the weekly line. Rebind on:
+      // a blocker / hard-cap, the 5h never-stall rail (control law #1), or being
+      // far over the weekly line (control law #6 — cache yields ONLY then; normal
+      // over-pace doesn't churn a warm session).
+      const farOverLine = acct ? this._paceGap(acct) < -this.farOverLineThreshold : false;
+      if (acct && warm && !this._isBlocked(acct) && !this._atHardLimit(acct)
+          && this._fiveHourEligible(acct) && !farOverLine) {
         b.lastUsedAt = now;
         return acct;
       }
@@ -320,6 +344,59 @@ export class AccountManager {
     return { counts, active };
   }
 
+  // ── Pace-to-weekly-line helpers (D-2104, real-data) ──────────────────
+  // Expected weekly utilization right now: fraction of the account's own 7d
+  // window elapsed. Window = [reset-7d, reset]; line = 1 - timeLeft/7d. A null
+  // reset (not yet observed) → line 0, so the account reads as "behind" and gets
+  // traffic that then populates its headers (self-priming).
+  _paceLine(account) {
+    const reset = account.quota.unified7dReset;
+    if (!reset) return 0;
+    const weekMs = 7 * 24 * 3600 * 1000;
+    const elapsed = 1 - (reset - Date.now()) / weekMs;
+    return Math.max(0, Math.min(1, elapsed));
+  }
+
+  // How far BEHIND its weekly line the account is. >0 = behind (wants more load);
+  // <0 = ahead (over-pace). Unknown utilization → treated as 0 used (behind).
+  _paceGap(account) {
+    const used = account.quota.unified7d ?? 0;
+    return this._paceLine(account) - used;
+  }
+
+  // Never-stall rail (control law #1, TOP priority): an account at/over its 5h
+  // soft ceiling — or server-flagged `rejected` — takes NO new load. Note: the
+  // `allowed_warning` status is NOT a trigger on its own (≈24% of normal requests
+  // carry it); the 5h utilization number is.
+  _fiveHourEligible(account) {
+    const q = account.quota;
+    if (q.unifiedStatus === 'rejected') return false;
+    if (q.unified5h != null && q.unified5h >= this.fiveHourSoftCeiling) return false;
+    return true;
+  }
+
+  // End-of-cycle ramp (control law #3): as the account nears its 7d-reset, escalate
+  // preference to drain unused weekly quota before it resets (use-it-or-lose-it).
+  // Boost = unusedWeeklyFraction × tierWeight(hoursToReset). 0 outside all tiers.
+  _rampBoost(account) {
+    const reset = account.quota.unified7dReset;
+    if (!reset) return 0;
+    const hoursToReset = (reset - Date.now()) / 3600000;
+    if (hoursToReset < 0) return 0;
+    let weight = 0;
+    for (const tier of this.rampTiers) {            // ascending by hours
+      if (hoursToReset <= tier.hours) { weight = tier.weight; break; }
+    }
+    if (!weight) return 0;
+    const unused = Math.max(0, 1 - (account.quota.unified7d ?? 0));
+    return unused * weight;
+  }
+
+  // Selection score: behind-line gap + end-of-cycle ramp. Highest wins.
+  _paceScore(account) {
+    return this._paceGap(account) + this._rampBoost(account);
+  }
+
   // ── Capacity model helpers (D-2179) ──────────────────
   // Per-account hourly burn buckets: Map(hourEpoch → tokens), pruned to 7d. Cheap
   // (≤168 entries) and the only forward signal we have when Max OAuth sends no
@@ -343,21 +420,29 @@ export class AccountManager {
   }
 
   /**
-   * Pick the least-loaded usable account to (re)bind a session to:
-   *  1. usable accounts only (not blocked, under the header hard ceiling);
-   *  2. fewest in-flight requests, then fewest warm sessions — spreads a burst
-   *     instead of dogpiling one account.
+   * Pick the account to (re)bind a session to (D-2104 pace controller):
+   *  1. usable accounts only (not blocked, under the 0.98 hard ceiling);
+   *  2. never-stall rail — prefer accounts below their 5h soft ceiling; fall back
+   *     to the full usable set only if NONE are 5h-eligible (better a near-cap
+   *     account than holding — a truly exhausted pool still yields via
+   *     _soonestUsableOrNull from step 1);
+   *  3. highest paceScore = furthest behind its weekly line + end-of-cycle ramp;
+   *  4. tie-break fewest in-flight, then fewest warm sessions (spread a burst).
    * Returns null only when the pool is genuinely exhausted (→ _soonestUsableOrNull).
    */
   _pickAccountForBinding() {
     const usable = this.accounts.filter(a => this._isUsable(a));
     if (usable.length === 0) return this._soonestUsableOrNull();
+    const eligible = usable.filter(a => this._fiveHourEligible(a));
+    const pool = eligible.length ? eligible : usable;
     const { counts } = this._activeSessionCounts();
-    return usable.reduce((best, a) => {
+    return pool.reduce((best, a) => {
+      const sa = this._paceScore(a), sb = this._paceScore(best);
+      if (Math.abs(sa - sb) > 1e-9) return sa > sb ? a : best;
       const ai = a._inflight || 0, bi = best._inflight || 0;
       if (ai !== bi) return ai < bi ? a : best;
       return counts[a.index] < counts[best.index] ? a : best;
-    }, usable[0]);
+    }, pool[0]);
   }
 
   // ── D1DX patch (D-1903): per-account in-flight accounting ──────────

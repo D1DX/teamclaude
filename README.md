@@ -8,7 +8,7 @@ Sits transparently between Claude Code and the Anthropic API, managing multiple 
 
 ## Features
 
-- **Session-sticky + least-loaded routing** — each client session sticks to one account (keeping its prompt cache warm); new/rebound sessions go to the least-loaded usable account
+- **Pace-to-weekly-line routing** — each session sticks to one account (warm prompt cache); new/rebound work goes to the account furthest BEHIND its weekly utilization line (`unified-7d-utilization` vs fraction-of-its-week-elapsed). A 5h soft-ceiling rail keeps new load off accounts near their session cap (never-stall), and an end-of-cycle ramp drains an account's unused weekly quota before its reset
 - **Escalating 429 backoff** — a 429 benches the account (honoring `retry-after` when present, else an escalating ladder by consecutive-429 streak that resets on any success), then fails over; clients only see a 429 once every account is throttled
 - **Capacity endpoint** — `GET /capacity` (and `teamclaude capacity`) report a pool verdict (green/yellow/red) + spare concurrency headroom + soonest-reset, learned from per-account burn, so a launcher can gate how much concurrent work it starts. Per-account usage + the learned caps persist to disk, so a restart doesn't blank the model
 - **Interactive TUI** — real-time dashboard with color-coded quota bars, reset countdowns, activity log, and keyboard controls
@@ -194,8 +194,8 @@ TEAMCLAUDE_CONFIG=./my-config.json teamclaude server
 1. Claude Code connects to the local proxy instead of `api.anthropic.com`
 2. The proxy selects the active account and forwards requests with that account's credentials
 3. OAuth tokens expiring within 5 minutes are automatically refreshed and persisted to config
-4. Each client session (by `x-claude-code-session-id`) binds to one account and stays cache-warm on it; new/rebound sessions pick the least-loaded usable account (fewest in-flight, then fewest warm sessions)
-5. Rate limit headers (`anthropic-ratelimit-unified-*`), when the upstream provides them, refine selection and engage the `switchThreshold` hard ceiling; without them the proxy routes reactively
+4. Each client session (by `x-claude-code-session-id`) binds to one account and stays cache-warm; new/rebound work goes to the account furthest BEHIND its weekly pace line (`unified-7d-utilization` vs fraction-of-its-week-elapsed). Before an account's first response populates its headers it reads as "behind" and gets traffic (self-priming); with no unified data at all it degrades to least-loaded spread (fewest in-flight, then fewest warm)
+5. Anthropic returns `anthropic-ratelimit-unified-5h/7d-utilization` (+ resets/status) on every Max OAuth response, so pacing runs on real weekly utilization. The proxy keeps new load off accounts at/over a 5h soft ceiling (never-stall rail), and treats `switchThreshold` as the hard unusable cap. A warm session is only rebound for pacing when its account is far past its line
 6. On a 429 the account is benched — to the server `retry-after` if present, otherwise an escalating ladder keyed to the consecutive-429 streak (capped), reset on any success — then the request fails over to another account
 7. A per-account capacity model learns each account's cap from its burn at 429 time and exposes pool headroom via `/capacity`
 8. Transient network errors (connection reset, timeout) drop the connection so the client can retry

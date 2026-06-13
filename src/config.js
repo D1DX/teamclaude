@@ -17,10 +17,12 @@ export function createDefaultConfig() {
     },
     upstream: 'https://api.anthropic.com',
     warmOnStartup: true,           // ping each account at boot to anchor rate-limit windows
-    // ── Routing (D1DX, D-2179) — capacity-aware ──
-    switchThreshold: 0.98,         // HARD ceiling — header path only (Max OAuth sends none)
+    // ── Routing (D1DX, D-2104) — real-data pace-to-weekly-line ──
+    switchThreshold: 0.98,         // HARD unusable ceiling on real unified-5h/7d utilization
     cacheAffinityWindowSec: 300,   // a session sticks to its account while used within this window
     bindingEvictSec: 1800,         // drop an idle session binding after this long
+    fiveHourSoftCeiling: 0.90,     // never-stall rail: no NEW load at/over this 5h utilization
+    farOverLineThreshold: 0.10,    // rebind a warm session only when this far past its weekly pace line
     backoffSec: 60,                // 429 escalating-backoff base: streak-1 bench (+ jitter)
     backoffFactor: 4,              // ×per consecutive 429 (60s → 4m → 15m)
     backoffCapSec: 900,            // escalating-backoff ceiling (15m)
