@@ -98,5 +98,37 @@ const bind = (am, sid, i) => {
   am.accounts[0]._inflight = 3; am.accounts[1]._inflight = 0; am.accounts[2]._inflight = 5;
   ok('no unified data → degrades to least-in-flight (a1)', am._pickAccountForBinding().name === 'a1'); }
 
+// ── anti-dogpile: in-flight cap excludes an at-cap account from new binds ──────
+{ const am = mk();
+  q(am, 0, { u7d: 0.10, u5h: 0.1 });   // all similarly behind → same band
+  q(am, 1, { u7d: 0.10, u5h: 0.1 });
+  q(am, 2, { u7d: 0.10, u5h: 0.1 });
+  am.accounts[1]._inflight = am.maxInflightPerAccount; // a1 at the cap
+  ok('in-flight cap excludes the at-cap account (burst spills off a1)', am._pickAccountForBinding().name !== 'a1'); }
+
+// ── anti-dogpile: within the pace tie-band, spread by warm-session load ────────
+{ const am = mk();
+  q(am, 0, { u7d: 0.10, u5h: 0.1 });   // all in the same band
+  q(am, 1, { u7d: 0.10, u5h: 0.1 });
+  q(am, 2, { u7d: 0.10, u5h: 0.1 });
+  bind(am, 'w1', 0); bind(am, 'w2', 0); // a0 carries 2 warm sessions
+  ok('tie-band spreads off the most-loaded account (not a0)', am._pickAccountForBinding().name !== 'a0'); }
+
+// ── concentration preserved: a clearly-behind account wins despite load ────────
+{ const am = mk();
+  q(am, 0, { u7d: 0.0,  u5h: 0.1 });   // gap +0.286 — alone in the band
+  q(am, 1, { u7d: 0.30, u5h: 0.1 });   // ahead, > tieBand below → out of band
+  q(am, 2, { u7d: 0.30, u5h: 0.1 });
+  bind(am, 'w1', 0); bind(am, 'w2', 0); // even with load, a0 is the only behind one
+  ok('a clearly-behind account still concentrates (a0 wins despite load)', am._pickAccountForBinding().name === 'a0'); }
+
+// ── graceful fallback: ALL at in-flight cap → still returns an account ─────────
+{ const am = mk();
+  q(am, 0, { u7d: 0.10, u5h: 0.1 });
+  q(am, 1, { u7d: 0.10, u5h: 0.1 });
+  q(am, 2, { u7d: 0.10, u5h: 0.1 });
+  am.accounts.forEach(a => { a._inflight = am.maxInflightPerAccount; });
+  ok('all at in-flight cap → still returns an account (no refuse)', !!am._pickAccountForBinding()); }
+
 console.log(`\n${pass} passed, ${fail} failed`);
 if (fail) process.exit(1);

@@ -106,6 +106,8 @@ async function serverCommand() {
     fiveHourSoftCeiling: config.fiveHourSoftCeiling ?? 0.90,   // never-stall rail: no new load at/over this 5h util
     farOverLineThreshold: config.farOverLineThreshold ?? 0.10, // rebind a warm session only when this far past its weekly line
     rampTiers: config.rampTiers ?? undefined,                  // hours→weight ramp before 7d-reset (constructor default)
+    paceTieBand: config.paceTieBand ?? 0.10,                   // anti-dogpile: accounts within this of the best paceScore spread by load
+    maxInflightPerAccount: config.maxInflightPerAccount ?? 3,  // hard never-stall valve: max concurrent in-flight per account
     // 429 handling — escalating backoff
     backoffSec: config.backoffSec ?? 60,           // streak-1 bench (ladder base)
     backoffFactor: config.backoffFactor ?? 4,      // ×per consecutive 429

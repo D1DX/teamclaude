@@ -180,6 +180,15 @@ export class AccountManager {
     // ONLY when its account is this far past its weekly line (cache yields late).
     this.fiveHourSoftCeiling  = opts.fiveHourSoftCeiling  ?? 0.90;
     this.farOverLineThreshold = opts.farOverLineThreshold ?? 0.10;
+    // Anti-dogpile (D-2104 hardening): without these, a concurrent burst all
+    // picks the single most-behind account and 429s it (thundering herd).
+    // paceTieBand: accounts within this of the best paceScore are "equally
+    // behind" → spread by load instead of dogpiling. maxInflightPerAccount: a
+    // hard never-stall valve — an account at this many concurrent in-flight
+    // requests takes no new bind, so a burst spills across accounts in pace order
+    // (bounds overshoot even when the 5h header lags the burst).
+    this.paceTieBand          = opts.paceTieBand          ?? 0.10;
+    this.maxInflightPerAccount = opts.maxInflightPerAccount ?? 3;
     // End-of-cycle ramp (control law #3): weight by hours-to-7d-reset, applied to
     // the account's unused weekly fraction → drains quota before it resets.
     // First tier (ascending hours) whose bound ≥ hoursToReset wins.
@@ -420,29 +429,36 @@ export class AccountManager {
   }
 
   /**
-   * Pick the account to (re)bind a session to (D-2104 pace controller):
-   *  1. usable accounts only (not blocked, under the 0.98 hard ceiling);
-   *  2. never-stall rail — prefer accounts below their 5h soft ceiling; fall back
-   *     to the full usable set only if NONE are 5h-eligible (better a near-cap
-   *     account than holding — a truly exhausted pool still yields via
-   *     _soonestUsableOrNull from step 1);
-   *  3. highest paceScore = furthest behind its weekly line + end-of-cycle ramp;
-   *  4. tie-break fewest in-flight, then fewest warm sessions (spread a burst).
-   * Returns null only when the pool is genuinely exhausted (→ _soonestUsableOrNull).
+   * Pick the account to (re)bind a session to (D-2104 pace controller).
+   * Layered eligibility — each set falls back to the prior so we never refuse
+   * while any usable account exists (a truly exhausted pool yields null via
+   * _soonestUsableOrNull at the top):
+   *   1. usable (not blocked, under the 0.98 hard ceiling);
+   *   2. 5h never-stall rail — below the 5h soft ceiling;
+   *   3. in-flight concurrency cap — under maxInflightPerAccount concurrent
+   *      requests (so a burst can't pile onto one account → spills in pace order).
+   * Then within the surviving pool, a PACE TIE-BAND: accounts within paceTieBand
+   * of the best paceScore are "equally behind" → spread a concurrent burst across
+   * them by load (fewest warm sessions, then fewest in-flight) instead of
+   * dogpiling the single best. A clearly-leading account (genuinely most-behind,
+   * or ramping near its reset) sits alone in the band and still concentrates load
+   * — bounded by the in-flight cap so it drains without 429ing.
    */
   _pickAccountForBinding() {
     const usable = this.accounts.filter(a => this._isUsable(a));
     if (usable.length === 0) return this._soonestUsableOrNull();
-    const eligible = usable.filter(a => this._fiveHourEligible(a));
-    const pool = eligible.length ? eligible : usable;
+    const fiveHourOk = usable.filter(a => this._fiveHourEligible(a));
+    const base = fiveHourOk.length ? fiveHourOk : usable;
+    const underCap = base.filter(a => (a._inflight || 0) < this.maxInflightPerAccount);
+    const pool = underCap.length ? underCap : base;
     const { counts } = this._activeSessionCounts();
-    return pool.reduce((best, a) => {
-      const sa = this._paceScore(a), sb = this._paceScore(best);
-      if (Math.abs(sa - sb) > 1e-9) return sa > sb ? a : best;
-      const ai = a._inflight || 0, bi = best._inflight || 0;
-      if (ai !== bi) return ai < bi ? a : best;
-      return counts[a.index] < counts[best.index] ? a : best;
-    }, pool[0]);
+    const best = pool.reduce((m, a) => Math.max(m, this._paceScore(a)), -Infinity);
+    const band = pool.filter(a => best - this._paceScore(a) <= this.paceTieBand);
+    return band.reduce((b, a) => {
+      const ca = counts[a.index] || 0, cb = counts[b.index] || 0;
+      if (ca !== cb) return ca < cb ? a : b;
+      return (a._inflight || 0) < (b._inflight || 0) ? a : b;
+    }, band[0]);
   }
 
   // ── D1DX patch (D-1903): per-account in-flight accounting ──────────
