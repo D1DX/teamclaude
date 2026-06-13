@@ -157,6 +157,7 @@ export class AccountManager {
       _lastBenchSec: 0,    // last bench duration in seconds (display + capacity)
       _burn: null,         // Map(hourEpoch → tokens) — rolling burn buckets (≤168 = 7d)
       _capEst5h: null,     // learned 5h cap: EMA of burn5h at the first 429 of each streak
+      _proven: false,      // D-2104 probe-gate: returned a 200 in this active spell? unproven → in-flight cap 1
     }));
     this.currentIndex = 0;
     this.switchThreshold = switchThreshold; // hard ceiling — 5h axis + real weekly limit
@@ -189,6 +190,12 @@ export class AccountManager {
     // (bounds overshoot even when the 5h header lags the burst).
     this.paceTieBand          = opts.paceTieBand          ?? 0.10;
     this.maxInflightPerAccount = opts.maxInflightPerAccount ?? 3;
+    // Probe-gate (D-2104): an UNPROVEN account (no 200 in this active spell — cold,
+    // or just recovered from a bench) admits only ONE in-flight request; until that
+    // probe returns 200 it takes no further binds, so we never pile sessions onto an
+    // account we haven't confirmed has headroom. maxSessionsPerAccount: hard cap on
+    // bound warm sessions per account (instances limit) — a burst spills beyond it.
+    this.maxSessionsPerAccount = opts.maxSessionsPerAccount ?? 4;
     // End-of-cycle ramp (control law #3): weight by hours-to-7d-reset, applied to
     // the account's unused weekly fraction → drains quota before it resets.
     // First tier (ascending hours) whose bound ≥ hoursToReset wins.
@@ -435,23 +442,29 @@ export class AccountManager {
    * _soonestUsableOrNull at the top):
    *   1. usable (not blocked, under the 0.98 hard ceiling);
    *   2. 5h never-stall rail — below the 5h soft ceiling;
-   *   3. in-flight concurrency cap — under maxInflightPerAccount concurrent
-   *      requests (so a burst can't pile onto one account → spills in pace order).
+   *   3. probe-gate in-flight cap — under 1 concurrent request while UNPROVEN
+   *      (no 200 yet this spell), opening to maxInflightPerAccount once proven;
+   *      so we never pile sessions onto an account we haven't confirmed healthy;
+   *   4. session cap — under maxSessionsPerAccount bound warm sessions.
    * Then within the surviving pool, a PACE TIE-BAND: accounts within paceTieBand
    * of the best paceScore are "equally behind" → spread a concurrent burst across
    * them by load (fewest warm sessions, then fewest in-flight) instead of
    * dogpiling the single best. A clearly-leading account (genuinely most-behind,
    * or ramping near its reset) sits alone in the band and still concentrates load
-   * — bounded by the in-flight cap so it drains without 429ing.
+   * — bounded by the caps so it drains without 429ing.
    */
   _pickAccountForBinding() {
     const usable = this.accounts.filter(a => this._isUsable(a));
     if (usable.length === 0) return this._soonestUsableOrNull();
+    const { counts } = this._activeSessionCounts();
     const fiveHourOk = usable.filter(a => this._fiveHourEligible(a));
     const base = fiveHourOk.length ? fiveHourOk : usable;
-    const underCap = base.filter(a => (a._inflight || 0) < this.maxInflightPerAccount);
-    const pool = underCap.length ? underCap : base;
-    const { counts } = this._activeSessionCounts();
+    // Probe-gate: cap = 1 until the account is proven (returned a 200), then opens.
+    const underCap = base.filter(a => (a._inflight || 0) < (a._proven ? this.maxInflightPerAccount : 1));
+    const capped = underCap.length ? underCap : base;
+    // Hard session cap (instances limit) — a burst spills beyond maxSessionsPerAccount.
+    const underSession = capped.filter(a => (counts[a.index] || 0) < this.maxSessionsPerAccount);
+    const pool = underSession.length ? underSession : capped;
     const best = pool.reduce((m, a) => Math.max(m, this._paceScore(a)), -Infinity);
     const band = pool.filter(a => best - this._paceScore(a) <= this.paceTieBand);
     return band.reduce((b, a) => {
@@ -1156,6 +1169,7 @@ export class AccountManager {
     if (!account) return;
     const now = Date.now();
     account._429streak = (account._429streak || 0) + 1;
+    account._proven = false; // D-2104 probe-gate: a 429 un-proves it → re-probe with 1 on recovery
 
     // D-2179: learn this account's 5h cap from the burn at the FIRST 429 of a
     // streak (the moment it hit the wall). EMA across cap events; later 429s in the
@@ -1198,7 +1212,9 @@ export class AccountManager {
   /** A successful response on an account — reset its 429 streak (ends the ladder). */
   noteAccountSuccess(accountIndex) {
     const a = this.accounts[accountIndex];
-    if (a && a._429streak) { a._429streak = 0; a._lastBenchSec = 0; }
+    if (!a) return;
+    if (a._429streak) { a._429streak = 0; a._lastBenchSec = 0; }
+    a._proven = true; // D-2104 probe-gate: a 200 proves headroom → open the in-flight cap to maxInflightPerAccount
   }
 
   /**

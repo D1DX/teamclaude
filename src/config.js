@@ -24,7 +24,8 @@ export function createDefaultConfig() {
     fiveHourSoftCeiling: 0.90,     // never-stall rail: no NEW load at/over this 5h utilization
     farOverLineThreshold: 0.10,    // rebind a warm session only when this far past its weekly pace line
     paceTieBand: 0.10,             // anti-dogpile: accounts within this of the best paceScore spread by load
-    maxInflightPerAccount: 3,      // hard never-stall valve: max concurrent in-flight requests per account
+    maxInflightPerAccount: 3,      // proven-account in-flight cap (unproven = 1, the probe-gate)
+    maxSessionsPerAccount: 4,      // hard cap on bound warm sessions per account (instances limit)
     backoffSec: 60,                // 429 escalating-backoff base: streak-1 bench (+ jitter)
     backoffFactor: 4,              // ×per consecutive 429 (60s → 4m → 15m)
     backoffCapSec: 900,            // escalating-backoff ceiling (15m)

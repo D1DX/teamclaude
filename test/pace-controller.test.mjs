@@ -130,5 +130,33 @@ const bind = (am, sid, i) => {
   am.accounts.forEach(a => { a._inflight = am.maxInflightPerAccount; });
   ok('all at in-flight cap → still returns an account (no refuse)', !!am._pickAccountForBinding()); }
 
+// ── probe-gate: an UNPROVEN account with a probe in-flight is skipped, even if most-behind ──
+{ const am = mk();
+  q(am, 0, { u7d: 0.0,  u5h: 0.1 });   // MOST behind, but unproven + already probing
+  q(am, 1, { u7d: 0.20, u5h: 0.1 });
+  q(am, 2, { u7d: 0.20, u5h: 0.1 });
+  am.accounts[0]._proven = false; am.accounts[0]._inflight = 1; // one probe in flight, no 200 yet
+  ok('probe-gate: unproven account mid-probe takes no further binds (spills off a0)', am._pickAccountForBinding().name !== 'a0'); }
+
+// ── probe-gate: a PROVEN account opens past the unproven cap of 1 ──────────────
+{ const am = mk();
+  q(am, 0, { u7d: 0.0, u5h: 0.1 });    // most behind
+  q(am, 1, { u7d: 0.30, u5h: 0.1 });
+  am.accounts[0]._proven = true; am.accounts[0]._inflight = 2; // proven → cap is maxInflightPerAccount (3), 2 < 3
+  ok('probe-gate: a proven account admits more than 1 in-flight (a0 still picked)', am._pickAccountForBinding().name === 'a0'); }
+
+// ── 200 proves / 429 un-proves ────────────────────────────────────────────────
+{ const am = mk();
+  am.noteAccountSuccess(0); ok('a 200 marks the account proven', am.accounts[0]._proven === true);
+  am.markRateLimited(0, 60); ok('a 429 un-proves the account (re-probe on recovery)', am.accounts[0]._proven === false); }
+
+// ── hard session cap: an account at maxSessionsPerAccount is skipped, even if most-behind ──
+{ const am = mk();
+  q(am, 0, { u7d: 0.0, u5h: 0.1 });    // most behind
+  q(am, 1, { u7d: 0.20, u5h: 0.1 });
+  am.accounts[0]._proven = true;        // proven, so the probe-gate isn't what excludes it
+  for (let i = 0; i < am.maxSessionsPerAccount; i++) bind(am, `cap${i}`, 0); // a0 at the session cap
+  ok('session cap excludes a maxed account (spills off a0 despite most-behind)', am._pickAccountForBinding().name !== 'a0'); }
+
 console.log(`\n${pass} passed, ${fail} failed`);
 if (fail) process.exit(1);
