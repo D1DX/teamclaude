@@ -1,5 +1,5 @@
 import { refreshAccessToken, isTokenExpiringSoon } from './oauth.js';
-import { readFileSync, writeFileSync, renameSync, readdirSync, statSync } from 'node:fs';
+import { readFileSync, writeFileSync, renameSync, readdirSync, statSync, openSync, readSync, closeSync } from 'node:fs';
 import { homedir, totalmem, freemem, loadavg, cpus, platform } from 'node:os';
 import { execFileSync } from 'node:child_process';
 import { join } from 'node:path';
@@ -30,6 +30,13 @@ const PROJECTS_DIR = join(homedir(), '.claude', 'projects');
 // bash reaper it needs no 12h/grace/pid-identity ceremony — a stale-but-maybe-
 // alive row is safely dropped and reappears the instant it does anything.
 const DECK_PRESENT_MS = 30 * 60 * 1000; // 30m activity window
+// D-2203: a brand-new session whose transcript JSONL has not materialised yet is
+// rescued for this long after it registered (pid-free — `started` from the row),
+// then drops if it still has produced no real turn.
+const NEW_SESSION_GRACE_MS = 2 * 60 * 1000; // 2m
+// Bytes of transcript tail scanned for the last real turn (the turn sits just
+// behind the trailing no-ts metadata block; a bounded read keeps it O(tail)).
+const TURN_TAIL_BYTES = 65536;
 
 // macOS "Memory Used" (App + Wired + Compressed), matching Activity Monitor.
 // os.freemem() can't be used here — it excludes reclaimable cache, overstating
@@ -491,24 +498,98 @@ export class AccountManager {
     } catch { return null; }
   }
 
-  // D-2203: a row is PRESENT on the deck iff the session showed ACTIVITY recently.
-  // The deck is a LIVE view, so presence keys on the transcript (the truthful
-  // activity signal — appended every turn/tool/hook), NOT on the recorded pid
-  // (D-2085: a walk-up artifact that is recyclable, so a crashed session's pid
-  // reads "alive" and a pid-only check shows a ghost). Three ways to be present:
+  // D-2203: epoch-ms of the session's NEWEST real turn (a user|assistant entry's
+  // .timestamp), or null. The transcript FILE-MTIME (_transcriptAgeMs, retained
+  // as a fallback) is bumped by no-timestamp harness metadata appended even at
+  // idle (mode/permission-mode/ai-title/agent-name/custom-title/
+  // file-history-snapshot/last-prompt/agent-*), so it reads a quiet session as
+  // fresh. Only user|assistant are real turns. Reads a bounded tail and scans
+  // backward for the newest one; widens once to the whole file if the tail holds
+  // no turn. All fs/JSON guarded → null on any failure.
+  _newestTurnTs(sid) {
+    if (!sid) return null;
+    const uuid = sid.startsWith('cc-') ? sid.slice(3) : sid;
+    // Resolve the newest-mtime matching transcript (mirrors _transcriptAgeMs).
+    let path = null, newestMtime = null;
+    try {
+      for (const dir of readdirSync(PROJECTS_DIR)) {
+        const candidate = join(PROJECTS_DIR, dir, `${uuid}.jsonl`);
+        try {
+          const st = statSync(candidate);
+          if (newestMtime === null || st.mtimeMs > newestMtime) { newestMtime = st.mtimeMs; path = candidate; }
+        } catch { /* not in this dir */ }
+      }
+    } catch { return null; }
+    if (!path) return null;
+
+    const scanBackward = (text) => {
+      const lines = text.split('\n');
+      for (let i = lines.length - 1; i >= 0; i--) {
+        const line = lines[i].trim();
+        if (!line) continue;
+        let o; try { o = JSON.parse(line); } catch { continue; }
+        if ((o.type === 'user' || o.type === 'assistant') && o.timestamp) {
+          const t = Date.parse(o.timestamp);
+          if (!Number.isNaN(t)) return t;
+        }
+      }
+      return null;
+    };
+
+    try {
+      const size = statSync(path).size;
+      if (size > TURN_TAIL_BYTES) {
+        const fd = openSync(path, 'r');
+        try {
+          const buf = Buffer.alloc(TURN_TAIL_BYTES);
+          readSync(fd, buf, 0, TURN_TAIL_BYTES, size - TURN_TAIL_BYTES);
+          const text = buf.toString('utf8');
+          const nl = text.indexOf('\n');               // drop the partial first line
+          const t = scanBackward(nl >= 0 ? text.slice(nl + 1) : text);
+          if (t != null) return t;
+          return scanBackward(readFileSync(path, 'utf8'));  // widen once
+        } finally { closeSync(fd); }
+      }
+      return scanBackward(readFileSync(path, 'utf8'));
+    } catch { return null; }
+  }
+
+  // D-2203: age (ms) since the last real turn, or null when there is no transcript
+  // / no parseable real turn (caller routes null to the started-freshness rescue).
+  // Cached per-sid ~5s — the deck refreshes ~1s and re-reads many rows per tick.
+  _lastTurnAgeMs(sid) {
+    if (!sid) return null;
+    this._turnCache ??= new Map();
+    const now = Date.now();
+    const c = this._turnCache.get(sid);
+    let ts;
+    if (c && now - c.at < 5000) ts = c.ts;
+    else { ts = this._newestTurnTs(sid); this._turnCache.set(sid, { at: now, ts }); }
+    return ts == null ? null : (now - ts);
+  }
+
+  // D-2203: a row is PRESENT on the deck iff the session took a REAL TURN recently.
+  // The deck is a LIVE view, so presence keys on the last real turn (newest
+  // user|assistant transcript timestamp — the truthful signal), NOT on the
+  // transcript FILE-MTIME (bumped by idle harness metadata) nor the recorded pid
+  // (D-2085: a recyclable daemon-pool ancestor — "alive" proves nothing). Three
+  // ways to be present:
   //   1. a tool is executing right now (the D-1749 inflight marker), OR
-  //   2. the transcript was touched within DECK_PRESENT_MS (recent activity), OR
-  //   3. there is no transcript file yet — a brand-new session whose JSONL has
-  //      not materialised — rescued by an alive pid.
-  // Everything else (transcript stale past the window, or absent with a dead pid)
-  // is hidden. Hiding is reversible: the row reappears the instant the session
-  // does anything. This is deliberately MORE aggressive than the bash reaper,
-  // which DELETES rows and so must stay conservative (pid-identity + 12h, D-2196).
+  //   2. the last real turn was within DECK_PRESENT_MS (recent activity), OR
+  //   3. no transcript file / no real turn yet — a brand-new session — rescued
+  //      for NEW_SESSION_GRACE_MS after it registered (started-freshness, pid-free).
+  // Everything else (last turn stale past the window, or no turn + started past the
+  // grace) is hidden. Hiding is reversible: the row reappears the instant the
+  // session takes a turn. Deliberately MORE aggressive than the bash reaper, which
+  // DELETES rows and so stays conservative (pid-identity + 12h, D-2196).
   _present(r) {
     if (this._sessionInflight(r.sid)) return true;            // a tool is running now
-    const age = this._transcriptAgeMs(r.sid);
-    if (age == null) return this._pidAlive(r.pid);            // no transcript yet → new-session rescue
-    return age <= DECK_PRESENT_MS;                            // recent activity → present; stale → hide
+    const age = this._lastTurnAgeMs(r.sid);
+    if (age == null) {                                        // no real turn yet → new-session rescue
+      const started = r.started ? Date.parse(r.started) : NaN;
+      return !Number.isNaN(started) && (Date.now() - started) <= NEW_SESSION_GRACE_MS;
+    }
+    return age <= DECK_PRESENT_MS;                            // recent real turn → present; stale → hide
   }
 
   // D-1739: a process is alive if kill(pid,0) succeeds; EPERM also means alive

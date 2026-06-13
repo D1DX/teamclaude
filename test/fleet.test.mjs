@@ -1,6 +1,6 @@
 import { AccountManager } from '../src/account-manager.js';
 import { TUI } from '../src/tui.js';
-import { mkdirSync, writeFileSync, rmSync, utimesSync } from 'node:fs';
+import { mkdirSync, writeFileSync, rmSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
 
@@ -78,15 +78,20 @@ const mk = () => new AccountManager([
   const tui = new TUI(stub);
   ok('_cost honors config.pricing override', Math.abs(tui._cost(1e6, 1e6) - 50) < 1e-9); }
 
-// ── D-2203: transcript-activity presence (the deck's live-view filter) ─────────
+// ── D-2203: last-real-turn presence (the deck's live-view filter) ─────────────
 const FAKE_PROJ = join(homedir(), '.claude', 'projects', '-test-d2203-fake');
-// Write a fake transcript for a uuid and age its mtime `agoSec` into the past.
-const writeTranscript = (uuid, agoSec) => {
+// Write a fake transcript whose NEWEST real turn (user|assistant) is `ageSec` old,
+// then optionally append `metaLines` trailing no-timestamp metadata entries (the
+// harness 'poke' that bumps file-mtime but is NOT a real turn). Presence keys on
+// the real-turn timestamp, so fixtures set age via CONTENT, not mtime.
+const writeTurnTranscript = (uuid, ageSec, metaLines = 0) => {
   mkdirSync(FAKE_PROJ, { recursive: true });
   const p = join(FAKE_PROJ, `${uuid}.jsonl`);
-  writeFileSync(p, '{}\n');
-  const t = Date.now() / 1000 - agoSec;
-  utimesSync(p, t, t);
+  const ts = new Date(Date.now() - ageSec * 1000).toISOString();
+  let body = `{"type":"assistant","timestamp":"${ts}","message":{"role":"assistant"}}\n`
+           + `{"type":"user","timestamp":"${ts}","message":{"role":"user"}}\n`;
+  for (let i = 0; i < metaLines; i++) body += '{"type":"mode"}\n';
+  writeFileSync(p, body);
   return p;
 };
 // Write a D-1749 tool-inflight marker for a full sid, `agoSec` old.
@@ -98,42 +103,63 @@ const setInflight = (fullSid, agoSec = 0) => {
 
 { const am = mk();
   const cleanupSids = [];
+  const startedNow = new Date().toISOString();
+  const startedOld = new Date(Date.now() - 10 * 60 * 1000).toISOString(); // 10m ago
   try {
-    // Fresh transcript → present (the pid is irrelevant when there's recent activity).
+    // Fresh real turn → present.
     const freshU = 'd2203aaa-0000-0000-0000-000000000001';
-    writeTranscript(freshU, 60); // 1 min ago
-    ok('_present: fresh transcript (1m) → present', am._present({ sid: `cc-${freshU}`, pid: process.pid }) === true);
+    writeTurnTranscript(freshU, 60); // 1 min ago
+    ok('_present: fresh real turn (1m) → present',
+      am._present({ sid: `cc-${freshU}`, pid: process.pid, started: startedNow }) === true);
 
-    // Stale transcript (>30m window) + alive pid → HIDE. This is the operator's
-    // "not active" row: an alive (possibly recycled) pid no longer keeps it.
+    // Stale real turn (>30m) + alive pid → HIDE — the operator's "not active" row.
     const staleU = 'd2203bbb-0000-0000-0000-000000000002';
-    writeTranscript(staleU, 40 * 60); // 40 min ago
-    ok('_present: stale transcript (40m) + alive pid → hide', am._present({ sid: `cc-${staleU}`, pid: process.pid }) === false);
+    writeTurnTranscript(staleU, 40 * 60); // 40 min ago
+    ok('_present: stale real turn (40m) + alive pid → hide',
+      am._present({ sid: `cc-${staleU}`, pid: process.pid, started: startedOld }) === false);
 
-    // Tool-inflight marker overrides a stale transcript → present (long foreground tool).
-    const inflU = 'd2203ccc-0000-0000-0000-000000000003';
-    writeTranscript(inflU, 40 * 60);
+    // THE bug fix: stale real turn + a FRESH metadata poke (file-mtime → now) →
+    // STILL hide. mtime is ignored; only the real turn counts.
+    const pokeU = 'd2203ccc-0000-0000-0000-000000000003';
+    writeTurnTranscript(pokeU, 40 * 60, 8); // 40m-old turn + 8 trailing no-ts metadata lines
+    ok('_present: stale turn + fresh metadata poke → hide (mtime ignored)',
+      am._present({ sid: `cc-${pokeU}`, pid: process.pid, started: startedOld }) === false);
+
+    // Tool-inflight marker overrides a stale turn → present (long foreground tool).
+    const inflU = 'd2203ddd-0000-0000-0000-000000000004';
+    writeTurnTranscript(inflU, 40 * 60);
     setInflight(`cc-${inflU}`, 0); cleanupSids.push(`cc-${inflU}`);
-    ok('_present: stale transcript + fresh inflight marker → present', am._present({ sid: `cc-${inflU}`, pid: 999999 }) === true);
+    ok('_present: stale turn + fresh inflight marker → present',
+      am._present({ sid: `cc-${inflU}`, pid: 999999, started: startedOld }) === true);
 
-    // Expired inflight marker (>120s, the D-1749 fresh-guard) does NOT rescue a stale row.
-    const expU = 'd2203ddd-0000-0000-0000-000000000004';
-    writeTranscript(expU, 40 * 60);
+    // Expired inflight marker (>120s) does NOT rescue a stale turn.
+    const expU = 'd2203eee-0000-0000-0000-000000000005';
+    writeTurnTranscript(expU, 40 * 60);
     setInflight(`cc-${expU}`, 300); cleanupSids.push(`cc-${expU}`);
-    ok('_present: stale transcript + EXPIRED inflight marker → hide', am._present({ sid: `cc-${expU}`, pid: 999999 }) === false);
+    ok('_present: stale turn + EXPIRED inflight marker → hide',
+      am._present({ sid: `cc-${expU}`, pid: 999999, started: startedOld }) === false);
 
-    // No transcript file yet + alive pid → present (brand-new-session rescue).
-    ok('_present: no transcript + alive pid → present (new-session rescue)',
-      am._present({ sid: 'cc-d2203eee-0000-0000-000000000005', pid: process.pid }) === true);
+    // No transcript yet + started within grace → present (brand-new rescue, pid-free).
+    ok('_present: no transcript + started fresh → present (new-session rescue)',
+      am._present({ sid: 'cc-d2203f01-0000-0000-0000-000000000006', pid: 999999, started: startedNow }) === true);
 
-    // No transcript file + dead pid → hide (unmappable stale row).
-    ok('_present: no transcript + dead pid → hide',
-      am._present({ sid: 'cc-d2203fff-0000-0000-000000000006', pid: 999999 }) === false);
+    // No transcript + started PAST grace + ALIVE pid → hide. Proves pid no longer
+    // rescues a row: an alive (recyclable) pid does NOT keep an idle no-turn session.
+    ok('_present: no transcript + started past grace + alive pid → hide (pid dropped)',
+      am._present({ sid: 'cc-d2203f02-0000-0000-0000-000000000007', pid: process.pid, started: startedOld }) === false);
 
-    // Dead pid + fresh transcript → present (just-finished/crashed but recently active).
-    const jdU = 'd2203999-0000-0000-0000-000000000007';
-    writeTranscript(jdU, 60);
-    ok('_present: dead pid + fresh transcript → present (recent activity)', am._present({ sid: `cc-${jdU}`, pid: 999999 }) === true);
+    // Metadata-only transcript (no real turn) → treated as no-turn → started-rescue governs.
+    const metaU = 'd2203f03-0000-0000-0000-000000000008';
+    mkdirSync(FAKE_PROJ, { recursive: true });
+    writeFileSync(join(FAKE_PROJ, `${metaU}.jsonl`), '{"type":"mode"}\n{"type":"ai-title"}\n{"type":"file-history-snapshot"}\n');
+    ok('_present: metadata-only transcript + started past grace → hide',
+      am._present({ sid: `cc-${metaU}`, pid: process.pid, started: startedOld }) === false);
+
+    // Dead pid + fresh real turn → present (just-finished/crashed but recently active).
+    const jdU = 'd2203f04-0000-0000-0000-000000000009';
+    writeTurnTranscript(jdU, 60);
+    ok('_present: dead pid + fresh real turn → present (recent activity)',
+      am._present({ sid: `cc-${jdU}`, pid: 999999, started: startedOld }) === true);
   } finally {
     try { rmSync(FAKE_PROJ, { recursive: true, force: true }); } catch {}
     for (const s of cleanupSids) { try { rmSync(sessDir(s), { recursive: true, force: true }); } catch {} }

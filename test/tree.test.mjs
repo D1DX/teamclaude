@@ -201,7 +201,9 @@ function renderFleet(allAgents) {
     for (const n of nodes) { const d = join(SS, n.sid); mkdirSync(d, { recursive: true }); writeFileSync(join(d, 'pin.json'), JSON.stringify(n.pin)); dirs.push(d); }
     const am = mk();
     // Inject ONLY the registry rows; pins are read REAL from disk by fleetRows->_sessionPin.
-    am._sessionTagCache = { at: Date.now() + 1e9, rows: nodes.map(n => ({ sid:n.sid, pid:process.pid, emoji:n.emoji, intent:null, pinned_issue:n.pin.identifier })) };
+    // `started` mirrors a real registry row (register stamps it) — D-2203's _present
+    // rescues a brand-new no-transcript session by started-freshness, pid-free.
+    am._sessionTagCache = { at: Date.now() + 1e9, rows: nodes.map(n => ({ sid:n.sid, pid:process.pid, emoji:n.emoji, intent:null, pinned_issue:n.pin.identifier, started: new Date().toISOString() })) };
     const toks = { 'cc-treetest-hoo':10000,'cc-treetest-A':5000,'cc-treetest-B':3000,'cc-treetest-A1':20000,'cc-treetest-B1':12000 };
     am.sessionBindingSummary = () => nodes.map(n => ({ fullSid:n.sid, tokens:toks[n.sid], inputTokens:toks[n.sid], outputTokens:0, account:'a0', warm:false, idleSec:null }));
     am.ledgerBySid = () => new Map();
