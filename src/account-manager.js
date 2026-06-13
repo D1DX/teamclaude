@@ -554,9 +554,13 @@ export class AccountManager {
     } catch { return null; }
   }
 
-  // D-2203: age (ms) since the last real turn, or null when there is no transcript
-  // / no parseable real turn (caller routes null to the started-freshness rescue).
-  // Cached per-sid ~5s — the deck refreshes ~1s and re-reads many rows per tick.
+  // D-2203: age (ms) since the last real turn. When the transcript has 0 real turns
+  // (a metadata-only stub) this falls back to the file mtime (a valid staleness
+  // floor — the metadata-poke problem only masks an OLD real turn behind a FRESH
+  // mtime, and a 0-turn stub has no real turn to mask, so a brand-new stub reads
+  // fresh and a dead stub reads stale — restoring reaper/hide coverage). null ONLY
+  // when there is no transcript file at all (caller routes null to the started-
+  // freshness rescue). Cached per-sid ~5s — the deck refreshes ~1s, many rows/tick.
   _lastTurnAgeMs(sid) {
     if (!sid) return null;
     this._turnCache ??= new Map();
@@ -565,7 +569,8 @@ export class AccountManager {
     let ts;
     if (c && now - c.at < 5000) ts = c.ts;
     else { ts = this._newestTurnTs(sid); this._turnCache.set(sid, { at: now, ts }); }
-    return ts == null ? null : (now - ts);
+    if (ts != null) return now - ts;
+    return this._transcriptAgeMs(sid);   // 0-turn stub → mtime floor; no file → null
   }
 
   // D-2203: a row is PRESENT on the deck iff the session took a REAL TURN recently.

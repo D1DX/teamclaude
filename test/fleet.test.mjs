@@ -1,6 +1,6 @@
 import { AccountManager } from '../src/account-manager.js';
 import { TUI } from '../src/tui.js';
-import { mkdirSync, writeFileSync, rmSync } from 'node:fs';
+import { mkdirSync, writeFileSync, rmSync, utimesSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
 
@@ -148,12 +148,21 @@ const setInflight = (fullSid, agoSec = 0) => {
     ok('_present: no transcript + started past grace + alive pid → hide (pid dropped)',
       am._present({ sid: 'cc-d2203f02-0000-0000-0000-000000000007', pid: process.pid, started: startedOld }) === false);
 
-    // Metadata-only transcript (no real turn) → treated as no-turn → started-rescue governs.
+    // Metadata-only transcript (0 real turns) → falls back to file MTIME (the
+    // staleness floor; the metadata-poke bug can't bite — no real turn to mask).
+    // A dead stub (old mtime) hides; a fresh stub (mtime ~now) shows.
     const metaU = 'd2203f03-0000-0000-0000-000000000008';
     mkdirSync(FAKE_PROJ, { recursive: true });
-    writeFileSync(join(FAKE_PROJ, `${metaU}.jsonl`), '{"type":"mode"}\n{"type":"ai-title"}\n{"type":"file-history-snapshot"}\n');
-    ok('_present: metadata-only transcript + started past grace → hide',
+    const metaP = join(FAKE_PROJ, `${metaU}.jsonl`);
+    writeFileSync(metaP, '{"type":"mode"}\n{"type":"ai-title"}\n{"type":"file-history-snapshot"}\n');
+    const oldMtime = Date.now() / 1000 - 40 * 60; // 40m ago
+    utimesSync(metaP, oldMtime, oldMtime);
+    ok('_present: dead 0-turn stub (mtime 40m) → hide (mtime floor, reapable)',
       am._present({ sid: `cc-${metaU}`, pid: process.pid, started: startedOld }) === false);
+    const freshStubU = 'd2203f05-0000-0000-0000-00000000000a';
+    writeFileSync(join(FAKE_PROJ, `${freshStubU}.jsonl`), '{"type":"mode"}\n{"type":"permission-mode"}\n');
+    ok('_present: fresh 0-turn stub (mtime ~0) → present (mtime floor, brand-new)',
+      am._present({ sid: `cc-${freshStubU}`, pid: 999999, started: startedOld }) === true);
 
     // Dead pid + fresh real turn → present (just-finished/crashed but recently active).
     const jdU = 'd2203f04-0000-0000-0000-000000000009';
