@@ -25,8 +25,8 @@ export function createDefaultConfig() {
     fiveHourWarnCeiling: 0.75,     // in-flight cap drops to 1 in [warn, soft) — slow-drain a near-cap account, no burst overshoot
     farOverLineThreshold: 0.10,    // rebind a warm session only when this far past its weekly pace line
     paceTieBand: 0.10,             // anti-dogpile: accounts within this of the best paceScore spread by load
-    maxInflightPerAccount: 3,      // proven-account in-flight cap (unproven = 1, the probe-gate)
-    maxSessionsPerAccount: 4,      // hard cap on bound warm sessions per account (instances limit)
+    maxInflightPerAccount: 5,      // proven-account in-flight cap (unproven = 1, the probe-gate) — D-2236: 3→5 for deadline throughput
+    maxSessionsPerAccount: 7,      // hard cap on bound warm sessions per account (instances limit) — D-2236: 4→7 for deadline throughput
     backoffSec: 60,                // 429 escalating-backoff base: streak-1 bench (+ jitter)
     backoffFactor: 4,              // ×per consecutive 429 (60s → 4m → 15m)
     backoffCapSec: 900,            // escalating-backoff ceiling (15m)

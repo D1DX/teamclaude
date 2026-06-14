@@ -195,13 +195,13 @@ export class AccountManager {
     // requests takes no new bind, so a burst spills across accounts in pace order
     // (bounds overshoot even when the 5h header lags the burst).
     this.paceTieBand          = opts.paceTieBand          ?? 0.10;
-    this.maxInflightPerAccount = opts.maxInflightPerAccount ?? 3;
+    this.maxInflightPerAccount = opts.maxInflightPerAccount ?? 5;
     // Probe-gate (D-2104): an UNPROVEN account (no 200 in this active spell — cold,
     // or just recovered from a bench) admits only ONE in-flight request; until that
     // probe returns 200 it takes no further binds, so we never pile sessions onto an
     // account we haven't confirmed has headroom. maxSessionsPerAccount: hard cap on
     // bound warm sessions per account (instances limit) — a burst spills beyond it.
-    this.maxSessionsPerAccount = opts.maxSessionsPerAccount ?? 4;
+    this.maxSessionsPerAccount = opts.maxSessionsPerAccount ?? 7;
     // End-of-cycle ramp (control law #3): weight by hours-to-7d-reset, applied to
     // the account's unused weekly fraction → drains quota before it resets.
     // First tier (ascending hours) whose bound ≥ hoursToReset wins.
