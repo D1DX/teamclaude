@@ -1101,10 +1101,27 @@ export class AccountManager {
     if (!isNaN(u5h)) account.quota.unified5h = u5h;
     if (!isNaN(u7d)) account.quota.unified7d = u7d;
 
+    // D-2236: never store a reset timestamp already in the past. At a window
+    // boundary Anthropic can briefly report a <=now reset; storing it makes
+    // _clearExpiredQuotas re-log "session quota reset" on EVERY subsequent sweep
+    // (it only nulls the window, but the next response re-populates the passed
+    // reset) — and because the TUI patches console.log -> _addLog -> render() ->
+    // computeCapacity() -> _sweepAll(), that storm recurses into a stack overflow.
+    // A passed reset means the window has rolled: clear util + reset so the next
+    // response repopulates a live (future-dated) window instead.
+    const nowMs = Date.now();
     const r5h = headers['anthropic-ratelimit-unified-5h-reset'];
     const r7d = headers['anthropic-ratelimit-unified-7d-reset'];
-    if (r5h) account.quota.unified5hReset = parseInt(r5h, 10) * 1000;
-    if (r7d) account.quota.unified7dReset = parseInt(r7d, 10) * 1000;
+    if (r5h) {
+      const t = parseInt(r5h, 10) * 1000;
+      if (t > nowMs) account.quota.unified5hReset = t;
+      else { account.quota.unified5hReset = null; account.quota.unified5h = null; }
+    }
+    if (r7d) {
+      const t = parseInt(r7d, 10) * 1000;
+      if (t > nowMs) account.quota.unified7dReset = t;
+      else { account.quota.unified7dReset = null; account.quota.unified7d = null; account.quota.unifiedStatus = null; }
+    }
 
     const uStatus = headers['anthropic-ratelimit-unified-status'];
     if (uStatus) account.quota.unifiedStatus = uStatus;

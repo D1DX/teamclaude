@@ -269,7 +269,17 @@ export class TUI {
     if (persist) appendOpLog(this.logDir, msg); // D-1680: durable daily file; D-1728: signal-only
     this.log.unshift({ t: timestamp(), msg });
     if (this.log.length > 200) this.log.length = 200;
-    if (this.running) this.render();
+    // D-2236: re-entrancy guard. console.log/error are patched (start()) to route
+    // here, and render() calls am.computeCapacity() -> _sweepAll() which can emit a
+    // console.log (e.g. a quota reset). Without this guard that nested log re-enters
+    // _addLog -> render() -> ... until the stack overflows (RangeError). The buffer
+    // is already updated above; the in-flight render paints it and the 500ms timer
+    // repaints regardless, so skipping the nested render loses nothing. try/finally
+    // so a render() throw can never wedge the Deck into a permanent no-render state.
+    if (this.running && !this._rendering) {
+      this._rendering = true;
+      try { this.render(); } finally { this._rendering = false; }
+    }
   }
 
   // ── input handling ─────────────────────────────────

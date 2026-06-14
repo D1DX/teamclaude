@@ -268,6 +268,22 @@ async function serverCommand() {
     }
   });
 
+  // D-2236: process-level safety net. The per-request handler (server.js) catches
+  // throws on the request path, but a throw OUTSIDE it — the startup warmer, the
+  // ledger save, any timer — had no handler: Node would print to stderr and exit,
+  // killing the proxy with no oplog line (an invisible "crash"). console.* is tee'd
+  // to the daily oplog, so logging here makes such failures visible. We keep the
+  // proxy alive (each request still has its own try/catch); a genuinely corrupt
+  // state will surface as logged errors the operator can act on, which beats a
+  // silent death. saveLedger() on uncaught so usage state survives the event.
+  process.on('unhandledRejection', (reason) => {
+    console.error(`[TeamClaude] Unhandled promise rejection: ${reason && reason.stack ? reason.stack : reason}`);
+  });
+  process.on('uncaughtException', (err) => {
+    console.error(`[TeamClaude] Uncaught exception: ${err && err.stack ? err.stack : err}`);
+    try { accountManager.saveLedger(); } catch {}
+  });
+
   if (!tui) {
     process.on('SIGINT', () => {
       console.log('\n[TeamClaude] Shutting down...');
