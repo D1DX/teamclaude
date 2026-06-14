@@ -11,6 +11,7 @@ import { importCredentials, loginOAuth, fetchProfile, refreshAccessToken, isToke
 import { TUI } from './tui.js';
 import { resolveLogDir, appendOpLog, pruneOldLogs, setLogRetentionHours } from './oplog.js';
 import { join } from 'node:path';
+import { BUILD } from './version.js';
 
 const args = process.argv.slice(2);
 const command = args[0];
@@ -243,7 +244,7 @@ async function serverCommand() {
   server.listen(port, '::1', () => {
     if (tui) {
       tui.start();
-      console.log(`Listening on port ${port} with ${accounts.length} account(s)`);
+      console.log(`Listening on port ${port} with ${accounts.length} account(s) (build ${BUILD})`);
     } else {
       const sep = '='.repeat(60);
       console.log('');
@@ -252,6 +253,7 @@ async function serverCommand() {
       console.log(sep);
       console.log(`  Port:       ${port}`);
       console.log(`  Accounts:   ${accounts.length}`);
+      console.log(`  Build:      ${BUILD}`);
       console.log(`  Threshold:  ${(threshold * 100).toFixed(0)}%`);
       console.log(`  Upstream:   ${config.upstream || 'https://api.anthropic.com'}`);
       console.log('');
@@ -468,6 +470,9 @@ async function statusCommand() {
     } catch { /* settings.json unreadable */ }
     const gb = mb => mb == null ? '?' : (mb / 1024).toFixed(1);
     console.log(`Proxy:    UP · port ${config.proxy.port} · up ${fmtDur(sys.proxyUptimeSec)} · proxy RSS ${sys.proxyRssMB ?? '?'}MB`);
+    // D-2226: prefer the RUNNING proxy's build (from /teamclaude/status); fall back
+    // to the on-disk build with a hint when the live proxy predates the stamp.
+    console.log(`Build:    ${data.build || `${BUILD} (on disk — running proxy predates the stamp; restart to load)`}`);
     console.log(`Routing:  ${wired}`);
     console.log(`System:   RAM ${gb(sys.usedMemMB)}/${gb(sys.totalMemMB)}GB (${sys.usedMemPct ?? '?'}%) · cpu ${sys.cpuBusyPct ?? '?'}% busy · load ${(sys.loadAvg || []).join(' ')} · ${sys.cpuCount ?? '?'} cpus`);
     console.log('');

@@ -1,6 +1,7 @@
 import http from 'node:http';
 import { writeFile, mkdir } from 'node:fs/promises';
 import { join } from 'node:path';
+import { BUILD } from './version.js';
 
 
 const HOP_BY_HOP_HEADERS = new Set([
@@ -53,7 +54,9 @@ export function createProxyServer(accountManager, config, hooks = {}) {
       // Status endpoint
       if (req.method === 'GET' && req.url === '/teamclaude/status') {
         res.writeHead(200, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify(accountManager.getStatus(), null, 2));
+        // D-2226: report the RUNNING proxy's build (this process), so `teamclaude
+        // status` shows what's actually live — not the on-disk copy the CLI sees.
+        res.end(JSON.stringify({ ...accountManager.getStatus(), build: BUILD }, null, 2));
         return;
       }
 
@@ -76,7 +79,7 @@ export function createProxyServer(accountManager, config, hooks = {}) {
       // counter / onRequest* hooks so it never reaches an account or the log.
       if ((req.method === 'GET' || req.method === 'HEAD') && (req.url === '/' || req.url === '/health')) {
         res.writeHead(200, { 'Content-Type': 'application/json' });
-        res.end(req.method === 'HEAD' ? undefined : JSON.stringify({ status: 'ok', service: 'teamclaude' }));
+        res.end(req.method === 'HEAD' ? undefined : JSON.stringify({ status: 'ok', service: 'teamclaude', build: BUILD }));
         return;
       }
 
