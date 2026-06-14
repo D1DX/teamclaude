@@ -205,13 +205,49 @@ async function forwardRequest(req, res, body, accountManager, upstream, retryCou
     return holdForThrottle(req, res, body, accountManager, upstream, hooks, reqId, ctx, logDir);
   }
 
+  // D1DX patch (D-2226): warm-path in-flight cap — HOLD for a slot, don't pile on
+  // or churn. _pickAccountForBinding excludes at-cap accounts from NEW binds, so an
+  // at-cap account reaching here is a warm-stuck session (or the all-at-cap
+  // fallback). Briefly wait for one of its OWN in-flight requests to finish, then
+  // dispatch to the SAME account — cache-affinity preserved, no rebind. The
+  // reservation below is synchronous with the final at-cap check (no `await`
+  // between the loop exit and noteInflightStart), so the freed slot is taken
+  // atomically. Budget-bounded: on timeout we dispatch anyway (never refuse — and a
+  // resulting burst-429 now benches ~60s, not 15 min).
+  if (accountManager.atInflightCap(account.index)) {
+    const WARM_SLOT_POLL_MS = 200, WARM_SLOT_BUDGET_MS = 5000;
+    let waited = 0;
+    while (accountManager.atInflightCap(account.index) && waited < WARM_SLOT_BUDGET_MS && !res.destroyed) {
+      const step = WARM_SLOT_POLL_MS + Math.floor(Math.random() * WARM_SLOT_POLL_MS); // anti-herd jitter
+      await new Promise(r => setTimeout(r, step));
+      waited += step;
+    }
+    if (res.destroyed) return; // client gave up during the wait — nothing reserved yet
+  }
+
   // Track which account handles this request
   ctx.account = account.name;
   hooks.onRequestRouted?.(reqId, { account: account.name });
 
+  // D1DX patch (D-2226): reserve the in-flight slot SYNCHRONOUSLY at selection —
+  // BEFORE the first `await` below — so a burst of concurrent requests can't all
+  // clear the per-account in-flight cap while _inflight is still 0. That TOCTOU
+  // race (selection read _inflight at getAccountForSession, but the increment
+  // used to land only at dispatch, after `await ensureTokenFresh`) defeated the
+  // probe-gate and let the recovery herd dogpile a just-freed account. Released by
+  // the dispatch try/finally below, or explicitly on each early exit between here
+  // and it (token-refresh throw / token-error failover).
+  accountManager.noteInflightStart(account.index);
+
   // Refresh OAuth token if needed
-  await accountManager.ensureTokenFresh(account.index);
+  try {
+    await accountManager.ensureTokenFresh(account.index);
+  } catch (err) {
+    accountManager.noteInflightEnd(account.index); // release on a refresh failure, then propagate
+    throw err;
+  }
   if (account.status === 'error' && retryCount < maxRetries) {
+    accountManager.noteInflightEnd(account.index); // release before the failover re-selects + re-reserves
     return forwardRequest(req, res, body, accountManager, upstream, retryCount + 1, hooks, reqId, ctx, logDir);
   }
 
@@ -277,14 +313,13 @@ async function forwardRequest(req, res, body, accountManager, upstream, retryCou
     }
   }
 
-  // D1DX patch (D-1903): bracket the upstream attempt so account._inflight
-  // reflects requests actually in flight on this account right now. The finally
-  // below releases it on every exit — success, error, or a failover/hold/retry
-  // recursion. Release is correct across recursion: a recursive forwardRequest()
-  // call only reaches its own noteInflightStart AFTER its first `await`
-  // (ensureTokenFresh), which runs after this invocation's finally has fired —
-  // so the old account is always released before the new one increments.
-  accountManager.noteInflightStart(account.index);
+  // D1DX patch (D-1903 + D-2226): the in-flight slot was reserved synchronously
+  // at selection above (D-2226). This try/finally is its release scope for the
+  // dispatch path — the finally below releases on every exit (success, terminal
+  // error, or a failover/hold/retry recursion). Recursion stays balanced: a
+  // recursive forwardRequest() reserves its OWN slot synchronously, and this
+  // invocation's finally fires the moment that recursive call yields at its first
+  // `await`, so the count never accumulates across the retry chain.
   try {
     const upstreamRes = await fetch(upstreamUrl, {
       method,

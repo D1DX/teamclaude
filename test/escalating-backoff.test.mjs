@@ -37,12 +37,20 @@ const benchSec = (am, i) => Math.round((am.accounts[i].rateLimitedUntil - Date.n
   am.markRateLimited(0, 3600);
   ok('an over-long retry-after is clamped to the cap (900s)', benchSec(am, 0) === 900); }
 
-// ── header refinement: a known unified reset benches to it (no retry-after) ────
+// ── D-2226: a known unified reset is used ONLY when the account is genuinely at a
+//    cap (near-ceiling util); a header-less burst BELOW the caps uses the ladder,
+//    not the always-far reset — the bench-to-reset-for-any-429 false-throttle fix ─
 { const am = mk({ backoffCapSec: 900 });
+  am.accounts[0].quota.unified5h = 0.95;                     // AT the 5h soft ceiling → genuine quota cap
   am.accounts[0].quota.unified5hReset = Date.now() + 150000; // 150s out
   am.markRateLimited(0, null);
   const w = benchSec(am, 0);
-  ok('a known unified reset is used when no retry-after (≈150s)', w >= 149 && w <= 151); }
+  ok('a near-cap 429 benches to the known unified reset (≈150s)', w >= 149 && w <= 151); }
+{ const am = mk({ backoffSec: 60, backoffCapSec: 900 });
+  am.accounts[0].quota.unified5h = 0.20;                     // well below the caps → a BURST, not quota
+  am.accounts[0].quota.unified5hReset = Date.now() + 150000; // reset is known but irrelevant to a burst
+  am.markRateLimited(0, null);
+  ok('a burst-429 below the caps uses the ladder, NOT the far reset (60s)', benchSec(am, 0) === 60); }
 
 // ── learned cap: EMA of burn5h at the FIRST 429 of each streak ────────────────
 { const am = mk({ capEmaAlpha: 0.5 });

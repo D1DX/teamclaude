@@ -23,6 +23,7 @@ function makeAM({ account = null, hardCapped = false, backoff = 1 } = {}) {
     ensureTokenFresh() {}, updateQuota() {}, markRateLimited() {},
     noteSuccess() {}, noteAccountSuccess() {}, updateUsage() {}, getStatus() { return {}; },
     noteInflightStart() {}, noteInflightEnd() {}, // D1DX (D-1903)
+    atInflightCap() { return false; }, // D1DX (D-2226): never at cap in these stubs → no warm-slot hold
   };
 }
 
@@ -98,6 +99,20 @@ const upPort = upstream.address().port;
   setTimeout(() => { am._account = am.accounts[0]; }, 200); // recovers within budget
   const { status, ms } = await req(proxy.address().port, '/v1/messages');
   ok('D held through transient throttle, served 200 on recovery', status === 200 && ms >= 150);
+  proxy.close();
+}
+
+// ── Case E (D-2226): account available but AT the in-flight cap → HELD for a slot
+//    on its OWN account (warm-path hold, no rebind), then 200 when a slot frees ──
+{
+  const am = makeAM({ account: null });
+  am._account = am.accounts[0];                 // the account IS available...
+  let capped = true;
+  am.atInflightCap = () => capped;              // ...but saturated at the hard cap
+  setTimeout(() => { capped = false; }, 200);   // one of its in-flight requests finishes
+  const proxy = await startProxy(am, upPort);
+  const { status, ms } = await req(proxy.address().port, '/v1/messages');
+  ok('E warm-slot held until a slot frees, then served 200 (no rebind)', status === 200 && ms >= 150);
   proxy.close();
 }
 

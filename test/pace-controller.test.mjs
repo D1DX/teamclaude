@@ -172,5 +172,27 @@ const bind = (am, sid, i) => {
   am.accounts[0]._proven = true; am.accounts[0]._inflight = 2; // cap is maxInflightPerAccount (3); 2 < 3
   ok('ample 5h headroom keeps full in-flight cap (a0 still picked at 2 in-flight)', am._pickAccountForBinding().name === 'a0'); }
 
+// ── D-2226: a header-less burst-429 (utilization well below caps) benches on the
+//    short ladder, NOT to the always-far window reset (the false-throttle bug) ──
+{ const am = mk(); am.backoffJitterSec = 0; // deterministic bench for the assertion
+  q(am, 0, { u7d: 0.20, u5h: 0.30 });        // both axes well below the caps → a BURST
+  am.markRateLimited(0, null);               // no retry-after header (the Max OAuth norm)
+  ok('burst-429 (low util) benches on the ladder, not to the reset', am.accounts[0]._lastBenchSec === am.backoffBaseSec); }
+
+// ── D-2226: a 429 with the 5h axis AT the soft ceiling IS a genuine quota cap →
+//    bench to the reset (clamped to backoffCapSec), the slow path it's meant for ──
+{ const am = mk(); am.backoffJitterSec = 0;
+  q(am, 0, { u7d: 0.20, u5h: 0.95, resetInMs: 5 * DAY }); // 5h ≥ 0.90 soft ceiling → near cap
+  am.markRateLimited(0, null);
+  ok('quota-429 (5h at the soft ceiling) benches to the reset, not the burst ladder', am.accounts[0]._lastBenchSec === am.backoffCapSec); }
+
+// ── D-2226: atInflightCap — the warm-path-hold predicate server.js polls on to
+//    wait for a slot on a warm-stuck account instead of piling on (anti-burst) ──
+{ const am = mk();
+  am.accounts[0]._inflight = am.maxInflightPerAccount;       // at the hard cap
+  am.accounts[1]._inflight = am.maxInflightPerAccount - 1;   // one below
+  ok('atInflightCap is true at the hard cap', am.atInflightCap(0) === true);
+  ok('atInflightCap is false below the hard cap', am.atInflightCap(1) === false); }
+
 console.log(`\n${pass} passed, ${fail} failed`);
 if (fail) process.exit(1);

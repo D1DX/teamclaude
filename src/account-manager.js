@@ -510,6 +510,17 @@ export class AccountManager {
     if (a) a._inflight = Math.max(0, (a._inflight || 0) - 1);
   }
 
+  // D-2226: is this account at/over its HARD in-flight cap? server.js uses this to
+  // briefly HOLD a warm-stuck request until one of the account's own in-flight
+  // slots frees — preserving cache-affinity — instead of piling on (→ burst-429)
+  // or churning the warm session onto another account. New binds already exclude
+  // at-cap accounts via _inflightCapFor; this guards the warm-stick + all-at-cap
+  // fallback paths that bypass that filter and reach the dispatcher directly.
+  atInflightCap(accountIndex) {
+    const a = this.accounts[accountIndex];
+    return !!a && (a._inflight || 0) >= this.maxInflightPerAccount;
+  }
+
   // Tier-3 fallback (pure): the soonest-to-reset account, reactivated only if its
   // reset has actually passed; else null (= genuinely exhausted → honest 429).
   _soonestUsableOrNull() {
@@ -1210,16 +1221,31 @@ export class AccountManager {
       baseMs = Math.min(retryAfterSeconds * 1000, capMs);          // server told us exactly
       why = 'retry-after';
     } else {
-      // Optional header refinement: a known unified reset → bench to it.
+      // D-2226: classify the header-less 429 by WHICH limit axis is actually hot.
+      // A 429 while utilization sits well below the hard ceiling is a BURST /
+      // concurrency limit (clears in seconds) — NOT quota exhaustion — so bench it
+      // on the short escalating ladder, not to the window reset. Only bench-to-reset
+      // when the account is genuinely AT a cap (5h ≥ soft ceiling, weekly ≥ hard
+      // ceiling, or the server flagged unified-status `rejected`): there the reset
+      // IS the soonest real recovery. Benching a transient burst to the always-far
+      // reset (clamped to backoffCapSec) is what sidelined a half-full account for
+      // 15 minutes and drove the false "all-throttled" cascade.
+      const u5h = account.quota.unified5h;
+      const u7d = account.quota.unified7d;
+      const nearCap = account.quota.unifiedStatus === 'rejected'
+        || (u5h != null && u5h >= this.fiveHourSoftCeiling)
+        || (u7d != null && u7d >= this.switchThreshold);
       const resets = [account.quota.unified5hReset, account.quota.unified7dReset].filter(Boolean);
       const reset = resets.length ? Math.min(...resets) : null;
-      if (reset && reset > now) {
-        baseMs = Math.min(reset - now, capMs);
-        why = 'reset';
+      if (nearCap && reset && reset > now) {
+        baseMs = Math.min(reset - now, capMs);            // genuine quota cap → wait for the reset
+        why = 'quota-reset';
       } else {
-        // Header-blind (the Max OAuth norm): escalating ladder by consecutive 429s.
+        // Header-blind burst (the Max OAuth norm): escalating ladder by consecutive
+        // 429s. Any success resets the streak (noteAccountSuccess), so a transient
+        // burst recovers in ~backoffBaseSec while a persistent one escalates.
         baseMs = Math.min(this.backoffBaseSec * 1000 * this.backoffFactor ** (account._429streak - 1), capMs);
-        why = `ladder×${account._429streak}`;
+        why = `burst×${account._429streak}`;
       }
     }
     const jitterMs = Math.random() * this.backoffJitterSec * 1000; // de-sync window expiry
