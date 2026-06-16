@@ -1,4 +1,5 @@
 import { readFile, writeFile, mkdir } from 'node:fs/promises';
+import { writeFileSync, mkdirSync } from 'node:fs';
 import { join, dirname } from 'node:path';
 import { homedir } from 'node:os';
 import { randomBytes } from 'node:crypto';
@@ -68,6 +69,18 @@ export async function saveConfig(config) {
   const path = getConfigPath();
   await mkdir(dirname(path), { recursive: true });
   await writeFile(path, JSON.stringify(config, null, 2) + '\n', { mode: 0o600 });
+}
+
+/**
+ * Synchronous config write for exit paths (D-2286). saveConfig is async — on
+ * SIGINT/SIGTERM or a Deck quit the process can die before the async write lands,
+ * stranding a rotated-but-unpersisted refresh token on the OLD value → invalid_grant
+ * on the next boot. A sync write completes before process.exit().
+ */
+export function saveConfigSync(config) {
+  const path = getConfigPath();
+  mkdirSync(dirname(path), { recursive: true });
+  writeFileSync(path, JSON.stringify(config, null, 2) + '\n', { mode: 0o600 });
 }
 
 /**

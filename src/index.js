@@ -4,7 +4,7 @@ import { spawnSync, execSync } from 'node:child_process';
 import { readFileSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { createInterface } from 'node:readline';
-import { loadOrCreateConfig, loadConfig, saveConfig, atomicConfigUpdate, getConfigPath } from './config.js';
+import { loadOrCreateConfig, loadConfig, saveConfig, saveConfigSync, atomicConfigUpdate, getConfigPath } from './config.js';
 import { AccountManager } from './account-manager.js';
 import { createProxyServer } from './server.js';
 import { importCredentials, loginOAuth, fetchProfile, refreshAccessToken, isTokenExpiringSoon } from './oauth.js';
@@ -162,6 +162,23 @@ async function serverCommand() {
       }
     }).catch(err => console.error(`[TeamClaude] Failed to save refreshed token: ${err.message}`));
   });
+
+  // D-2286: flush the freshest tokens to disk SYNCHRONOUSLY on every exit path.
+  // Anthropic rotates the refresh token on each refresh; onTokenRefresh (above) mirrors
+  // the rotated token into config.accounts synchronously but writes disk ASYNC. If the
+  // operator quits the Deck (or a signal kills the process) while that write is in flight,
+  // the next boot loads the rotated-but-unpersisted (now-invalid) refresh token →
+  // invalid_grant kills the whole grant (the recurring cherry/banana deaths, D-2286 S3-tail).
+  // A sync flush on exit closes that window. (Residual narrow gap: a refresh whose HTTP
+  // round-trip is still in flight at quit — config holds the pre-rotation token then; not
+  // worth making the exit path async to cover.)
+  let _tokensFlushed = false;
+  const flushTokensSync = () => {
+    if (_tokensFlushed) return;
+    _tokensFlushed = true;
+    try { saveConfigSync(config); } catch {}
+  };
+
   const port = config.proxy.port;
   const useTUI = process.stdout.isTTY && process.stdin.isTTY;
 
@@ -194,7 +211,7 @@ async function serverCommand() {
         if (!diskConfig) return 0;
         return syncAccountsFromDisk(diskConfig, config, accountManager);
       },
-      onQuit: () => { accountManager.saveLedger(); server.close(() => process.exit(0)); },
+      onQuit: () => { flushTokensSync(); accountManager.saveLedger(); server.close(() => process.exit(0)); },
     });
     hooks = {
       onRequestStart: (id, info) => tui.onRequestStart(id, info),
@@ -324,11 +341,13 @@ async function serverCommand() {
   if (!tui) {
     process.on('SIGINT', () => {
       console.log('\n[TeamClaude] Shutting down...');
+      flushTokensSync();
       accountManager.saveLedger();
       server.close(() => process.exit(0));
     });
     process.on('SIGTERM', () => {
       console.log('\n[TeamClaude] Shutting down...');
+      flushTokensSync();
       accountManager.saveLedger();
       server.close(() => process.exit(0));
     });
