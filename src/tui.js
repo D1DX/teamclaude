@@ -941,7 +941,17 @@ export class TUI {
     }
     // Show cursor only in input mode
     buf += this.mode === 'input' ? `${ESC}?25h` : `${ESC}?25l`;
-    process.stdout.write(buf);
+    // D-2286: guard the frame write. When the controlling terminal backgrounds or its
+    // pty buffer fills, this write raises EIO/EPIPE. render() is reached from console.*
+    // (patched → _addLog → render), the 500ms timer, resize, and key handlers — an
+    // unguarded throw here propagated into the crash handler, which re-logged via
+    // console.error → _addLog → render → here again: the 06-15 EIO storm. Swallow the
+    // terminal-write error; the next 500ms repaint recovers once the terminal is back.
+    try {
+      process.stdout.write(buf);
+    } catch (e) {
+      if (!(e && (e.code === 'EPIPE' || e.code === 'EIO'))) throw e;
+    }
   }
 
   _renderAcct(idx, bw, showBoth) {

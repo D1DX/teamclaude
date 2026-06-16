@@ -208,39 +208,43 @@ async function forwardRequest(req, res, body, accountManager, upstream, retryCou
     return holdForThrottle(req, res, body, accountManager, upstream, hooks, reqId, ctx, logDir);
   }
 
-  // D1DX patch (D-2226): warm-path in-flight cap — HOLD for a slot, don't pile on
-  // or churn. _pickAccountForBinding excludes at-cap accounts from NEW binds, so an
-  // at-cap account reaching here is a warm-stuck session (or the all-at-cap
-  // fallback). Briefly wait for one of its OWN in-flight requests to finish, then
-  // dispatch to the SAME account — cache-affinity preserved, no rebind. The
-  // reservation below is synchronous with the final at-cap check (no `await`
-  // between the loop exit and noteInflightStart), so the freed slot is taken
-  // atomically. Budget-bounded: on timeout we dispatch anyway (never refuse — and a
-  // resulting burst-429 now benches ~60s, not 15 min).
-  if (accountManager.atInflightCap(account.index)) {
-    const WARM_SLOT_POLL_MS = 200, WARM_SLOT_BUDGET_MS = 5000;
+  // D-2286: atomic dispatch probe-gate (supersedes the D-2226 warm-path hold + the
+  // separate synchronous reserve). tryReserveInflight checks the account against its
+  // GRADUATED cap (_inflightCapFor: 1 while UNPROVEN/just-recovered) AND reserves the
+  // slot in one synchronous step, so a concurrent recovery herd can't all clear the
+  // cap while _inflight is still 0 — exactly ONE request probes a just-recovered
+  // account; the rest HOLD here for a slot (cache-affinity preserved, no rebind).
+  // _pickAccountForBinding still pre-filters at-cap accounts from NEW binds; this is
+  // the dispatch-time gate that the bind-time filter's TOCTOU let the 06-15 herd slip
+  // through (8 sessions each read _inflight=0 and dogpiled one just-freed account).
+  let reserved = accountManager.tryReserveInflight(account.index);
+  if (!reserved) {
+    const SLOT_POLL_MS = 200, SLOT_BUDGET_MS = 5000;
     let waited = 0;
-    while (accountManager.atInflightCap(account.index) && waited < WARM_SLOT_BUDGET_MS && !res.destroyed) {
-      const step = WARM_SLOT_POLL_MS + Math.floor(Math.random() * WARM_SLOT_POLL_MS); // anti-herd jitter
+    while (!reserved && waited < SLOT_BUDGET_MS && !res.destroyed) {
+      const step = SLOT_POLL_MS + Math.floor(Math.random() * SLOT_POLL_MS); // anti-herd jitter
       await new Promise(r => setTimeout(r, step));
       waited += step;
+      reserved = accountManager.tryReserveInflight(account.index);
     }
-    if (res.destroyed) return; // client gave up during the wait — nothing reserved yet
+    if (res.destroyed) { if (reserved) accountManager.noteInflightEnd(account.index); return; }
+    if (!reserved) {
+      // Budget exhausted and still no slot — never refuse. Reserve unconditionally and
+      // dispatch; with the D-2286 streak-debounce a resulting burst-429 benches ~60s,
+      // and by 5s the in-flight probe has almost certainly resolved the account's
+      // proven state anyway (cap opens, or it benched and we'd have re-selected).
+      accountManager.noteInflightStart(account.index);
+      reserved = true;
+    }
   }
 
   // Track which account handles this request
   ctx.account = account.name;
   hooks.onRequestRouted?.(reqId, { account: account.name });
 
-  // D1DX patch (D-2226): reserve the in-flight slot SYNCHRONOUSLY at selection —
-  // BEFORE the first `await` below — so a burst of concurrent requests can't all
-  // clear the per-account in-flight cap while _inflight is still 0. That TOCTOU
-  // race (selection read _inflight at getAccountForSession, but the increment
-  // used to land only at dispatch, after `await ensureTokenFresh`) defeated the
-  // probe-gate and let the recovery herd dogpile a just-freed account. Released by
-  // the dispatch try/finally below, or explicitly on each early exit between here
-  // and it (token-refresh throw / token-error failover).
-  accountManager.noteInflightStart(account.index);
+  // In-flight slot already reserved above (atomically via tryReserveInflight, or the
+  // never-refuse fallback). Released by the dispatch try/finally below, or explicitly
+  // on each early exit between here and it (token-refresh throw / token-error failover).
 
   // Refresh OAuth token if needed
   try {

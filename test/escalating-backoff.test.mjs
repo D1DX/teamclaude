@@ -10,23 +10,44 @@ const mk = (opts = {}) => new AccountManager([
   { name: 'a2', type: 'oauth', accessToken: 'x', refreshToken: 'r', expiresAt: Date.now() + 1e9 },
 ], 0.98, { backoffJitterSec: 0, ...opts });
 const benchSec = (am, i) => Math.round((am.accounts[i].rateLimitedUntil - Date.now()) / 1000);
+// D-2286: model a recovery between SEQUENTIAL 429s — the bench expired and the account
+// was re-probed (what _sweepAll does: flip an expired bench back to 'active'). Only a
+// failure AFTER recovery is a distinct cycle that escalates the streak; a 429 arriving
+// while still benched is a concurrent-burst sibling (debounced, no escalation).
+const recover = (am, i) => { am.accounts[i].status = 'active'; am.accounts[i].rateLimitedUntil = 0; };
 
-// ── escalating ladder: header-blind 429s grow 60 → 240 → 900 (cap) ────────────
+// ── escalating ladder: SEQUENTIAL header-blind 429s grow 60 → 240 → 900 (cap) ──
 { const am = mk({ backoffSec: 60, backoffFactor: 4, backoffCapSec: 900 });
   am.markRateLimited(0, null); const w1 = benchSec(am, 0);
-  am.markRateLimited(0, null); const w2 = benchSec(am, 0);
-  am.markRateLimited(0, null); const w3 = benchSec(am, 0);
+  recover(am, 0); am.markRateLimited(0, null); const w2 = benchSec(am, 0);
+  recover(am, 0); am.markRateLimited(0, null); const w3 = benchSec(am, 0);
   ok('streak 1 benches the base (60s)', w1 === 60);
   ok('streak 2 escalates ×factor (240s)', w2 === 240);
   ok('streak 3 clamps to the ladder cap (900s, not 960)', w3 === 900);
   ok('the consecutive-429 streak is tracked on the account', am.accounts[0]._429streak === 3); }
 
+// ── D-2286: concurrent-burst debounce — sibling 429s while ALREADY benched do NOT
+//    escalate the streak or re-bench. The 06-15 cascade was 3 concurrent 429s driving
+//    60→240→900 in 3 seconds because the streak counted in-flight 429s. Now only a
+//    SEQUENTIAL failure (after recovery) escalates; a concurrent sibling is a no-op. ─
+{ const am = mk({ backoffSec: 60, backoffFactor: 4, backoffCapSec: 900 });
+  am.markRateLimited(0, null);                 // first 429 → streak 1, 60s, status throttled
+  am.markRateLimited(0, null);                 // concurrent sibling (still benched) → debounced
+  am.markRateLimited(0, null);                 // concurrent sibling → debounced
+  ok('a concurrent burst does NOT inflate the streak (stays 1)', am.accounts[0]._429streak === 1);
+  ok('a concurrent burst does NOT re-bench (stays 60s, not 900s)', benchSec(am, 0) === 60);
+  recover(am, 0); am.markRateLimited(0, null); // a SEQUENTIAL failure after recovery DOES escalate
+  ok('a sequential failure after recovery escalates (streak 2, 240s)', am.accounts[0]._429streak === 2 && benchSec(am, 0) === 240);
+  // a concurrent 429 carrying a LONGER retry-after still extends the bench (no escalation)
+  am.markRateLimited(0, 600);
+  ok('a concurrent retry-after extends the bench but not the streak', am.accounts[0]._429streak === 2 && benchSec(am, 0) === 600); }
+
 // ── a success resets the streak → next 429 is back to the base ────────────────
 { const am = mk({ backoffSec: 60, backoffFactor: 4 });
-  am.markRateLimited(0, null); am.markRateLimited(0, null); // streak 2
+  am.markRateLimited(0, null); recover(am, 0); am.markRateLimited(0, null); // sequential → streak 2
   am.noteAccountSuccess(0);
   ok('a success clears the 429 streak', am.accounts[0]._429streak === 0);
-  am.markRateLimited(0, null);
+  recover(am, 0); am.markRateLimited(0, null);
   ok('the next 429 after a success benches the base again (60s)', benchSec(am, 0) === 60); }
 
 // ── an explicit retry-after overrides the ladder (clamped to the cap) ─────────
@@ -55,13 +76,13 @@ const benchSec = (am, i) => Math.round((am.accounts[i].rateLimitedUntil - Date.n
 // ── learned cap: EMA of burn5h at the FIRST 429 of each streak ────────────────
 { const am = mk({ capEmaAlpha: 0.5 });
   am._recordBurn(am.accounts[0], 200000);
-  am.markRateLimited(0, null);
+  am.markRateLimited(0, null);                         // streak 1 → teach: capEst5h = 200k
   ok('first cap event sets capEst5h to burn5h (200k)', am.accounts[0]._capEst5h === 200000);
   am._recordBurn(am.accounts[0], 100000);             // burn5h now 300k
-  am.markRateLimited(0, null);                        // streak 2 — must NOT re-teach
+  recover(am, 0); am.markRateLimited(0, null);        // streak 2 (sequential) — only the 1st of a streak teaches
   ok('a later 429 in the same streak does NOT re-teach the cap', am.accounts[0]._capEst5h === 200000);
-  am.noteAccountSuccess(0);                            // new streak
-  am.markRateLimited(0, null);                        // EMA toward 300k: 0.5×200k + 0.5×300k
+  am.noteAccountSuccess(0);                            // success → fresh streak
+  recover(am, 0); am.markRateLimited(0, null);        // streak 1 again → EMA toward 300k: 0.5×200k + 0.5×300k
   ok('a fresh streak EMAs the cap toward the new burn (250k)', am.accounts[0]._capEst5h === 250000); }
 
 // ── burn window: only the last N whole-hour buckets count ─────────────────────

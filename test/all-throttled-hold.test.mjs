@@ -23,7 +23,8 @@ function makeAM({ account = null, hardCapped = false, backoff = 1 } = {}) {
     ensureTokenFresh() {}, updateQuota() {}, markRateLimited() {},
     noteSuccess() {}, noteAccountSuccess() {}, updateUsage() {}, getStatus() { return {}; },
     noteInflightStart() {}, noteInflightEnd() {}, // D1DX (D-1903)
-    atInflightCap() { return false; }, // D1DX (D-2226): never at cap in these stubs → no warm-slot hold
+    atInflightCap() { return false; }, // D1DX (D-2226): legacy, superseded by tryReserveInflight
+    tryReserveInflight() { return true; }, // D-2286: atomic dispatch probe-gate — reserve succeeds by default
   };
 }
 
@@ -102,13 +103,13 @@ const upPort = upstream.address().port;
   proxy.close();
 }
 
-// ── Case E (D-2226): account available but AT the in-flight cap → HELD for a slot
-//    on its OWN account (warm-path hold, no rebind), then 200 when a slot frees ──
+// ── Case E (D-2226/D-2286): account available but AT the in-flight cap → HELD for a
+//    slot on its OWN account (probe-gate hold, no rebind), then 200 when a slot frees ──
 {
   const am = makeAM({ account: null });
   am._account = am.accounts[0];                 // the account IS available...
   let capped = true;
-  am.atInflightCap = () => capped;              // ...but saturated at the hard cap
+  am.tryReserveInflight = () => !capped;        // ...but saturated → the probe-gate holds (D-2286)
   setTimeout(() => { capped = false; }, 200);   // one of its in-flight requests finishes
   const proxy = await startProxy(am, upPort);
   const { status, ms } = await req(proxy.address().port, '/v1/messages');

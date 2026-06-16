@@ -510,6 +510,24 @@ export class AccountManager {
     if (a) a._inflight = Math.max(0, (a._inflight || 0) - 1);
   }
 
+  // D-2286: atomic dispatch probe-gate. Checks the account against its GRADUATED cap
+  // (_inflightCapFor: 1 while UNPROVEN/just-recovered → exactly ONE probe in flight,
+  // opening to maxInflightPerAccount once a 200 proves headroom) and reserves the slot
+  // in the SAME synchronous step. Single-threaded JS makes the check+increment atomic,
+  // so a concurrent recovery herd can't all pass while _inflight is still 0 (the TOCTOU
+  // that let 7+ requests pile onto one just-recovered account and burst-429 it — the
+  // 06-15 cascade). server.js calls this at dispatch instead of the bind-time filter
+  // (which races) + a separate noteInflightStart (which doesn't gate). Returns true if
+  // a slot was reserved — caller MUST pair it with noteInflightEnd — or false if the
+  // account is at its graduated cap (caller holds for a slot, preserving affinity).
+  tryReserveInflight(accountIndex) {
+    const a = this.accounts[accountIndex];
+    if (!a) return false;
+    if ((a._inflight || 0) >= this._inflightCapFor(a)) return false;
+    a._inflight = (a._inflight || 0) + 1;
+    return true;
+  }
+
   // D-2226: is this account at/over its HARD in-flight cap? server.js uses this to
   // briefly HOLD a warm-stuck request until one of the account's own in-flight
   // slots frees — preserving cache-affinity — instead of piling on (→ burst-429)
@@ -1217,6 +1235,28 @@ export class AccountManager {
     const account = this.accounts[accountIndex];
     if (!account) return;
     const now = Date.now();
+
+    // D-2286: concurrent-burst debounce. If this account is ALREADY benched from
+    // this cycle (throttled, time remaining), a 429 arriving now is a sibling of the
+    // same concurrent burst — NOT a fresh post-recovery probe failure. Incrementing
+    // the streak per in-flight 429 is what drove 60s→4m→15m in 3 seconds and the
+    // false all-throttled cascade (06-15, D-2286 forensic). Keep the existing bench:
+    // don't increment the streak, don't re-bench, don't re-log. A genuine SEQUENTIAL
+    // failure still escalates — by then the bench has expired and _sweepAll flipped
+    // status back to 'active', so this guard passes. A server retry-after still
+    // EXTENDS the bench when it's longer than what we already hold.
+    if (account.status === 'throttled' && account.rateLimitedUntil > now) {
+      account._proven = false;
+      if (retryAfterSeconds != null && !isNaN(retryAfterSeconds)) {
+        const until = now + Math.min(retryAfterSeconds * 1000, this.backoffCapSec * 1000);
+        if (until > account.rateLimitedUntil) {
+          account.rateLimitedUntil = until;
+          account._lastBenchSec = Math.round((until - now) / 1000);
+        }
+      }
+      return;
+    }
+
     account._429streak = (account._429streak || 0) + 1;
     account._proven = false; // D-2104 probe-gate: a 429 un-proves it → re-probe with 1 on recovery
 
@@ -1233,7 +1273,7 @@ export class AccountManager {
     }
 
     const capMs = this.backoffCapSec * 1000;
-    let baseMs, why;
+    let baseMs, why, isBurst = false;
     if (retryAfterSeconds != null && !isNaN(retryAfterSeconds)) {
       baseMs = Math.min(retryAfterSeconds * 1000, capMs);          // server told us exactly
       why = 'retry-after';
@@ -1261,11 +1301,25 @@ export class AccountManager {
         // Header-blind burst (the Max OAuth norm): escalating ladder by consecutive
         // 429s. Any success resets the streak (noteAccountSuccess), so a transient
         // burst recovers in ~backoffBaseSec while a persistent one escalates.
-        baseMs = Math.min(this.backoffBaseSec * 1000 * this.backoffFactor ** (account._429streak - 1), capMs);
+        // D-2286: FULL JITTER (AWS "Exponential Backoff and Jitter") — spread the
+        // bench across [base, ladder] so simultaneously-benched accounts DON'T expire
+        // together and re-form the synchronized recovery herd. The ladder ceiling
+        // still grows with the streak; jitter only de-synchronizes WHEN each account
+        // frees. backoffJitterSec === 0 keeps it deterministic (= ladder) for tests.
+        const ladderMs = Math.min(this.backoffBaseSec * 1000 * this.backoffFactor ** (account._429streak - 1), capMs);
+        if (this.backoffJitterSec > 0) {
+          const floorMs = Math.min(this.backoffBaseSec * 1000, ladderMs);
+          baseMs = floorMs + Math.random() * (ladderMs - floorMs);
+        } else {
+          baseMs = ladderMs;
+        }
         why = `burst×${account._429streak}`;
+        isBurst = true;
       }
     }
-    const jitterMs = Math.random() * this.backoffJitterSec * 1000; // de-sync window expiry
+    // D-2286: retry-after + quota-reset keep the small additive de-sync jitter; a
+    // burst already carries full jitter above, so don't double-jitter it.
+    const jitterMs = isBurst ? 0 : Math.random() * this.backoffJitterSec * 1000;
     account.status = 'throttled';
     account.rateLimitedUntil = now + baseMs + jitterMs;
     account._lastBenchSec = Math.round((baseMs + jitterMs) / 1000);

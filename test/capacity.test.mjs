@@ -31,7 +31,11 @@ const mk = (opts = {}) => new AccountManager([
 
 // ── yellow: a deep streak (≥2) keeps the pool cautious even when not benched ───
 { const am = mk();
-  am.markRateLimited(0, null); am.markRateLimited(0, null);   // streak 2
+  // D-2286: build the streak SEQUENTIALLY (recover between 429s) — a concurrent burst
+  // is now debounced to streak 1, so two back-to-back calls no longer reach streak 2.
+  am.markRateLimited(0, null);
+  am.accounts[0].status = 'active'; am.accounts[0].rateLimitedUntil = 0; // bench expired + re-probed
+  am.markRateLimited(0, null);                                // sequential → streak 2
   am.accounts[0].status = 'active'; am.accounts[0].rateLimitedUntil = null; // bench cleared, streak kept
   const c = am.computeCapacity();
   ok('a deep 429 streak keeps the pool YELLOW (no bench)', c.verdict === 'yellow' && c.benched === 0); }

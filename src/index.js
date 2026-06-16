@@ -209,8 +209,21 @@ async function serverCommand() {
   // redirects console to the in-memory pane and the _addLog patch (tui.js) takes
   // over filing from there — so there is no double-write and no gap. The original
   // stdout/stderr are preserved (headless visibility + the pre-TUI startup flash).
+  // D-2286: swallow EPIPE/EIO on the std streams. When the controlling terminal
+  // (Daniel's Terminal.app tab) backgrounds, scrolls, or its pty buffer fills, a write
+  // to stdout/stderr raises EPIPE/EIO. Without these listeners Node turns that stream
+  // 'error' into an uncaughtException; the crash handler below then logged it via
+  // console.error → another terminal write → another EIO → a self-amplifying storm
+  // (06-15: 4.5M lines / 280MB in 5 min). The oplog FILE write is independent, so
+  // dropping the terminal write loses nothing.
+  for (const stream of [process.stdout, process.stderr]) {
+    stream.on('error', (e) => { if (e && (e.code === 'EPIPE' || e.code === 'EIO')) return; });
+  }
+
+  // opLogDir hoisted to serverCommand scope (D-2286) so the crash handlers below can
+  // write to the file directly, never through the patched (TUI-rerouted) console.
+  const opLogDir = resolveLogDir(config);
   {
-    const opLogDir = resolveLogDir(config);
     // D1DX (D-1728): 24h log retention — set the window + prune once at startup
     // (the opportunistic hourly prune in appendOpLog covers long-running uptime).
     setLogRetentionHours(config.logRetentionHours ?? 24);
@@ -218,8 +231,11 @@ async function serverCommand() {
     if (pruned > 0) console.log(`[TeamClaude] Pruned ${pruned} log file(s) older than ${config.logRetentionHours ?? 24}h`);
     const origLog = console.log;
     const origErr = console.error;
-    console.log = (...a) => { appendOpLog(opLogDir, a.join(' ')); origLog(...a); };
-    console.error = (...a) => { appendOpLog(opLogDir, a.join(' ')); origErr(...a); };
+    // D-2286: appendOpLog (file) is independent and always runs; the terminal write is
+    // wrapped so a synchronous EIO/EPIPE throw can't propagate out of console.* into
+    // the request path or the crash handler.
+    console.log = (...a) => { appendOpLog(opLogDir, a.join(' ')); try { origLog(...a); } catch {} };
+    console.error = (...a) => { appendOpLog(opLogDir, a.join(' ')); try { origErr(...a); } catch {} };
   }
 
   const server = createProxyServer(accountManager, config, hooks);
@@ -271,16 +287,37 @@ async function serverCommand() {
   // D-2236: process-level safety net. The per-request handler (server.js) catches
   // throws on the request path, but a throw OUTSIDE it — the startup warmer, the
   // ledger save, any timer — had no handler: Node would print to stderr and exit,
-  // killing the proxy with no oplog line (an invisible "crash"). console.* is tee'd
-  // to the daily oplog, so logging here makes such failures visible. We keep the
-  // proxy alive (each request still has its own try/catch); a genuinely corrupt
-  // state will surface as logged errors the operator can act on, which beats a
-  // silent death. saveLedger() on uncaught so usage state survives the event.
+  // killing the proxy with no oplog line (an invisible "crash"). We keep the proxy
+  // alive (each request still has its own try/catch); a genuinely corrupt state
+  // surfaces as logged errors the operator can act on. saveLedger() on uncaught so
+  // usage state survives the event.
+  //
+  // D-2286: EIO-safe crash logging. Do NOT route through console.error here — in TUI
+  // mode console.error is patched to _addLog → render() → process.stdout.write, so a
+  // crash CAUSED by an EIO terminal write would re-enter that same write and loop (the
+  // 06-15 storm). Write straight to the oplog FILE (independent of the terminal) plus a
+  // guarded raw stderr, behind a re-entrancy flag so a throw inside the handler can
+  // never re-arm it. A bare EPIPE/EIO is a terminal-write fault, not a real fault — skip
+  // it entirely (still saveLedger on uncaught).
+  let _inCrashHandler = false;
+  const crashLog = (label, detail) => {
+    if (_inCrashHandler) return;
+    _inCrashHandler = true;
+    try {
+      const line = `[TeamClaude] ${label}: ${detail}`;
+      try { appendOpLog(opLogDir, line); } catch {}
+      try { process.stderr.write(line + '\n'); } catch {}
+    } finally {
+      _inCrashHandler = false;
+    }
+  };
   process.on('unhandledRejection', (reason) => {
-    console.error(`[TeamClaude] Unhandled promise rejection: ${reason && reason.stack ? reason.stack : reason}`);
+    if (reason && (reason.code === 'EPIPE' || reason.code === 'EIO')) return;
+    crashLog('Unhandled promise rejection', reason && reason.stack ? reason.stack : reason);
   });
   process.on('uncaughtException', (err) => {
-    console.error(`[TeamClaude] Uncaught exception: ${err && err.stack ? err.stack : err}`);
+    if (err && (err.code === 'EPIPE' || err.code === 'EIO')) { try { accountManager.saveLedger(); } catch {} return; }
+    crashLog('Uncaught exception', err && err.stack ? err.stack : err);
     try { accountManager.saveLedger(); } catch {}
   });
 
