@@ -284,7 +284,8 @@ export class AccountManager {
     const current = this.accounts[this.currentIndex];
     // Sticky while the current account is usable; otherwise (re)pick the
     // least-loaded usable account. First-ever call always picks.
-    if (this._didBootSelect && current && this._isUsable(current) && this._fiveHourEligible(current)) {
+    if (this._didBootSelect && current && this._isUsable(current) && this._fiveHourEligible(current)
+        && !this._apikeyShouldYield(current)) {
       return current; // stay cache-warm (until it nears its 5h ceiling — never-stall)
     }
     this._didBootSelect = true;
@@ -320,7 +321,8 @@ export class AccountManager {
       // over-pace doesn't churn a warm session).
       const farOverLine = acct ? this._paceGap(acct) < -this.farOverLineThreshold : false;
       if (acct && warm && !this._isBlocked(acct) && !this._atHardLimit(acct)
-          && this._fiveHourEligible(acct) && !farOverLine) {
+          && this._fiveHourEligible(acct) && !farOverLine
+          && !this._apikeyShouldYield(acct)) {
         b.lastUsedAt = now;
         return acct;
       }
@@ -474,8 +476,14 @@ export class AccountManager {
    * — bounded by the caps so it drains without 429ing.
    */
   _pickAccountForBinding() {
-    const usable = this.accounts.filter(a => this._isUsable(a));
-    if (usable.length === 0) return this._soonestUsableOrNull();
+    const usableAll = this.accounts.filter(a => this._isUsable(a));
+    if (usableAll.length === 0) return this._soonestUsableOrNull();
+    // D1DX (D-2182): apikey accounts are a STRICT last resort. An apikey has no
+    // weekly line → flat-0 paceScore, which otherwise beats any OAuth account a
+    // hair over its pace-line (negative score) and parks PAID traffic while healthy
+    // Max headroom sits idle. Only fall to apikey when NO OAuth account is usable.
+    const oauthUsable = usableAll.filter(a => a.type !== 'apikey');
+    const usable = oauthUsable.length ? oauthUsable : usableAll;
     const { counts } = this._activeSessionCounts();
     const fiveHourOk = usable.filter(a => this._fiveHourEligible(a));
     const base = fiveHourOk.length ? fiveHourOk : usable;
@@ -493,6 +501,15 @@ export class AccountManager {
       if (ca !== cb) return ca < cb ? a : b;
       return (a._inflight || 0) < (b._inflight || 0) ? a : b;
     }, band[0]);
+  }
+
+  // D1DX (D-2182): true when `account` is the apikey last-resort AND at least one
+  // OAuth account is usable right now — so a session sitting on the paid apikey
+  // (from an OAuth-outage window) should yield back to Max. Gates the two sticky
+  // paths so apikey use never outlives the OAuth recovery.
+  _apikeyShouldYield(account) {
+    if (!account || account.type !== 'apikey') return false;
+    return this.accounts.some(a => a.type !== 'apikey' && this._isUsable(a));
   }
 
   // ── D1DX patch (D-1903): per-account in-flight accounting ──────────

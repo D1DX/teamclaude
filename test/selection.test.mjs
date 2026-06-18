@@ -64,5 +64,29 @@ const mk = () => new AccountManager([
 { const am = mk(); am.markRateLimited(0, 300); am.markRateLimited(2, 300);
   ok('the only usable account is selected when the others are throttled', am._pickAccountForBinding().name === 'a1'); }
 
+// ── D-2182: apikey is a STRICT last resort (never beats a usable OAuth account) ─
+const mkBk = () => new AccountManager([
+  { name: 'oa', type: 'oauth',  accessToken: 'x', refreshToken: 'r', expiresAt: Date.now() + 1e9 },
+  { name: 'ob', type: 'oauth',  accessToken: 'x', refreshToken: 'r', expiresAt: Date.now() + 1e9 },
+  { name: 'bk', type: 'apikey', apiKey: 'k' },
+], 0.98);
+
+// apikey NOT picked while any OAuth is usable — even when both OAuth are over their
+// pace-line (negative paceScore) and the apikey's flat-0 would otherwise win.
+{ const am = mkBk();
+  am.accounts[0].quota.unified7d = 0.95; am.accounts[1].quota.unified7d = 0.95;
+  ok('apikey NOT picked while OAuth usable (D-2182)', am._pickAccountForBinding().type === 'oauth'); }
+
+// apikey IS the last resort — picked only when no OAuth account is usable.
+{ const am = mkBk(); am.markRateLimited(0, 300); am.markRateLimited(1, 300);
+  ok('apikey picked only when all OAuth throttled (last resort)', am._pickAccountForBinding().name === 'bk'); }
+
+// sticky-yield: a session on the apikey migrates back to OAuth once it recovers.
+{ const am = mkBk(); am.markRateLimited(0, 300); am.markRateLimited(1, 300);
+  const first = am.getAccountForSession('s1');           // all OAuth down → binds apikey
+  am.accounts[0].rateLimitedUntil = null; am.accounts[0].status = 'active'; // oa recovers
+  const next = am.getAccountForSession('s1');
+  ok('session on apikey yields back to OAuth on recovery', first.name === 'bk' && next.type === 'oauth'); }
+
 console.log(`\n${pass} passed, ${fail} failed`);
 process.exit(fail === 0 ? 0 : 1);
