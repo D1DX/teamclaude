@@ -28,6 +28,34 @@ function makeAM({ account = null, hardCapped = false, backoff = 1 } = {}) {
   };
 }
 
+// D1DX (D-2420): stub with an apikey fallback. OAuth is gated until `recoverAfterMs`;
+// the apikey is returned ONLY when the hold loop passes allowApikey:true. Tracks
+// whether the paid key was actually fired and whether OAuth was served instead.
+function makeAMbk({ recoverAfterMs = null, hardCapped = false } = {}) {
+  const oauth  = { index: 0, name: 'oa', type: 'oauth',  credential: 'tok', status: 'active', quota: {} };
+  const apikey = { index: 1, name: 'bk', type: 'apikey', credential: 'k',   status: 'active', quota: {} };
+  let oauthUsable = false;
+  if (recoverAfterMs != null) setTimeout(() => { oauthUsable = true; }, recoverAfterMs);
+  return {
+    accounts: [oauth, apikey],
+    switchThreshold: 0.98,
+    firedApikey: false,
+    servedOAuth: false,
+    getAccountForSession(_sid, opts = {}) {
+      if (oauthUsable) { this.servedOAuth = true; return oauth; }       // OAuth preferred once usable
+      if (opts.allowApikey) { this.firedApikey = true; return apikey; } // last-resort admit
+      return null;                                                      // gated → server HOLDS
+    },
+    hasUsableApikey() { return true; },        // the paid key is always a usable fallback
+    allHardCapped() { return hardCapped; },
+    allThrottledBackoff() { return 1; },
+    ensureTokenFresh() {}, updateQuota() {}, markRateLimited() {},
+    noteSuccess() {}, noteAccountSuccess() {}, updateUsage() {}, getStatus() { return {}; },
+    noteInflightStart() {}, noteInflightEnd() {},
+    atInflightCap() { return false; }, tryReserveInflight() { return true; },
+  };
+}
+
 // Mock upstream that returns 200 JSON for any request.
 function startUpstream() {
   const srv = http.createServer((req, res) => {
@@ -114,6 +142,45 @@ const upPort = upstream.address().port;
   const proxy = await startProxy(am, upPort);
   const { status, ms } = await req(proxy.address().port, '/v1/messages');
   ok('E warm-slot held until a slot frees, then served 200 (no rebind)', status === 200 && ms >= 150);
+  proxy.close();
+}
+
+// ── D-2420 Case F: all OAuth throttled, apikey present, OAuth never recovers →
+//    HELD past the deadline, then served 200 via the PAID key (last resort) ──────
+{
+  const am = makeAMbk({ recoverAfterMs: null });
+  const proxy = await startProxy(am, upPort, {
+    allThrottledHoldBudgetSec: 10, holdPollSec: 0.2,
+    apikeyFallbackDeadlineSec: 0.6, apikeyLastResortLeadSec: 0.1, // fire ~0.5s
+  });
+  const { status, ms } = await req(proxy.address().port, '/v1/messages');
+  ok('F held to the deadline then served 200 via apikey', status === 200 && ms >= 400 && am.firedApikey && !am.servedOAuth);
+  proxy.close();
+}
+
+// ── D-2420 Case G: OAuth genuinely hard-capped, apikey present → key fires
+//    IMMEDIATELY (no pointless wait — subscriptions can't recover) ──────────────
+{
+  const am = makeAMbk({ hardCapped: true });
+  const proxy = await startProxy(am, upPort, {
+    allThrottledHoldBudgetSec: 10, holdPollSec: 0.2,
+    apikeyFallbackDeadlineSec: 5, apikeyLastResortLeadSec: 0.1,
+  });
+  const { status, ms } = await req(proxy.address().port, '/v1/messages');
+  ok('G hard-capped → apikey served immediately (< one poll)', status === 200 && ms < 150 && am.firedApikey);
+  proxy.close();
+}
+
+// ── D-2420 Case H (the gate): all OAuth throttled but one RECOVERS before the
+//    deadline → served 200 via OAuth; the paid key is NEVER touched ─────────────
+{
+  const am = makeAMbk({ recoverAfterMs: 200 });
+  const proxy = await startProxy(am, upPort, {
+    allThrottledHoldBudgetSec: 10, holdPollSec: 0.2,
+    apikeyFallbackDeadlineSec: 5, apikeyLastResortLeadSec: 0.1, // deadline far off
+  });
+  const { status, ms } = await req(proxy.address().port, '/v1/messages');
+  ok('H gate holds — OAuth recovery served, apikey never fired', status === 200 && ms >= 150 && am.servedOAuth && !am.firedApikey);
   proxy.close();
 }
 

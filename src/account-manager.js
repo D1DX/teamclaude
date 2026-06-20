@@ -279,7 +279,7 @@ export class AccountManager {
    * Get the best available account (sticky while the current one is preferred).
    * Returns null only if every account is hard-capped / throttled with no reset yet.
    */
-  getActiveAccount() {
+  getActiveAccount(opts = {}) {
     this._sweepAll();
     const current = this.accounts[this.currentIndex];
     // Sticky while the current account is usable; otherwise (re)pick the
@@ -289,7 +289,7 @@ export class AccountManager {
       return current; // stay cache-warm (until it nears its 5h ceiling — never-stall)
     }
     this._didBootSelect = true;
-    const chosen = this._pickAccountForBinding();
+    const chosen = this._pickAccountForBinding(opts);
     if (chosen) this._switchTo(chosen, `account "${chosen.name}" (pace: behind weekly line)`);
     return chosen;
   }
@@ -305,10 +305,10 @@ export class AccountManager {
    * session id (warmer / health checks / non-Claude-Code clients).
    * Returns null only when the pool is genuinely exhausted.
    */
-  getAccountForSession(sessionId) {
+  getAccountForSession(sessionId, opts = {}) {
     this._sweepAll();
     this._evictStaleBindings();
-    if (!sessionId) return this.getActiveAccount();
+    if (!sessionId) return this.getActiveAccount(opts);
 
     const now = Date.now();
     const b = this.sessionBindings.get(sessionId);
@@ -329,7 +329,7 @@ export class AccountManager {
     }
 
     // (Re)bind: no binding, window lapsed, or bound account blocked/capped.
-    const chosen = this._pickAccountForBinding();
+    const chosen = this._pickAccountForBinding(opts);
     if (!chosen) return null; // genuinely exhausted — server returns an honest 429
 
     const prevIdx = b?.index;
@@ -475,15 +475,27 @@ export class AccountManager {
    * or ramping near its reset) sits alone in the band and still concentrates load
    * — bounded by the caps so it drains without 429ing.
    */
-  _pickAccountForBinding() {
+  _pickAccountForBinding({ allowApikey = false } = {}) {
     const usableAll = this.accounts.filter(a => this._isUsable(a));
     if (usableAll.length === 0) return this._soonestUsableOrNull();
     // D1DX (D-2182): apikey accounts are a STRICT last resort. An apikey has no
     // weekly line → flat-0 paceScore, which otherwise beats any OAuth account a
     // hair over its pace-line (negative score) and parks PAID traffic while healthy
-    // Max headroom sits idle. Only fall to apikey when NO OAuth account is usable.
+    // Max headroom sits idle. OAuth is always preferred.
+    //
+    // D1DX (D-2420): the apikey is gated behind the all-throttled HOLD. When every
+    // OAuth account is throttled, normal binding (allowApikey=false) returns null
+    // so the server HOLDS and polls for an OAuth account to recover, instead of
+    // burning the PAID key on a transient header-less 429 (clears in ~60-140s).
+    // Only the hold-loop's last-resort attempt (server.js, after the max wait
+    // elapses or the pool is genuinely hard-capped) passes allowApikey=true to
+    // admit the apikey. _apikeyShouldYield still migrates a session off the apikey
+    // the moment an OAuth account recovers.
     const oauthUsable = usableAll.filter(a => a.type !== 'apikey');
-    const usable = oauthUsable.length ? oauthUsable : usableAll;
+    let usable;
+    if (oauthUsable.length) usable = oauthUsable;        // OAuth available → use it
+    else if (allowApikey) usable = usableAll;            // last resort → admit apikey
+    else return null;                                    // only apikey usable, not yet allowed → HOLD
     const { counts } = this._activeSessionCounts();
     const fiveHourOk = usable.filter(a => this._fiveHourEligible(a));
     const base = fiveHourOk.length ? fiveHourOk : usable;
@@ -510,6 +522,13 @@ export class AccountManager {
   _apikeyShouldYield(account) {
     if (!account || account.type !== 'apikey') return false;
     return this.accounts.some(a => a.type !== 'apikey' && this._isUsable(a));
+  }
+
+  // D1DX (D-2420): is there a usable apikey account to fall back to as the genuine
+  // last resort? The server's all-throttled HOLD loop checks this before firing the
+  // paid key (at the deadline, or immediately when the OAuth pool is hard-capped).
+  hasUsableApikey() {
+    return this.accounts.some(a => a.type === 'apikey' && this._isUsable(a));
   }
 
   // ── D1DX patch (D-1903): per-account in-flight accounting ──────────

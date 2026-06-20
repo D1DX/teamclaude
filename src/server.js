@@ -13,7 +13,8 @@ const HOP_BY_HOP_HEADERS = new Set([
 // createProxyServer from config; defaults cover configs predating the keys.
 // (Lives here, not on AccountManager, because D-1741 shares account-manager.js
 // with a live sibling session — see the D-1741 issue thread.)
-let HOLD = { budgetSec: 1800, pollSec: 5 };
+// D1DX (D-2420): apikeyDeadlineSec/apikeyLeadSec gate the paid-key last resort.
+let HOLD = { budgetSec: 1800, pollSec: 5, apikeyDeadlineSec: 300, apikeyLeadSec: 1 };
 
 export function createProxyServer(accountManager, config, hooks = {}) {
   const upstream = config.upstream || 'https://api.anthropic.com';
@@ -30,6 +31,16 @@ export function createProxyServer(accountManager, config, hooks = {}) {
   HOLD = {
     budgetSec: Number.isFinite(config.allThrottledHoldBudgetSec) ? config.allThrottledHoldBudgetSec : 1800,
     pollSec:   Number.isFinite(config.holdPollSec) ? config.holdPollSec : 5,
+    // D1DX (D-2420): paid-key last resort. Hold/poll for an OAuth account up to
+    // apikeyDeadlineSec, then fire the apikey apikeyLeadSec before that.
+    // IMPORTANT — a held request sends NO response headers, so Claude Code's
+    // CLAUDE_CODE_CONNECT_TIMEOUT_MS (default 60s) aborts+retries it well before
+    // 290s. This 290s default ASSUMES the box raised CLAUDE_CODE_CONNECT_TIMEOUT_MS
+    // (box-env.sh sets 660000) so the hold can run that long AND the key's own
+    // response still arrives inside the window. On a deploy WITHOUT that raise, set
+    // apikeyFallbackDeadlineSec ≤ ~45 so the key fires before the 60s client abort.
+    apikeyDeadlineSec: Number.isFinite(config.apikeyFallbackDeadlineSec) ? config.apikeyFallbackDeadlineSec : 290,
+    apikeyLeadSec:     Number.isFinite(config.apikeyLastResortLeadSec) ? config.apikeyLastResortLeadSec : 1,
   };
 
   if (logDir) {
@@ -199,7 +210,10 @@ async function forwardRequest(req, res, body, accountManager, upstream, retryCou
   // the cache window lapses. No header (warmer / health / non-CC) → global
   // getActiveAccount() fallback (unchanged behavior).
   const sessionId = req.headers['x-claude-code-session-id'] || null;
-  const account = accountManager.getAccountForSession(sessionId);
+  // D1DX (D-2420): the apikey is admitted only once the hold loop has set
+  // ctx.allowApikey (max wait elapsed, or pool hard-capped). Normal binds keep it
+  // gated so an all-OAuth-throttled pool returns null → HOLD, not the paid key.
+  const account = accountManager.getAccountForSession(sessionId, { allowApikey: ctx.allowApikey === true });
   if (!account) {
     // D1DX patch (D-1741): all accounts throttled at selection time — HOLD the
     // inference request and poll for one to free up, instead of returning a 429
@@ -551,27 +565,51 @@ async function holdForThrottle(req, res, body, accountManager, upstream, hooks, 
   if (!isInference) return sendAllThrottled429(res, accountManager, ctx);
 
   if (ctx.throttleHoldStart == null) ctx.throttleHoldStart = Date.now();
-  const budgetMs = HOLD.budgetSec * 1000;
   const elapsedMs = Date.now() - ctx.throttleHoldStart;
-  const remainingMs = budgetMs - elapsedMs;
+  if (res.destroyed) return;
 
-  // Give up: budget spent, client gone, or genuine exhaustion. allHardCapped is
-  // the real-vs-transient discriminator — a transiently-benched account is NOT
-  // hard-capped (its quota has headroom), so it is held for; a genuinely capped
-  // pool (quota ≥ ceiling / status rejected) resets hours out, so holding the
-  // full budget would just hang the agent before erroring anyway.
-  if (remainingMs <= 0 || res.destroyed || accountManager.allHardCapped()) {
-    if (res.destroyed) return;
+  // D1DX (D-2420): paid-key last resort. With a usable apikey configured, fire it
+  // — instead of holding further or 429ing — when EITHER (a) the OAuth pool is
+  // genuinely hard-capped (real weekly/5h exhaustion; resets hours out, holding
+  // can't recover it), OR (b) the max wait has elapsed (apikeyDeadlineSec minus a
+  // small lead, so the key fires just before the client's own request timeout).
+  // Subscriptions are ALWAYS tried first and to the maximum; the paid key is the
+  // very last thing before the request would otherwise fail. ctx.allowApikey opens
+  // the gate in _pickAccountForBinding for the re-attempt (OAuth is still preferred
+  // if one recovered in the same tick — allowApikey only widens the fallback).
+  const hasApikey = accountManager.hasUsableApikey?.() === true;
+  if (hasApikey) {
+    const fireAtMs = Math.max(0, (HOLD.apikeyDeadlineSec - HOLD.apikeyLeadSec) * 1000);
+    const hardCapped = accountManager.allHardCapped();
+    if (hardCapped || elapsedMs >= fireAtMs) {
+      ctx.allowApikey = true;
+      console.log(`[TeamClaude] apikey last-resort for ${reqId} after ${Math.round(elapsedMs / 1000)}s (${hardCapped ? 'OAuth hard-capped' : `deadline ${HOLD.apikeyDeadlineSec}s`})`);
+      return forwardRequest(req, res, body, accountManager, upstream, 0, hooks, reqId, ctx, logDir);
+    }
+  }
+
+  // No apikey to fall to (or not yet due): legacy D-1741 hold to the OAuth-recovery
+  // budget, then an honest reset-aware 429. allHardCapped short-circuits — holding a
+  // genuinely capped pool with no apikey would just hang the agent before erroring.
+  const remainingMs = HOLD.budgetSec * 1000 - elapsedMs;
+  if (remainingMs <= 0 || accountManager.allHardCapped()) {
     return sendAllThrottled429(res, accountManager, ctx);
   }
 
-  // Poll: short, anti-herd jitter, never past the remaining budget.
+  // Poll: short, anti-herd jitter. Never sleep past the OAuth-recovery budget, nor
+  // (when an apikey is configured) past the apikey fire point — so the key fires on
+  // time at the deadline rather than one poll late.
   const baseMs = HOLD.pollSec * 1000;
-  const waitMs = Math.min(remainingMs, baseMs + Math.floor(Math.random() * baseMs));
+  let ceilMs = remainingMs;
+  if (hasApikey) {
+    ceilMs = Math.min(ceilMs, Math.max(0, (HOLD.apikeyDeadlineSec - HOLD.apikeyLeadSec) * 1000 - elapsedMs));
+  }
+  const waitMs = Math.min(ceilMs, baseMs + Math.floor(Math.random() * baseMs));
 
   ctx.throttleHolds = (ctx.throttleHolds || 0) + 1;
   if (ctx.throttleHolds === 1 || ctx.throttleHolds % 6 === 0) {
-    console.log(`[TeamClaude] all accounts throttled — holding request ${reqId} (waited ${Math.round(elapsedMs / 1000)}s/${HOLD.budgetSec}s)`);
+    const cap = hasApikey ? `${HOLD.apikeyDeadlineSec}s→apikey` : `${HOLD.budgetSec}s`;
+    console.log(`[TeamClaude] all OAuth throttled — holding request ${reqId} (waited ${Math.round(elapsedMs / 1000)}s/${cap})`);
   }
   await new Promise(resolve => setTimeout(resolve, waitMs));
   if (res.destroyed) return;

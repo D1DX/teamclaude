@@ -77,16 +77,38 @@ const mkBk = () => new AccountManager([
   am.accounts[0].quota.unified7d = 0.95; am.accounts[1].quota.unified7d = 0.95;
   ok('apikey NOT picked while OAuth usable (D-2182)', am._pickAccountForBinding().type === 'oauth'); }
 
-// apikey IS the last resort — picked only when no OAuth account is usable.
+// ── D-2420: apikey gated behind the all-throttled HOLD (supersedes the D-2182
+//    "picked when all throttled" rule — the paid key must NOT be grabbed the instant
+//    OAuth goes throttled; the server HOLDS first, then admits the key via allowApikey).
+// Normal bind (allowApikey default false) with all OAuth throttled → null → the
+// server HOLDS and polls for an OAuth account to recover.
 { const am = mkBk(); am.markRateLimited(0, 300); am.markRateLimited(1, 300);
-  ok('apikey picked only when all OAuth throttled (last resort)', am._pickAccountForBinding().name === 'bk'); }
+  ok('all OAuth throttled + apikey present → bind returns null (HOLD, not the paid key)', am._pickAccountForBinding() === null); }
 
-// sticky-yield: a session on the apikey migrates back to OAuth once it recovers.
+// hasUsableApikey reports a fallback exists (the hold loop checks this before firing).
 { const am = mkBk(); am.markRateLimited(0, 300); am.markRateLimited(1, 300);
-  const first = am.getAccountForSession('s1');           // all OAuth down → binds apikey
+  ok('hasUsableApikey() true when a usable apikey exists', am.hasUsableApikey() === true); }
+
+// The last-resort attempt (allowApikey:true) DOES pick the apikey when no OAuth usable.
+{ const am = mkBk(); am.markRateLimited(0, 300); am.markRateLimited(1, 300);
+  ok('apikey admitted only with allowApikey (last-resort attempt)', am._pickAccountForBinding({ allowApikey: true }).name === 'bk'); }
+
+// allowApikey still never beats a usable OAuth account (OAuth always preferred).
+{ const am = mkBk();
+  ok('OAuth preferred even when allowApikey is set', am._pickAccountForBinding({ allowApikey: true }).type === 'oauth'); }
+
+// sticky-yield: a session bound to the apikey (via the last-resort attempt) migrates
+// back to OAuth once one recovers (D-2182 _apikeyShouldYield preserved).
+{ const am = mkBk(); am.markRateLimited(0, 300); am.markRateLimited(1, 300);
+  const first = am.getAccountForSession('s1', { allowApikey: true }); // last-resort bind → apikey
   am.accounts[0].rateLimitedUntil = null; am.accounts[0].status = 'active'; // oa recovers
-  const next = am.getAccountForSession('s1');
+  const next = am.getAccountForSession('s1');                          // normal bind → yields to OAuth
   ok('session on apikey yields back to OAuth on recovery', first.name === 'bk' && next.type === 'oauth'); }
+
+// gate: a normal session bind never lands on the apikey while OAuth is throttled —
+// getAccountForSession returns null so the server HOLDS (no eager paid-key bind).
+{ const am = mkBk(); am.markRateLimited(0, 300); am.markRateLimited(1, 300);
+  ok('normal session bind returns null while OAuth throttled (no eager apikey)', am.getAccountForSession('s2') === null); }
 
 console.log(`\n${pass} passed, ${fail} failed`);
 process.exit(fail === 0 ? 0 : 1);
