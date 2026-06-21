@@ -1690,4 +1690,30 @@ export class AccountManager {
       })),
     };
   }
+
+  // D-2485: full Deck-render snapshot — a SUPERSET of getStatus() carrying
+  // everything tui.js render() consumes, so a read-only viewer (`teamclaude
+  // watch`) can render the IDENTICAL Deck from a polled JSON snapshot without
+  // being the server (no port bind, no second pooling process). Single source
+  // of truth: it reuses getStatus() plus the same fleet/ledger accessors the
+  // live Deck reads, so the viewer can never drift from the real Deck.
+  //   getStatus() already gives accounts/quota/usage/capacity/system/
+  //   sessionBindings/sessionAggregate/usageByIssue. The Deck additionally
+  //   reads currentIndex (current-account ►), fleetRows() (the registry spine),
+  //   and ledgerBySid() (cluster idle agents under their last account). The
+  //   per-request spinner rows are NOT pollable (sub-second, no HTTP surface),
+  //   so we publish a scalar activeLLM count for the Top "N LLM" line instead.
+  getDeckSnapshot() {
+    const status = this.getStatus(); // sweeps + builds the shared sections
+    return {
+      ...status,
+      currentIndex: this.currentIndex,
+      // live concurrent upstream calls across the pool → the Top "N LLM" line
+      activeLLM: this.accounts.reduce((s, a) => s + (a._inflight || 0), 0),
+      fleet: this.fleetRows(),
+      // Map<bareSid,{account,lastActiveAt}> isn't JSON-serializable — flatten to
+      // a plain object; the viewer's DeckSnapshotSource rebuilds the Map.
+      ledgerBySid: Object.fromEntries(this.ledgerBySid()),
+    };
+  }
 }

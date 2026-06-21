@@ -158,12 +158,21 @@ const SEVEN_D_MS = 7 * 24 * 60 * 60 * 1000;
 // ── TUI class ────────────────────────────────────────────────
 
 export class TUI {
-  constructor({ accountManager, config, saveConfig, syncAccounts, onQuit }) {
+  constructor({ accountManager, config, saveConfig, syncAccounts, onQuit, readOnly = false }) {
     this.am = accountManager;
     this.config = config;
     this.saveConfig = saveConfig;
     this.syncAccounts = syncAccounts;
     this.onQuit = onQuit;
+    // D-2485: read-only viewer (`teamclaude watch`). When true the Deck renders
+    // a polled snapshot of a SEPARATE running proxy — it owns no AccountManager,
+    // no server, no config to mutate. Mutation keys (s/r/a/R) are disabled, the
+    // console-capture patch is skipped (no server log stream to absorb), and a
+    // WATCH / connection banner is shown. activeLLM + connState are pushed in by
+    // the watch driver each poll.
+    this.readOnly = !!readOnly;
+    this.activeCount = null;                 // D-2485: snapshot in-flight count (Top "N LLM")
+    this.connState = { ok: true, msg: '' };  // D-2485: watch poll connection state
 
     this.log = [];           // completed activity entries
     this.active = new Map(); // in-flight requests
@@ -218,11 +227,15 @@ export class TUI {
     process.stdin.on('data', this._dataHandler);
     process.stdout.on('resize', this._resizeHandler);
 
-    // Redirect console to activity log
-    this._origLog = console.log;
-    this._origErr = console.error;
-    console.log = (...a) => this._addLog(a.join(' '));
-    console.error = (...a) => this._addLog(a.join(' '));
+    // Redirect console to activity log. D-2485: skip in read-only watch mode —
+    // there is no server console stream to absorb, and hijacking console.error
+    // would swallow the watch driver's own poll-error reporting.
+    if (!this.readOnly) {
+      this._origLog = console.log;
+      this._origErr = console.error;
+      console.log = (...a) => this._addLog(a.join(' '));
+      console.error = (...a) => this._addLog(a.join(' '));
+    }
 
     this.render();
     this.timer = setInterval(() => {
@@ -235,8 +248,10 @@ export class TUI {
     this.running = false;
     if (this.timer) { clearInterval(this.timer); this.timer = null; }
     if (this._origLog) { console.log = this._origLog; console.error = this._origErr; }
-    process.stdin.removeListener('data', this._dataHandler);
-    process.stdout.removeListener('resize', this._resizeHandler);
+    // D-2485: guard against stop() before start() (the listeners aren't installed
+    // yet) so the read-only viewer can quit safely on any path.
+    if (this._dataHandler) process.stdin.removeListener('data', this._dataHandler);
+    if (this._resizeHandler) process.stdout.removeListener('resize', this._resizeHandler);
     process.stdout.write(`${ESC}?25h${ESC}?1049l`);
     try { process.stdin.setRawMode(false); } catch {}
     process.stdin.pause();
@@ -307,6 +322,21 @@ export class TUI {
   }
 
   _keyNormal(k) {
+    // D-2485: read-only watch viewer — only quit + the harmless view toggles.
+    // Account mutation (s/r/a) + config reload (R) are disabled; the viewer owns
+    // no AccountManager/config to change.
+    if (this.readOnly) {
+      if (k === 'q') { this.stop(); this.onQuit?.(); }
+      else if (k === 'b') {
+        this.bell = this.bell === false;
+        this._addLog('Alert bell ' + (this.bell === false ? 'muted' : 'on'));
+      }
+      else if (k === 'i') {
+        this.byIssueExpanded = !this.byIssueExpanded;
+        if (this.running) this.render();
+      }
+      return;
+    }
     if (k === 'q') { this.stop(); this.onQuit?.(); }
     else if (k === 's' && this.am.accounts.length > 0) {
       this.mode = 'select'; this.selAction = 'switch'; this.selIdx = this.am.currentIndex;
@@ -519,11 +549,23 @@ export class TUI {
     };
 
     // ── Header
-    const left = bold(' TeamClaude');
+    // D-2485: in the read-only watch viewer, tag the title + flip the up/down
+    // marker to the WATCHED proxy's reachability (not this process — the viewer
+    // is never a server).
+    const watchTag = this.readOnly
+      ? '  ' + (this.connState.ok ? yellow('👁 WATCH (read-only)') : red('⚠ WATCH — disconnected'))
+      : '';
+    const left = bold(' TeamClaude') + watchTag;
     const port = this.config.proxy?.port || 3456;
-    const right = `Port ${port} ${green('▲')} `;
+    const upMark = (this.readOnly && !this.connState.ok) ? red('▼') : green('▲');
+    const right = `Port ${port} ${upMark} `;
     lines.push(left + ' '.repeat(Math.max(1, W - vw(left) - vw(right))) + right);
     lines.push(' ' + dim('─'.repeat(W - 2)));
+    // D-2485: a loud retry banner while the watched proxy is unreachable; the
+    // frozen last-known snapshot stays visible below it.
+    if (this.readOnly && !this.connState.ok) {
+      lines.push(' ' + red(this.connState.msg || `proxy unreachable on :${port} — retrying…`));
+    }
 
     // D-1728 S8: system resource snapshot — rendered via _healthPanel in the Top section (D-2169).
     const sys = this.am.systemSnapshot ? this.am.systemSnapshot() : null;
@@ -647,7 +689,10 @@ export class TUI {
         // as ☂, never ↳), so solo · ☂ · ↳ always sums to agents.length.
         const childOnly = [...childSet].filter(a => !umbrellaLeadSet.has(a)).length;
         const independent = agents.filter(a => !umbrellaLeadSet.has(a) && !childSet.has(a)).length;
-        const runningLLM = this.active.size;  // in-flight upstream API calls through proxy
+        // in-flight upstream API calls through proxy. D-2485: the watch viewer has
+        // no per-request hooks (this.active stays empty), so prefer the scalar
+        // activeLLM count polled from the snapshot; live mode falls back to the set.
+        const runningLLM = this.activeCount != null ? this.activeCount : this.active.size;
         const runningTools = agents.filter(a => a.inflight).length;
 
         lines.push('');
@@ -1102,6 +1147,11 @@ export class TUI {
   }
 
   _renderFooter() {
+    // D-2485: read-only watch viewer — only the non-mutating keys are live.
+    if (this.readOnly) {
+      const conn = this.connState.ok ? green('● live') : red('● reconnecting');
+      return ` ${conn}  ${bold('b')}ell${this.bell === false ? gray('·muted') : ''}  ${bold('i')}ssues${this.byIssueExpanded ? gray('·all') : ''}  ${bold('q')}uit  ${gray('· read-only viewer')}`;
+    }
     switch (this.mode) {
       case 'normal':
         return ` ${bold('s')}witch  ${bold('a')}dd  ${bold('r')}emove  ${bold('R')}eload  ${bold('b')}ell${this.bell === false ? gray('·muted') : ''}  ${bold('i')}ssues${this.byIssueExpanded ? gray('·all') : ''}  ${bold('q')}uit`;

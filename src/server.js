@@ -79,6 +79,16 @@ export function createProxyServer(accountManager, config, hooks = {}) {
         return;
       }
 
+      // D-2485: full Deck snapshot — everything tui.js render() needs, so
+      // `teamclaude watch` can render the live Deck READ-ONLY (no port bind, no
+      // second server). Localhost + x-api-key gated exactly like /status; served
+      // locally, never routed upstream, never logged.
+      if (req.method === 'GET' && req.url === '/teamclaude/deck') {
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ ...accountManager.getDeckSnapshot(), build: BUILD }, null, 2));
+        return;
+      }
+
       // D1DX patch (D-1903): local health endpoint. A bare `GET`/`HEAD /` (and
       // `/health`) is a connectivity probe Claude Code / monitors fire ~every 30s.
       // Anthropic returns 404 for it, so WITHOUT this short-circuit every probe is
