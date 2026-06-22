@@ -231,11 +231,11 @@ async function serverCommand() {
   // over filing from there — so there is no double-write and no gap. The original
   // stdout/stderr are preserved (headless visibility + the pre-TUI startup flash).
   // D-2286: swallow EPIPE/EIO on the std streams. When the controlling terminal
-  // (Daniel's Terminal.app tab) backgrounds, scrolls, or its pty buffer fills, a write
+  // backgrounds, scrolls, or its pty buffer fills, a write
   // to stdout/stderr raises EPIPE/EIO. Without these listeners Node turns that stream
   // 'error' into an uncaughtException; the crash handler below then logged it via
   // console.error → another terminal write → another EIO → a self-amplifying storm
-  // (06-15: 4.5M lines / 280MB in 5 min). The oplog FILE write is independent, so
+  // (observed once as a multi-million-line log storm within minutes). The oplog FILE write is independent, so
   // dropping the terminal write loses nothing.
   for (const stream of [process.stdout, process.stderr]) {
     stream.on('error', (e) => { if (e && (e.code === 'EPIPE' || e.code === 'EIO')) return; });
