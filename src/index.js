@@ -275,10 +275,14 @@ async function serverCommand() {
     clearTimeout(deadline);
   }
 
-  // D-1644: bind loopback-only (::1) instead of the default 0.0.0.0/:: wildcard,
-  // so the proxy is reachable only from this host (not LAN/tailnet). localhost
-  // resolves to ::1 first on macOS, which is the path Claude Code already uses.
-  server.listen(port, '::1', () => {
+  // D-1644: bind loopback-only (::1) by default — reachable only from this host
+  // (not LAN/tailnet); localhost resolves to ::1 first on macOS, the path Claude
+  // Code already uses. D-2646: TEAMCLAUDE_BIND overrides the bind address for the
+  // vultr-main containerized deploy, where the netns-shared inbound DNAT arrives
+  // on the tailscale/eth iface (not loopback) so the server must bind 0.0.0.0.
+  // Exposure stays tailnet-only via the host port map on the netns sidecar.
+  const bindAddr = process.env.TEAMCLAUDE_BIND || '::1';
+  server.listen(port, bindAddr, () => {
     if (tui) {
       tui.start();
       console.log(`Listening on port ${port} with ${accounts.length} account(s) (build ${BUILD})`);
