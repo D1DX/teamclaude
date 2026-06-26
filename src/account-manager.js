@@ -141,6 +141,9 @@ export class AccountManager {
       type: acct.type,
       accountUuid: acct.accountUuid || null,
       credential: acct.accessToken || acct.apiKey,
+      upstream: acct.upstream || null,   // D-2655: per-account upstream override (GLM/OpenRouter last-resort)
+      model: acct.model || null,         // D-2655: rewrite body.model for this account
+      provider: acct.provider || null,   // D-2655: OpenRouter provider routing (fp8 pin)
       refreshToken: acct.refreshToken || null,
       expiresAt: acct.expiresAt || null,
       status: 'active',
@@ -1535,6 +1538,9 @@ export class AccountManager {
       type: acctData.type,
       accountUuid: acctData.accountUuid || null,
       credential: acctData.accessToken || acctData.apiKey,
+      upstream: acctData.upstream || null,   // D-2655
+      model: acctData.model || null,         // D-2655
+      provider: acctData.provider || null,   // D-2655
       refreshToken: acctData.refreshToken || null,
       expiresAt: acctData.expiresAt || null,
       status: 'active',

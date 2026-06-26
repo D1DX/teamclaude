@@ -318,7 +318,31 @@ async function forwardRequest(req, res, body, accountManager, upstream, retryCou
     headers['x-api-key'] = account.credential;
   }
 
-  const upstreamUrl = `${upstream}${req.url}`;
+  // --- D1DX patch (D-2655): per-account upstream + model override for the
+  // apikey last-resort (GLM-5.2 via OpenRouter). Fires ONLY for an apikey
+  // account that declares its own `upstream`; OAuth + plain Anthropic-apikey
+  // are untouched. Rewrites body.model, pins the fp8 provider, swaps to Bearer.
+  let effectiveUpstream = upstream;
+  let outBody = body;
+  if (account.type === 'apikey' && account.upstream) {
+    effectiveUpstream = account.upstream;
+    if (account.model && body.length > 0) {
+      try {
+        const parsed = JSON.parse(body.toString());
+        parsed.model = account.model;
+        if (account.provider) parsed.provider = account.provider;
+        outBody = Buffer.from(JSON.stringify(parsed));
+        for (const k of Object.keys(headers)) {
+          if (k.toLowerCase() === 'content-length') delete headers[k];
+        }
+      } catch { /* non-JSON body — forward unchanged */ }
+    }
+    delete headers['x-api-key'];
+    headers['authorization'] = `Bearer ${account.credential}`;
+  }
+  // --- end D1DX patch (D-2655) ---
+
+  const upstreamUrl = `${effectiveUpstream}${req.url}`;
   const method = req.method;
 
   // Build log sections
@@ -355,7 +379,7 @@ async function forwardRequest(req, res, body, accountManager, upstream, retryCou
     const upstreamRes = await fetch(upstreamUrl, {
       method,
       headers,
-      body: ['GET', 'HEAD'].includes(method) ? undefined : body,
+      body: ['GET', 'HEAD'].includes(method) ? undefined : outBody,
       redirect: 'manual',
     });
 
