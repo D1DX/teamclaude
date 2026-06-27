@@ -590,7 +590,11 @@ export class TUI {
       typeof l === 'string' && /^orchestrator(:child)?$/i.test(l);
 
     // resolve every registry agent → account (current OR last-known) + live data
-    const agents = fleet.map(f => {
+    // D-2697: on a CENTRALIZED proxy fleetRows() is empty (the registry / sessions.json
+    // lives client-side), so per-session rows + the Accounts agent rows were blank even
+    // with sessions bound. Fall back to the live binding summary — real session rows
+    // (sid · account · tokens · state), minus the client-only emoji/issue identity.
+    const agents = fleet.length ? fleet.map(f => {
       const bare = bareOf(f.sid);
       const b = bindByBare.get(bare) || null;
       return {
@@ -608,7 +612,15 @@ export class TUI {
         // D-1827: raw labels array (null if pc-current hasn't written them yet).
         labels: f.labels || f.pin?.labels || null,
       };
-    });
+    }) : binds.map(b => ({
+      emoji: null, issue: b.issue || null, intent: b.intent || null,
+      sid8: b.sid8 || bareOf(b.fullSid).slice(0, 8),
+      status: b.status || null, needsYou: !!b.needsYou,
+      inflight: false, // per-session in-flight isn't carried in the binding summary
+      account: b.account || null, bound: true, warm: !!b.warm, idleSec: b.idleSec ?? null,
+      tokens: b.tokens || 0, inTok: b.inputTokens || 0, outTok: b.outputTokens || 0, cost: b.cost || 0,
+      issueId: null, parentId: null, title: b.title || null, labels: null,
+    }));
 
     // D-2697: central-Deck fallback — on a centralized proxy the registry fleet
     // (sessions.json) is client-side, so `fleet` is empty even with live sessions
@@ -1002,9 +1014,17 @@ export class TUI {
     // ── Activity header
     lines.push('');
     const ac = this.active.size;
-    lines.push(sectionHdr('Activity', ac > 0 ? cyan(ac + ' active') : ''));
+    // D-2697: a `watch` viewer has no pollable live-request stream nor oplog
+    // (this.active / this.log come from the SERVING proxy's console, not the polled
+    // snapshot), so the Activity panel was permanently blank in watch mode. When both
+    // are empty but sessions are bound, show the live sessions as the activity view.
+    const centralActivity = ac === 0 && this.log.length === 0 && agents.length > 0;
+    const actHdr = ac > 0 ? cyan(ac + ' active')
+      : centralActivity ? cyan(agents.length + (agents.length === 1 ? ' session' : ' sessions'))
+      : '';
+    lines.push(sectionHdr('Activity', actHdr));
 
-    // Active requests
+    // Active requests (pollable only when this viewer IS the serving proxy)
     const now = Date.now();
     for (const [, r] of this.active) {
       const el = ((now - r.started) / 1000).toFixed(1);
@@ -1013,15 +1033,30 @@ export class TUI {
       lines.push(` ${sp} ${gray(r.t)}  ${r.method} ${r.path}${a} ${dim(`(${el}s...)`)}`);
     }
 
-    // Completed log
-    // D-1820 Req 8: color activity rows by severity (error=red, warn=yellow, else plain).
     const footerH = 2;
     const space = Math.max(0, H - lines.length - footerH);
-    for (let i = 0; i < space && i < this.log.length; i++) {
-      const { t, msg } = this.log[i];
-      const sev = this._logSeverity(msg);
-      const coloredMsg = sev === 'error' ? red(msg) : sev === 'warn' ? yellow(msg) : msg;
-      lines.push(`   ${gray(t)}  ${coloredMsg}`);
+    if (centralActivity) {
+      // D-2697: per-session activity rows from the live bindings (warm-first, then most
+      // recently active), minus the client-only emoji/issue. The flat fleet-activity view
+      // the central Deck can build without a per-client presence feed.
+      const rows = [...agents].sort((x, y) =>
+        (Number(y.warm) - Number(x.warm)) || ((x.idleSec ?? 1e9) - (y.idleSec ?? 1e9)) || (y.tokens - x.tokens));
+      for (let i = 0; i < space && i < rows.length; i++) {
+        const a = rows[i];
+        const dot  = a.warm ? green('●') : gray('○');
+        const st   = a.warm ? green('live') : gray(a.idleSec != null ? `idle ${Math.round(a.idleSec / 60)}m` : 'idle');
+        const acct = gray('→ ' + (a.account || '?'));
+        const cst  = a.cost ? ' · ' + green(fmtCost(a.cost)) : '';
+        lines.push(` ${dot} ${cyan(a.sid8)} ${acct}  ${green(fmtN(a.tokens) + ' tok')}${cst} · ${st}`);
+      }
+    } else {
+      // Completed log — D-1820 Req 8: color by severity (error=red, warn=yellow, else plain).
+      for (let i = 0; i < space && i < this.log.length; i++) {
+        const { t, msg } = this.log[i];
+        const sev = this._logSeverity(msg);
+        const coloredMsg = sev === 'error' ? red(msg) : sev === 'warn' ? yellow(msg) : msg;
+        lines.push(`   ${gray(t)}  ${coloredMsg}`);
+      }
     }
 
     // Pad to fill
