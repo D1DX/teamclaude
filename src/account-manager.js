@@ -122,6 +122,12 @@ function emptyQuota() {
   };
 }
 
+// D-2697: wall-clock time string, byte-identical to tui.js's timestamp() so the
+// server-side Activity ring renders the same as the interactive Deck's.
+function _actTimestamp() {
+  return new Date().toLocaleTimeString('en-US', { hour12: false });
+}
+
 export class AccountManager {
   // D1DX — capacity-aware routing (D-2179). Max OAuth accounts send NO rate-limit
   // headers (anthropic-ratelimit-unified-*), so the prior pace-to-line model ran
@@ -251,6 +257,16 @@ export class AccountManager {
     // D1DX (D-2169): per-model price overrides (family → [in$, out$] per Mtok).
     // Falls back to the PRICING table above per family.
     this.pricing = opts.pricing ?? null;
+
+    // ── D-2697: server-side live request stream (Activity panel) ──
+    // In the centralized/headless mode there is no interactive TUI to track the
+    // in-flight requests + completed log (those lived only on the TUI instance,
+    // tui.js:262-286). So AccountManager keeps its OWN in-memory active-map +
+    // recent-log ring, fed by the same server hooks (wired in index.js when
+    // !useTUI). getDeckSnapshot() ships them and a remote `watch` viewer renders
+    // the ORIGINAL Activity panel from them — no port bind, no second server.
+    this._active = new Map(); // reqId -> { method, path, account, t, started }
+    this._log = [];           // [{ t, msg }] newest-first, capped at LOG_CAP
   }
 
   // D1DX (D-2169): resolve $/Mtok [input, output] for a model string. Family
@@ -1665,6 +1681,36 @@ export class AccountManager {
     }));
   }
 
+  // ── D-2697: live request stream hooks ──────────────────────
+  // Mirror tui.js's onRequestStart/Routed/End (262-286) so the centralized
+  // headless proxy tracks the same active-map + log ring the interactive Deck
+  // does. Wired into the server in index.js when !useTUI. NOTE: unlike the TUI
+  // version these DO NOT persist to the daily oplog file — in headless mode the
+  // console tee (index.js) already files non-2xx lines, so persisting here too
+  // would double-write. The ring is purely the live-snapshot source.
+  onRequestStart(id, info) {
+    this._active.set(id, { ...info, t: _actTimestamp(), started: Date.now(), account: null });
+  }
+
+  onRequestRouted(id, info) {
+    const r = this._active.get(id);
+    if (r) r.account = info.account;
+  }
+
+  onRequestEnd(id, info) {
+    const r = this._active.get(id);
+    this._active.delete(id);
+    const dur = r ? ((Date.now() - r.started) / 1000).toFixed(1) : '?';
+    const acct = info.account || r?.account || '?';
+    this._addLog(`${info.method} ${info.path} → ${acct} (${info.status}, ${dur}s)`);
+  }
+
+  _addLog(msg) {
+    msg = msg.replace(/^\[TeamClaude\]\s*/, '');
+    this._log.unshift({ t: _actTimestamp(), msg });
+    if (this._log.length > 200) this._log.length = 200;
+  }
+
   /**
    * Return a status summary of all accounts (safe to expose, no credentials).
    */
@@ -1716,6 +1762,13 @@ export class AccountManager {
       currentIndex: this.currentIndex,
       // live concurrent upstream calls across the pool → the Top "N LLM" line
       activeLLM: this.accounts.reduce((s, a) => s + (a._inflight || 0), 0),
+      // D-2697: the live request stream for the Activity panel. The Map isn't
+      // JSON-serializable → flatten to an array carrying the reqId; the viewer's
+      // watch loop rebuilds the Map the TUI's Activity render reads. `log` is
+      // already the {t,msg} shape the render consumes. Empty in interactive mode
+      // (the TUI tracks its own active/log there); populated when headless.
+      active: [...this._active.entries()].map(([id, r]) => ({ id, ...r })),
+      log: this._log,
       fleet: this.fleetRows(),
       // Map<bareSid,{account,lastActiveAt}> isn't JSON-serializable — flatten to
       // a plain object; the viewer's DeckSnapshotSource rebuilds the Map.

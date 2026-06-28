@@ -610,6 +610,29 @@ export class TUI {
       };
     });
 
+    // D-2697: central-Deck fallback — on a centralized proxy the registry fleet
+    // (sessions.json) is client-side, so `fleet` is empty even with live sessions
+    // bound. Synthesize `agents` from the live session bindings so the fleet
+    // header counts (N agents · M warm · L LLM) + the per-account session rows
+    // reflect real activity centrally. The client-only fields (emoji / issue /
+    // pin status / umbrella linkage) aren't on the central proxy, so they render
+    // as their nil forms (sid8 instead of an issue label, no ☂/↳ tree); the live
+    // token / warm / idle / account / cost data is all present in the binding.
+    if (agents.length === 0 && binds.length) {
+      for (const b of binds) {
+        const bare = bareOf(b.fullSid);
+        agents.push({
+          emoji: null, issue: null, intent: null, sid8: bare.slice(0, 8),
+          status: null, needsYou: false, inflight: false,
+          account: b.account || null,
+          bound: true, warm: b.warm || false, idleSec: b.idleSec ?? null,
+          tokens: b.tokens || 0, inTok: b.inputTokens || 0, outTok: b.outputTokens || 0,
+          cost: b.cost || 0,
+          issueId: null, parentId: null, title: null, labels: null,
+        });
+      }
+    }
+
     // collisions + attention counts across the whole fleet
     const issueCount = new Map();
     for (const a of agents) if (a.issue) issueCount.set(a.issue, (issueCount.get(a.issue) || 0) + 1);
@@ -886,9 +909,16 @@ export class TUI {
         const list = byAcct.get(acct.name) || [];
         let rin = 0, rout = 0, live = 0;
         for (const a of list) { rin += a.inTok; rout += a.outTok; if (a.warm) live++; }
+        const _bn = binds.filter(b => b.account === acct.name);           // D-2697: central-Deck chat count from session bindings (fleet rows are client-side)
+        const _bnLive = _bn.filter(b => b.warm).length;
+        const _bnTok = _bn.reduce((s, b) => s + (b.tokens || 0), 0);
+        const actN = (acct.inflight != null ? acct.inflight : (acct._inflight || 0)); // D-2697: per-account live in-flight (requests executing now)
+        const actChip = actN ? ' · ' + cyan(actN + ' active') : '';
         const roll = list.length
-          ? `${cyan(list.length + (list.length === 1 ? ' agent' : ' agents'))}${live ? ' · ' + green(live + ' live') : ''} · ${green(fmtN(rin + rout) + ' tok')}`
-          : gray('· no agents ·');
+          ? `${cyan(list.length + (list.length === 1 ? ' agent' : ' agents'))}${live ? ' · ' + green(live + ' live') : ''}${actChip} · ${green(fmtN(rin + rout) + ' tok')}`
+          : _bn.length
+            ? `${cyan(_bn.length + (_bn.length === 1 ? ' chat' : ' chats'))}${_bnLive ? ' · ' + green(_bnLive + ' live') : ''}${actChip} · ${green(fmtN(_bnTok) + ' tok')}`
+            : gray('· no agents ·');
         lines.push('');
         lines.push(this._renderAcctHeader(i, bw, showBoth, roll));
         if (!list.length) continue;

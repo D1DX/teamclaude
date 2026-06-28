@@ -222,6 +222,17 @@ async function serverCommand() {
       onRequestRouted: (id, info) => tui.onRequestRouted(id, info),
       onRequestEnd: (id, info) => tui.onRequestEnd(id, info),
     };
+  } else {
+    // D-2697: headless/centralized mode has no TUI to track the live request
+    // stream, so feed AccountManager's in-memory active-map + log ring directly.
+    // getDeckSnapshot() then ships them and a remote `teamclaude watch` viewer
+    // renders the ORIGINAL Activity panel — the live request log the interactive
+    // Deck has always shown, now visible centrally.
+    hooks = {
+      onRequestStart: (id, info) => accountManager.onRequestStart(id, info),
+      onRequestRouted: (id, info) => accountManager.onRequestRouted(id, info),
+      onRequestEnd: (id, info) => accountManager.onRequestEnd(id, info),
+    };
   }
 
   // D-1680: tee the operational console stream to a daily file. Installed BEFORE
@@ -679,6 +690,12 @@ async function watchCommand() {
       const snap = await res.json();
       source.update(snap);
       tui.activeCount = snap.activeLLM ?? 0;
+      // D-2697: feed the live request stream into the viewer's Activity panel.
+      // The snapshot now carries active rows (flattened from the server's Map)
+      // + the recent log; rebuild the Map the TUI's Activity render reads
+      // (tui.js:951-972) so the centralized Deck shows the live request log.
+      tui.active = new Map((snap.active || []).map(r => [r.id, r]));
+      tui.log = Array.isArray(snap.log) ? snap.log : [];
       tui.connState = { ok: true, msg: '' };
     } catch (err) {
       // Keep the last-known snapshot visible behind the banner; just retry.
