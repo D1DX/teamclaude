@@ -1654,6 +1654,42 @@ export class AccountManager {
   }
 
   /**
+   * D-2805: on-demand "mint" of the headroom OAuth accounts — start each
+   * account's 5h window EARLY (the morning primer curls POST /teamclaude/warm).
+   * Warms ONLY OAuth accounts under `threshold` weekly utilization, reusing
+   * warmOne → ensureTokenFresh (the coalesced per-PROCESS refresh) so an expired
+   * token is refreshed CLOBBER-SAFELY by the running proxy itself, never a second
+   * process racing the shared token store into invalid_grant (D-2286). A capped
+   * account is skipped (a warm can't help it until reset). Best-effort per
+   * account; never throws. Returns a summary the caller serializes as JSON.
+   */
+  async warmHeadroom(threshold = 0.90, upstream = 'https://api.anthropic.com') {
+    const minted = [];
+    const skipped = [];
+    for (const account of this.accounts) {
+      if (account.type !== 'oauth') { skipped.push({ name: account.name, reason: 'not oauth' }); continue; }
+      const u7 = account.quota?.unified7d;
+      if (u7 != null && u7 >= threshold) {
+        skipped.push({ name: account.name, reason: `weekly ${(u7 * 100).toFixed(0)}% ≥ ${(threshold * 100).toFixed(0)}% (capped)` });
+        continue;
+      }
+      try {
+        const status = await this.warmOne(account, upstream);
+        minted.push({
+          name: account.name,
+          status,
+          unified5h: account.quota?.unified5h ?? null,
+          unified7d: account.quota?.unified7d ?? null,
+        });
+      } catch (err) {
+        skipped.push({ name: account.name, reason: `warm error: ${err.message}` });
+      }
+    }
+    console.log(`[TeamClaude] warmHeadroom(threshold=${threshold}): minted ${minted.length} (${minted.map((m) => m.name).join(', ') || '-'}), skipped ${skipped.length}`);
+    return { threshold, minted, skipped };
+  }
+
+  /**
    * D-1763: bounded background re-warm for accounts whose boot-warm failed on a
    * network error. Per account, retry on a fixed backoff schedule until the API
    * is reached or attempts are exhausted, then STOP. Terminating by construction

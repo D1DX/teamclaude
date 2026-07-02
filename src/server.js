@@ -89,6 +89,20 @@ export function createProxyServer(accountManager, config, hooks = {}) {
         return;
       }
 
+      // D-2805: on-demand mint — start the 5h window EARLY for the headroom
+      // OAuth accounts (the morning primer curls this from localhost). Gated by
+      // the top auth check exactly like /status (remote needs the key; localhost
+      // exempt). Uses the proxy's own warmOne → ensureTokenFresh, so an expired
+      // token is refreshed clobber-safely (no second process racing the token
+      // store). Never routed upstream as a proxied request.
+      if (req.method === 'POST' && req.url === '/teamclaude/warm') {
+        const threshold = Number.isFinite(config.warmHeadroomThreshold) ? config.warmHeadroomThreshold : 0.90;
+        const summary = await accountManager.warmHeadroom(threshold, upstream);
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ ...summary, build: BUILD }, null, 2));
+        return;
+      }
+
       // D1DX patch (D-1903): local health endpoint. A bare `GET`/`HEAD /` (and
       // `/health`) is a connectivity probe Claude Code / monitors fire ~every 30s.
       // Anthropic returns 404 for it, so WITHOUT this short-circuit every probe is
