@@ -1,3 +1,10 @@
 node_modules/
 config.json
 *.log
+.env
+credentials.json
+*.har
+*.pem
+*.key
+GEMINI.md
+.gemini/settings.json
