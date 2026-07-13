@@ -115,6 +115,7 @@ async function serverCommand() {
     paceTieBand: config.paceTieBand ?? 0.10,                   // anti-dogpile: accounts within this of the best paceScore spread by load
     maxInflightPerAccount: config.maxInflightPerAccount ?? 5,  // proven-account in-flight cap (unproven = 1, the probe-gate) — D-2236
     maxSessionsPerAccount: config.maxSessionsPerAccount ?? 7,  // hard cap on bound warm sessions per account (instances limit) — D-2236
+    premiumModelPattern: config.premiumModelPattern ?? 'fable|mythos', // DL-2841: regex for the flagship/premium weekly tier (Anthropic's 7d_oi sub-axis) — a premium-capped account is skipped for these models only, stays usable for the rest
     // 429 handling — escalating backoff
     backoffSec: config.backoffSec ?? 60,           // streak-1 bench (ladder base)
     backoffFactor: config.backoffFactor ?? 4,      // ×per consecutive 429

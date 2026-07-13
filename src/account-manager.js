@@ -117,7 +117,14 @@ function emptyQuota() {
     unified7d: null,       // utilization 0-1
     unified5hReset: null,  // ms timestamp
     unified7dReset: null,  // ms timestamp
-    unifiedStatus: null,   // allowed | allowed_warning | rejected
+    unifiedStatus: null,   // allowed | allowed_warning | rejected (BASE 5h/7d axes only — NOT the premium sub-axis)
+    // DL-2841: per-model-tier weekly sub-limit (Anthropic's `unified-7d_oi-*` axis —
+    // the flagship/premium tier, e.g. Fable). Anthropic rejects premium-model requests
+    // on this axis while the account's BASE 5h/7d budget is fine, so it must be tracked
+    // SEPARATELY from unifiedStatus (which gates the whole account).
+    premiumStatus: null,   // allowed | rejected — the 7d_oi sub-axis status
+    premiumUtil: null,     // utilization 0-1 on the premium sub-axis
+    premiumReset: null,    // ms timestamp — when the premium sub-limit resets
     resetsAt: null,
   };
 }
@@ -167,6 +174,7 @@ export class AccountManager {
       _burn: null,         // Map(hourEpoch → tokens) — rolling burn buckets (≤168 = 7d)
       _capEst5h: null,     // learned 5h cap: EMA of burn5h at the first 429 of each streak
       _proven: false,      // D-2104 probe-gate: returned a 200 in this active spell? unproven → in-flight cap 1
+      _premiumRejectedUntil: 0, // DL-2841: ms — the account is premium-tier (7d_oi) capped until this instant; usable for non-premium models throughout
     }));
     this.currentIndex = 0;
     this.switchThreshold = switchThreshold; // hard ceiling — 5h axis + real weekly limit
@@ -221,6 +229,19 @@ export class AccountManager {
       { hours: 48, weight: 2 },   // ≤48h → push
       { hours: 72, weight: 1 },   // ≤72h → push where possible
     ];
+
+    // DL-2841: per-model-tier weekly sub-limit awareness. Anthropic meters the
+    // flagship/premium tier (e.g. Fable) on a SEPARATE weekly axis (`unified-7d_oi-*`)
+    // and rejects premium-model requests on it while the account's base 5h/7d budget
+    // is fine. Without this, a single Fable 429 set the account-wide `unified-status:
+    // rejected` and benched the WHOLE account out of the pool for every model — a stuck
+    // trap (excluded → no non-premium traffic ever flips it back). premiumModelRe
+    // classifies which outbound models fall in that tier so a premium-capped account is
+    // avoided for premium requests only, and stays fully usable for the rest.
+    this.premiumModelRe = (() => {
+      const src = opts.premiumModelPattern ?? 'fable|mythos';
+      try { return new RegExp(src, 'i'); } catch { return /fable|mythos/i; }
+    })();
 
     // ── 429 handling: escalating backoff (D-2179) ──
     // A 429 with a server retry-after (or a known unified reset) benches until that
@@ -304,7 +325,8 @@ export class AccountManager {
     // Sticky while the current account is usable; otherwise (re)pick the
     // least-loaded usable account. First-ever call always picks.
     if (this._didBootSelect && current && this._isUsable(current) && this._fiveHourEligible(current)
-        && !this._apikeyShouldYield(current)) {
+        && !this._apikeyShouldYield(current)
+        && !(this._isPremiumModel(opts.model) && this._premiumRejected(current))) { // DL-2841: don't stick a premium request on a premium-capped account
       return current; // stay cache-warm (until it nears its 5h ceiling — never-stall)
     }
     this._didBootSelect = true;
@@ -339,9 +361,13 @@ export class AccountManager {
       // far over the weekly line (control law #6 — cache yields ONLY then; normal
       // over-pace doesn't churn a warm session).
       const farOverLine = acct ? this._paceGap(acct) < -this.farOverLineThreshold : false;
+      // DL-2841: a warm binding rebinds if THIS request is a premium-tier model and the
+      // bound account is premium-capped — otherwise every Fable request on a warm-bound
+      // account would 429. Non-premium requests keep the warm binding unchanged.
+      const premiumMiss = this._isPremiumModel(opts.model) && this._premiumRejected(acct);
       if (acct && warm && !this._isBlocked(acct) && !this._atHardLimit(acct)
           && this._fiveHourEligible(acct) && !farOverLine
-          && !this._apikeyShouldYield(acct)) {
+          && !this._apikeyShouldYield(acct) && !premiumMiss) {
         b.lastUsedAt = now;
         return acct;
       }
@@ -416,6 +442,21 @@ export class AccountManager {
     if (q.unifiedStatus === 'rejected') return false;
     if (q.unified5h != null && q.unified5h >= this.fiveHourSoftCeiling) return false;
     return true;
+  }
+
+  // DL-2841: is this outbound model in the premium/flagship weekly tier (the one
+  // Anthropic meters on the `unified-7d_oi` sub-axis)? Config-driven regex; default
+  // matches the Fable/Mythos flagship family. Non-premium models (Sonnet/Opus/Haiku)
+  // are never gated by a premium sub-limit.
+  _isPremiumModel(model) {
+    return !!model && this.premiumModelRe.test(model);
+  }
+
+  // DL-2841: is this account currently premium-tier (7d_oi) capped? True only while the
+  // sub-limit is live. Non-premium traffic ignores this entirely (the account stays
+  // usable); premium binds skip it while it holds.
+  _premiumRejected(account) {
+    return !!account && account._premiumRejectedUntil > Date.now();
   }
 
   // Graduated in-flight cap for new binds (D-2104):
@@ -494,7 +535,7 @@ export class AccountManager {
    * or ramping near its reset) sits alone in the band and still concentrates load
    * — bounded by the caps so it drains without 429ing.
    */
-  _pickAccountForBinding({ allowApikey = false } = {}) {
+  _pickAccountForBinding({ allowApikey = false, model = null } = {}) {
     const usableAll = this.accounts.filter(a => this._isUsable(a));
     if (usableAll.length === 0) return this._soonestUsableOrNull();
     // D1DX (D-2182): apikey accounts are a STRICT last resort. An apikey has no
@@ -515,6 +556,14 @@ export class AccountManager {
     if (oauthUsable.length) usable = oauthUsable;        // OAuth available → use it
     else if (allowApikey) usable = usableAll;            // last resort → admit apikey
     else return null;                                    // only apikey usable, not yet allowed → HOLD
+    // DL-2841: a premium-tier request (e.g. Fable) must avoid accounts whose premium
+    // sub-limit (7d_oi) is currently capped — they serve non-premium fine but would 429
+    // this model. Fall back to the unfiltered set only if every candidate is
+    // premium-capped (then the request 429s honestly rather than never binding).
+    if (this._isPremiumModel(model)) {
+      const premiumOk = usable.filter(a => !this._premiumRejected(a));
+      if (premiumOk.length) usable = premiumOk;
+    }
     const { counts } = this._activeSessionCounts();
     const fiveHourOk = usable.filter(a => this._fiveHourEligible(a));
     const base = fiveHourOk.length ? fiveHourOk : usable;
@@ -1196,8 +1245,46 @@ export class AccountManager {
       else { account.quota.unified7dReset = null; account.quota.unified7d = null; account.quota.unifiedStatus = null; }
     }
 
+    // DL-2841: parse the premium-tier weekly sub-axis (`unified-7d_oi-*`). Anthropic
+    // emits it only on premium-model requests; it goes `rejected`/util 1.0 when that
+    // tier's separate weekly cap is hit, while the base 5h/7d axes stay `allowed`.
+    const oiStatus = headers['anthropic-ratelimit-unified-7d_oi-status'];
+    if (oiStatus) {
+      account.quota.premiumStatus = oiStatus;
+      const oiUtil = parseFloat(headers['anthropic-ratelimit-unified-7d_oi-utilization']);
+      if (!isNaN(oiUtil)) account.quota.premiumUtil = oiUtil;
+      const oiReset = headers['anthropic-ratelimit-unified-7d_oi-reset'];
+      const oiResetMs = oiReset ? parseInt(oiReset, 10) * 1000 : null;
+      if (oiStatus === 'rejected') {
+        account.quota.premiumReset = oiResetMs && oiResetMs > nowMs ? oiResetMs : null;
+        // Bench premium-only: usable for every non-premium model throughout. Fall back
+        // to the backoff cap when Anthropic sends no forward-dated reset.
+        account._premiumRejectedUntil = (oiResetMs && oiResetMs > nowMs)
+          ? oiResetMs : nowMs + this.backoffCapSec * 1000;
+      } else {
+        account.quota.premiumReset = null;
+        account._premiumRejectedUntil = 0; // recovered
+      }
+    }
+
+    // The top-line `unified-status` is REQUEST-MODEL-scoped: on a premium request it
+    // MIRRORS the 7d_oi sub-axis (rejected) even though the account's base budget is
+    // fine. Storing that as the account-wide status benched the whole account for every
+    // model (DL-2841 stuck trap). Keep account-wide status on the BASE axes: derive it
+    // from the explicit per-axis statuses when present; only fall back to the top-line
+    // when no premium sub-axis is in play.
+    const s5 = headers['anthropic-ratelimit-unified-5h-status'];
+    const s7 = headers['anthropic-ratelimit-unified-7d-status'];
     const uStatus = headers['anthropic-ratelimit-unified-status'];
-    if (uStatus) account.quota.unifiedStatus = uStatus;
+    if (s5 || s7) {
+      account.quota.unifiedStatus = (s5 === 'rejected' || s7 === 'rejected')
+        ? 'rejected'
+        : (s7 || s5); // allowed | allowed_warning from the base axes
+    } else if (uStatus && !oiStatus) {
+      account.quota.unifiedStatus = uStatus; // no sub-axis → top-line is account-wide
+    }
+    // else: a premium request with no explicit base-axis headers — leave account-wide
+    // status untouched rather than clobber it from the premium-mirrored top-line.
 
     // Standard rate limits (API key accounts)
     const tokensLimit = parseInt(headers['anthropic-ratelimit-tokens-limit'], 10);
@@ -1309,6 +1396,21 @@ export class AccountManager {
           account._lastBenchSec = Math.round((until - now) / 1000);
         }
       }
+      return;
+    }
+
+    // DL-2841: a premium-tier (7d_oi) 429 is scoped to the per-model weekly sub-limit,
+    // not the account. updateQuota (run first in the 429 path) already recorded the
+    // premium bench and kept account-wide status on the base axes. Do NOT throttle the
+    // whole account here — that would stall its Sonnet/Opus/Haiku traffic too. The
+    // premium request itself still fails over (server.js), and premium binds avoid this
+    // account (_premiumRejected) until the sub-limit resets, but non-premium keeps flowing.
+    const q = account.quota;
+    const premiumScoped = this._premiumRejected(account)
+      && (q.unified5h == null || q.unified5h < this.fiveHourSoftCeiling)
+      && (q.unified7d == null || q.unified7d < this.switchThreshold);
+    if (premiumScoped) {
+      console.log(`[TeamClaude] Account "${account.name}" premium-tier (7d_oi) capped — NOT benching account; stays usable for non-premium models`);
       return;
     }
 
@@ -1768,6 +1870,8 @@ export class AccountManager {
         streak: a._429streak || 0,  // D1DX (D-2179): consecutive-429 ladder depth
         benchSec: (a.status === 'throttled' && a.rateLimitedUntil)
           ? Math.max(0, Math.ceil((a.rateLimitedUntil - Date.now()) / 1000)) : 0,
+        premiumCappedSec: this._premiumRejected(a) // DL-2841: premium-tier (7d_oi) capped, still usable for non-premium
+          ? Math.max(0, Math.ceil((a._premiumRejectedUntil - Date.now()) / 1000)) : 0,
         burn5h: this._burnWindow(a, 5),   // D1DX (D-2179): rolling 5h token burn
         capEst5h: a._capEst5h ?? null,    // D1DX (D-2179): learned 5h cap
         quota: { ...a.quota },

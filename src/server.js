@@ -234,10 +234,15 @@ async function forwardRequest(req, res, body, accountManager, upstream, retryCou
   // the cache window lapses. No header (warmer / health / non-CC) → global
   // getActiveAccount() fallback (unchanged behavior).
   const sessionId = req.headers['x-claude-code-session-id'] || null;
+  // DL-2841: parse the outbound model so selection can avoid a premium-tier (7d_oi)
+  // capped account for premium requests only (non-premium keeps flowing to it). Cheap
+  // one-shot parse; a non-JSON / unparseable body → model unknown → treated non-premium.
+  let reqModel = null;
+  if (body && body.length) { try { reqModel = JSON.parse(body.toString('utf8')).model || null; } catch { /* model unknown */ } }
   // D1DX (D-2420): the apikey is admitted only once the hold loop has set
   // ctx.allowApikey (max wait elapsed, or pool hard-capped). Normal binds keep it
   // gated so an all-OAuth-throttled pool returns null → HOLD, not the paid key.
-  const account = accountManager.getAccountForSession(sessionId, { allowApikey: ctx.allowApikey === true });
+  const account = accountManager.getAccountForSession(sessionId, { allowApikey: ctx.allowApikey === true, model: reqModel });
   if (!account) {
     // D1DX patch (D-1741): all accounts throttled at selection time — HOLD the
     // inference request and poll for one to free up, instead of returning a 429
