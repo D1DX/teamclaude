@@ -6,6 +6,7 @@ import { systemSnapshot as _systemSnapshot } from './infra/system.js';
 import { priceFor } from './accounting/pricing.js';
 import { updateUsage as usageUpdateUsage, recordBurn as usageRecordBurn, burnWindow as usageBurnWindow } from './accounting/usage.js';
 import { setLedgerPath as ledgerSetPath, loadLedger as ledgerLoad, saveLedger as ledgerSave, pruneLedger as ledgerPrune, ledgerTouch as ledgerTouchFn, maybeSaveLedger as ledgerMaybeSave, ledgerByIssue as ledgerByIssueFn, ledgerBySid as ledgerBySidFn } from './accounting/ledger.js';
+import { computeCapacity as capComputeCapacity, noteAccountSuccess as capNoteAccountSuccess, recalibrateCap as capRecalibrateCap } from './accounting/capacity.js';
 import { createAccounts, addAccount as poolAddAccount, removeAccount as poolRemoveAccount } from './core/pool.js';
 import { getAccountForSession as sessGetAccountForSession, activeSessionCounts as sessActiveSessionCounts, evictStaleBindings as sessEvictStaleBindings, sessionBindingSummary as sessBindingSummary, sessionAggregate as sessAggregate } from './core/session.js';
 import { getActiveAccount as selGetActiveAccount, pickAccountForBinding as selPickAccountForBinding, paceLine as selPaceLine, paceGap as selPaceGap, rampBoost as selRampBoost, paceScore as selPaceScore, apikeyShouldYield as selApikeyShouldYield, hasUsableApikey as selHasUsableApikey, switchTo as selSwitchTo } from './core/selection.js';
@@ -577,48 +578,11 @@ export class AccountManager {
   // Mark an account rate-limited (429) — reactive-only (core/bench.js).
   markRateLimited(accountIndex, retryAfterSeconds) { return benchMarkRateLimited(this, accountIndex, retryAfterSeconds); }
 
-  /** A successful response on an account — mark it proven + recalibrate its cap. */
-  noteAccountSuccess(accountIndex) {
-    const a = this.accounts[accountIndex];
-    if (!a) return;
-    a._proven = true; // a 200 proves headroom → opens the in-flight cap
-    this._recalibrateCap(a); // success-taught cap recalibration (reporting only)
-  }
+  // A successful response — mark proven + recalibrate the learned cap (accounting/capacity.js).
+  noteAccountSuccess(accountIndex) { return capNoteAccountSuccess(this, accountIndex); }
 
-  /**
-   * DL-3032: recalibrate the learned 5h cap on a successful response so a
-   * burst-driven low estimate can't stay frozen and falsely flag the account
-   * `constrained`. The EMA cap (learned only at 429 moments) never decayed — a
-   * concurrency-429 at low burn taught a low cap that then persisted forever. Two moves:
-   *   (1) immediate RAISE — a success that burned past capEst×capSoftCeiling proves the
-   *       soft ceiling is higher than believed, so lift capEst to put this burn back at
-   *       the ceiling (the account clearly serves more than we thought);
-   *   (2) time-DECAY toward the max observed successful 5h burn (proven headroom) with a
-   *       capDecayHalfLifeHours half-life, so a stale estimate relaxes toward reality
-   *       even without a boundary-crossing success.
-   * No-op until a cap has been learned (capEst null → constrained can't fire anyway).
-   */
-  _recalibrateCap(account) {
-    if (!account) return;
-    const now = Date.now();
-    const burn5h = this._burnWindow(account, 5);
-    if (burn5h > 0) account._maxSuccessBurn5h = Math.max(account._maxSuccessBurn5h || 0, burn5h);
-    if (account._capEst5h == null) { account._capEstAt = now; return; }
-    // (1) immediate raise on a success above the soft ceiling
-    if (burn5h > account._capEst5h * this.capSoftCeiling) {
-      account._capEst5h = burn5h / this.capSoftCeiling;
-    }
-    // (2) decay toward proven headroom (max successful burn)
-    const target = account._maxSuccessBurn5h || 0;
-    const last = account._capEstAt || now;
-    const dtHours = (now - last) / 3600000;
-    if (dtHours > 0 && this.capDecayHalfLifeHours > 0 && target > 0) {
-      const k = Math.pow(0.5, dtHours / this.capDecayHalfLifeHours);
-      account._capEst5h = target + (account._capEst5h - target) * k;
-    }
-    account._capEstAt = now;
-    this._ledgerDirty = true;
-  }
+  // Success-taught 5h-cap recalibration, reporting only (accounting/capacity.js).
+  _recalibrateCap(account) { return capRecalibrateCap(this, account); }
 
   // Reset-aware all-throttled client retry-after (core/hold-policy.js).
   allThrottledBackoff() { return holdAllThrottledBackoff(this); }
@@ -626,65 +590,8 @@ export class AccountManager {
   /** A successful upstream response — no all-throttled episode state to clear now. */
   noteSuccess() { /* no-op: simplified rails have no episode streak */ }
 
-  /**
-   * D-2179: capacity snapshot for orchestrators (served by GET /capacity +
-   * `teamclaude capacity`). Header-blind by design — derives a verdict from live
-   * state + the learned per-account cap, so a launcher gates worker spawns on real
-   * pool headroom instead of saturating it. An account is "live" when it is not
-   * benched, not errored/exhausted, not over the header hard ceiling, and not past
-   * its learned soft cap. headroom = spare concurrent-session slots across the pool.
-   */
-  computeCapacity() {
-    this._sweepAll();
-    const now = Date.now();
-    const accounts = this.accounts.map(a => {
-      const benched = a.status === 'throttled' && a.rateLimitedUntil != null && now < a.rateLimitedUntil;
-      const benchSec = benched ? Math.ceil((a.rateLimitedUntil - now) / 1000) : 0;
-      const burn5h = this._burnWindow(a, 5);
-      const cap = a._capEst5h ?? null;
-      const headroomTok = cap != null ? Math.max(0, Math.round(cap * this.capSoftCeiling - burn5h)) : null;
-      // DL-3032: the learned soft cap now flags CONSTRAINED (feeds headroom) — it no
-      // longer removes the account from `live`. An account past its EMA soft cap is
-      // still serving; excluding it produced the false red/yellow that gated
-      // orchestrator spawns while most of the pool was active (1/12 "live" vs 10/12
-      // serving). Liveness is base-axis truth only (not benched, not dead, not
-      // hard-capped); the constraint shrinks published headroom instead.
-      const constrained = cap != null && burn5h >= cap * this.capSoftCeiling;
-      const dead = a.status === 'error' || a.status === 'exhausted';
-      return {
-        name: a.name, status: a.status,
-        benched, benchSec, inflight: a._inflight || 0,
-        burn5h, capEst5h: cap, headroomTok,
-        constrained, nearCap: constrained,   // nearCap retained as an alias for existing readers (status label)
-        live: !benched && !dead && !this._atHardLimit(a),
-      };
-    });
-    const live = accounts.filter(a => a.live);
-    const benchedAll = accounts.filter(a => a.benched);
-    const { active: warmSessions } = this._activeSessionCounts();
-    // DL-3032: a constrained (near learned-cap) account is live but contributes no
-    // fresh concurrency headroom — only UNCONSTRAINED live accounts add slots.
-    const unconstrainedLive = live.filter(a => !a.constrained);
-    const slotHeadroom = Math.max(0, unconstrainedLive.length * this.softConcurrencyPerAccount - warmSessions);
-    const soonestResetSec = benchedAll.length ? Math.min(...benchedAll.map(a => a.benchSec)) : 0;
-
-    let verdict;
-    if (live.length === 0) verdict = 'red';
-    else if (benchedAll.length > 0 || slotHeadroom <= 1) verdict = 'yellow';
-    else verdict = 'green';
-
-    return {
-      verdict,
-      headroom: slotHeadroom,   // est. more concurrent sessions the pool can absorb now
-      liveAccounts: live.length,
-      benched: benchedAll.length,
-      total: this.accounts.length,
-      warmSessions,
-      soonestResetSec,          // when the next benched account frees (RED scheduling)
-      accounts,
-      at: new Date(now).toISOString(),
-    };
-  }
+  // Capacity snapshot for orchestrators (reporting only) — accounting/capacity.js.
+  computeCapacity() { return capComputeCapacity(this); }
 
   // Q1 signal 2: every account server-`rejected` for this request's axis (core/bench.js).
   allHardCapped(model = null) { return benchAllHardCapped(this, model); }
