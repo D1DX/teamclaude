@@ -454,9 +454,11 @@ export class AccountManager {
   // `allowed_warning` status is NOT a trigger on its own (≈24% of normal requests
   // carry it); the 5h utilization number is.
   _fiveHourEligible(account) {
-    const q = account.quota;
-    if (q.unifiedStatus === 'rejected') return false;
-    if (q.unified5h != null && q.unified5h >= this.fiveHourSoftCeiling) return false;
+    // DL-3032 (operator directive): PREDICTION REMOVED. The 5h never-stall rail
+    // pre-emptively excluded an account from selection based on a PREDICTED cap
+    // (unified-5h header ≥ soft ceiling, or an `allowed_warning`/`rejected` status)
+    // before Anthropic actually refused it. The only control signal is now a REAL
+    // 429 (→ failover); we never predict a limit and sideline an account ourselves.
     return true;
   }
 
@@ -482,9 +484,10 @@ export class AccountManager {
   //     updates and the 5h rail excludes it);
   //   proven with ample 5h headroom → maxInflightPerAccount.
   _inflightCapFor(account) {
-    if (!account._proven) return 1;
-    const u5h = account.quota.unified5h;
-    if (u5h != null && u5h >= this.fiveHourWarnCeiling) return 1;
+    // DL-3032 (operator directive): PREDICTION REMOVED. The probe-gate/graduated cap
+    // PREDICTED concurrency headroom — throttling an unproven or warn-band account to
+    // one in-flight request to avoid a predicted 429. We no longer predict: an account
+    // takes up to maxInflightPerAccount and a real 429 (→ failover) is the only signal.
     return this.maxInflightPerAccount;
   }
 
@@ -1202,14 +1205,12 @@ export class AccountManager {
   // `rejected` is the server telling us this account is over (allowed_warning
   // is NOT a trigger — ~24% of normal requests carry it).
   _atHardLimit(account) {
-    const q = account.quota;
-    if (q.unifiedStatus === 'rejected') return true;
-    if (q.unified5h != null && q.unified5h >= this.switchThreshold) return true;
-    if (q.unified7d != null && q.unified7d >= this.switchThreshold) return true;
-    if (q.tokensLimit != null && q.tokensRemaining != null &&
-        (1 - q.tokensRemaining / q.tokensLimit) >= this.switchThreshold) return true;
-    if (q.requestsLimit != null && q.requestsRemaining != null &&
-        (1 - q.requestsRemaining / q.requestsLimit) >= this.switchThreshold) return true;
+    // DL-3032 (operator directive): PREDICTION REMOVED. This PREDICTED a hard limit
+    // from the unified utilization headers (5h/7d ≥ switchThreshold, or status
+    // `rejected`) and excluded the account from selection BEFORE Anthropic actually
+    // refused a request. Anthropic's own 429 is the authoritative signal — we react to
+    // it (failover), we do not pre-empt it. An account is only unusable when genuinely
+    // errored/exhausted (_isBlocked), never on a predicted header threshold.
     return false;
   }
 
