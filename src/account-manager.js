@@ -19,6 +19,11 @@ const PRICING = {
 const CACHE_WRITE_5M_MULT = 1.25;
 const CACHE_WRITE_1H_MULT = 2.0;
 const CACHE_READ_MULT = 0.1;
+// DL-2841: premium (7d_oi) sub-axis reject with no server-stated reset — bench the
+// premium axis for this long, then re-probe. Only fires when Anthropic sends a
+// `rejected` premium status but no forward-dated reset (rare); the next premium
+// response carries the real reset and supersedes it. covered by per-family-reject.test.
+const PREMIUM_REJECT_FALLBACK_MS = 15 * 60 * 1000; // 15m
 // D1DX (D-1728): D1DX session presence registry — used only to resolve a
 // session emoji for log/TUI display. Best-effort; never load-bearing for routing.
 const SESSIONS_REGISTRY = join(homedir(), '.claude', 'state', 'sessions.json');
@@ -136,17 +141,19 @@ function _actTimestamp() {
 }
 
 export class AccountManager {
-  // D1DX — capacity-aware routing (D-2179). Max OAuth accounts send NO rate-limit
-  // headers (anthropic-ratelimit-unified-*), so the prior pace-to-line model ran
-  // blind. The model is now reactive with an optional header refinement:
-  //   • SELECT: session-sticky (per-account prompt cache) + least-in-flight spread.
-  //   • THROTTLE: a 429 benches the account on an ESCALATING ladder keyed to the
-  //     consecutive-429 streak (reset on any success) — a real cap stops being
-  //     re-probed every 60s; a header retry-after / known reset overrides it.
-  //   • CAPACITY: per-account rolling 5h/7d burn + a learned cap (EMA of burn at
-  //     the first 429 of each streak) → forward headroom, published via
-  //     computeCapacity() so orchestrators gate launches instead of saturating.
-  // switchThreshold (0.98) stays as the header-path hard ceiling when headers exist.
+  // Pool selection + reactive rate-limit handling. The invariant catalog and its
+  // incident→invariant→test mapping live in design/architecture-v3.md §2.1.
+  //   • SELECT: session cache-affinity + pace-to-weekly-line (covered by
+  //     pace-controller.test, session-routing.test, selection.test).
+  //   • BENCH: reactive-only — the server's explicit signal is the only admission
+  //     signal. A 429 with retry-after benches that one account for exactly the
+  //     stated duration; a header-less 429 fails over, never benches; a base-axis
+  //     unified-status `rejected` excludes the account until its reset (Q1). No
+  //     prediction, no streak, no utilization thresholds (covered by
+  //     reactive-bench.test, per-family-reject.test).
+  //   • CAPACITY: per-account rolling 5h/7d burn + success-taught cap → reporting
+  //     only, never admission (covered by capacity.test).
+  // switchThreshold (0.98) is a reporting band only (the near-ceiling display log).
   constructor(accounts, switchThreshold = 0.98, opts = {}) {
     this.accounts = accounts.map((acct, index) => ({
       index,
@@ -169,10 +176,9 @@ export class AccountManager {
       },
       rateLimitedUntil: null,
       _inflight: 0,        // live concurrent upstream requests (spread tiebreak + display)
-      _429streak: 0,       // consecutive 429s (drives the escalating backoff ladder)
       _lastBenchSec: 0,    // last bench duration in seconds (display + capacity)
       _burn: null,         // Map(hourEpoch → tokens) — rolling burn buckets (≤168 = 7d)
-      _capEst5h: null,     // learned 5h cap: EMA of burn5h at the first 429 of each streak
+      _capEst5h: null,     // success-taught 5h cap (reporting only; recalibrated on 200s)
       _maxSuccessBurn5h: null, // DL-3032: max observed SUCCESSFUL 5h burn — the recalibration target
       _capEstAt: 0,        // DL-3032: last capEst recalibration instant (ms) — drives time-decay
       _proven: false,      // D-2104 probe-gate: returned a 200 in this active spell? unproven → in-flight cap 1
@@ -194,17 +200,8 @@ export class AccountManager {
     this.cacheAffinityWindowMs = (opts.cacheAffinityWindowSec ?? 300) * 1000; // warm-stick window
     this.bindingEvictMs        = (opts.bindingEvictSec        ?? 1800) * 1000; // drop idle bindings
 
-    // Pace controller knobs. fiveHourSoftCeiling = never-stall rail (control law
-    // #1, TOP priority): an account at/over this 5h utilization takes no new load.
     // farOverLineThreshold = control law #6: a warm session is rebound for pacing
     // ONLY when its account is this far past its weekly line (cache yields late).
-    this.fiveHourSoftCeiling  = opts.fiveHourSoftCeiling  ?? 0.90;
-    // Graduated 5h admission (D-2104): a proven account whose 5h-utilization is in
-    // the warn band [fiveHourWarnCeiling, fiveHourSoftCeiling) drops to an in-flight
-    // cap of 1 — it drains one-at-a-time instead of taking a burst, so its 5h
-    // header updates between requests and it gets excluded (≥ soft ceiling) before
-    // a burst overshoots into a 429. Below the warn ceiling → full cap.
-    this.fiveHourWarnCeiling  = opts.fiveHourWarnCeiling  ?? 0.75;
     this.farOverLineThreshold = opts.farOverLineThreshold ?? 0.10;
     // Anti-dogpile (D-2104 hardening): without these, a concurrent burst all
     // picks the single most-behind account and 429s it (thundering herd).
@@ -245,32 +242,18 @@ export class AccountManager {
       try { return new RegExp(src, 'i'); } catch { return /fable|mythos/i; }
     })();
 
-    // ── 429 handling: escalating backoff (D-2179) ──
-    // A 429 with a server retry-after (or a known unified reset) benches until that
-    // instant. Header-blind (the Max OAuth norm), it benches on an escalating ladder
-    // keyed to consecutive 429s: backoffBaseSec * backoffFactor^(streak-1), capped at
-    // backoffCapSec, + de-sync jitter. Any success resets the streak — so a transient
-    // 429 recovers fast while a genuine cap stops being re-probed every 60s.
-    this.backoffBaseSec     = opts.backoffSec         ?? 60;   // streak-1 bench
-    this.backoffFactor      = opts.backoffFactor      ?? 4;    // ×per consecutive 429
-    this.backoffCapSec      = opts.backoffCapSec      ?? 900;  // ladder ceiling (15m)
+    // ── 429 handling: reactive-only bench (covered by reactive-bench.test) ──
+    // A 429 with a server retry-after benches that one account for exactly the
+    // stated duration; a header-less 429 fails over, never benches. backoffBaseSec
+    // is the floor for the all-throttled client retry-after; allThrottledCapSec its
+    // ceiling. No ladder, no streak, no utilization thresholds.
+    this.backoffBaseSec     = opts.backoffSec         ?? 60;   // all-throttled retry-after floor
     this.allThrottledCapSec = opts.allThrottledCapSec ?? 600;  // client retry-after cap
-    this.backoffJitterSec   = opts.backoffJitterSec   ?? this.backoffBaseSec; // de-sync spread (0 = deterministic)
-    // DL-3032: utilization-aware burst class. A header-less 429 whose base axes are
-    // BOTH at/under burstUtilMax is a concurrency/burst blip (clears in seconds), not
-    // quota — cap its bench at burstBenchCapSec instead of climbing the full ladder to
-    // backoffCapSec, so a synchronized low-util burst can't bench the whole pool for
-    // minutes and produce the false all-throttled hold cascade. Mid-band (util between
-    // burstUtilMax and the near-cap ceilings) keeps the escalating ladder; near-cap
-    // still benches to the axis reset.
-    this.burstUtilMax       = opts.burstUtilMax       ?? 0.30;  // ≤ this on all base axes → concurrency class
-    this.burstBenchCapSec   = opts.burstBenchCapSec   ?? 120;   // bench ceiling for concurrency-class 429s
 
-    // ── Capacity model (D-2179) ──
-    // Per-account hourly burn buckets (≤168 = 7d) feed a learned 5h cap (EMA of
-    // burn5h at the first 429 of each streak). headroom is published below the
-    // learned cap by capSoftCeiling; concurrency by softConcurrencyPerAccount.
-    this.capEmaAlpha               = opts.capEmaAlpha               ?? 0.3;
+    // ── Capacity model (reporting only) ──
+    // Per-account hourly burn buckets (≤168 = 7d) feed a success-taught 5h cap.
+    // headroom is published below the cap by capSoftCeiling; concurrency by
+    // softConcurrencyPerAccount. Never an admission signal.
     this.capSoftCeiling            = opts.capSoftCeiling            ?? 0.75;
     this.softConcurrencyPerAccount = opts.softConcurrencyPerAccount ?? 3;
     // DL-3032: learned-cap recalibration. The EMA cap is learned at a 429 moment and
@@ -340,7 +323,7 @@ export class AccountManager {
     const current = this.accounts[this.currentIndex];
     // Sticky while the current account is usable; otherwise (re)pick the
     // least-loaded usable account. First-ever call always picks.
-    if (this._didBootSelect && current && this._isUsable(current) && this._fiveHourEligible(current)
+    if (this._didBootSelect && current && this._isUsable(current)
         && !this._apikeyShouldYield(current)
         && !(this._isPremiumModel(opts.model) && this._premiumRejected(current))) { // DL-2841: don't stick a premium request on a premium-capped account
       return current; // stay cache-warm (until it nears its 5h ceiling — never-stall)
@@ -382,7 +365,7 @@ export class AccountManager {
       // account would 429. Non-premium requests keep the warm binding unchanged.
       const premiumMiss = this._isPremiumModel(opts.model) && this._premiumRejected(acct);
       if (acct && warm && !this._isBlocked(acct) && !this._atHardLimit(acct)
-          && this._fiveHourEligible(acct) && !farOverLine
+          && !farOverLine
           && !this._apikeyShouldYield(acct) && !premiumMiss) {
         b.lastUsedAt = now;
         return acct;
@@ -449,19 +432,6 @@ export class AccountManager {
     return this._paceLine(account) - used;
   }
 
-  // Never-stall rail (control law #1, TOP priority): an account at/over its 5h
-  // soft ceiling — or server-flagged `rejected` — takes NO new load. Note: the
-  // `allowed_warning` status is NOT a trigger on its own (≈24% of normal requests
-  // carry it); the 5h utilization number is.
-  _fiveHourEligible(account) {
-    // DL-3032 (operator directive): PREDICTION REMOVED. The 5h never-stall rail
-    // pre-emptively excluded an account from selection based on a PREDICTED cap
-    // (unified-5h header ≥ soft ceiling, or an `allowed_warning`/`rejected` status)
-    // before Anthropic actually refused it. The only control signal is now a REAL
-    // 429 (→ failover); we never predict a limit and sideline an account ourselves.
-    return true;
-  }
-
   // DL-2841: is this outbound model in the premium/flagship weekly tier (the one
   // Anthropic meters on the `unified-7d_oi` sub-axis)? Config-driven regex; default
   // matches the Fable/Mythos flagship family. Non-premium models (Sonnet/Opus/Haiku)
@@ -475,20 +445,6 @@ export class AccountManager {
   // usable); premium binds skip it while it holds.
   _premiumRejected(account) {
     return !!account && account._premiumRejectedUntil > Date.now();
-  }
-
-  // Graduated in-flight cap for new binds (D-2104):
-  //   unproven (no 200 this spell) → 1 (probe-gate);
-  //   proven but in the 5h warn band [warnCeiling, softCeiling) → 1 (slow-drain,
-  //     so a near-cap account can't take a burst that overshoots before its header
-  //     updates and the 5h rail excludes it);
-  //   proven with ample 5h headroom → maxInflightPerAccount.
-  _inflightCapFor(account) {
-    // DL-3032 (operator directive): PREDICTION REMOVED. The probe-gate/graduated cap
-    // PREDICTED concurrency headroom — throttling an unproven or warn-band account to
-    // one in-flight request to avoid a predicted 429. We no longer predict: an account
-    // takes up to maxInflightPerAccount and a real 429 (→ failover) is the only signal.
-    return this.maxInflightPerAccount;
   }
 
   // End-of-cycle ramp (control law #3): as the account nears its 7d-reset, escalate
@@ -536,16 +492,13 @@ export class AccountManager {
   }
 
   /**
-   * Pick the account to (re)bind a session to (D-2104 pace controller).
-   * Layered eligibility — each set falls back to the prior so we never refuse
-   * while any usable account exists (a truly exhausted pool yields null via
-   * _soonestUsableOrNull at the top):
-   *   1. usable (not blocked, under the 0.98 hard ceiling);
-   *   2. 5h never-stall rail — below the 5h soft ceiling;
-   *   3. graduated in-flight cap (_inflightCapFor) — 1 while UNPROVEN (probe-gate)
-   *      or in the 5h warn band, opening to maxInflightPerAccount only when proven
-   *      with ample 5h headroom; so we never pile onto an unconfirmed or near-cap
-   *      account, and a near-cap account drains one-at-a-time without overshooting;
+   * Pick the account to (re)bind a session to (pace controller; covered by
+   * pace-controller.test, selection.test). Layered eligibility — each set falls
+   * back to the prior so we never refuse while any usable account exists (a truly
+   * exhausted pool yields null via _soonestUsableOrNull at the top):
+   *   1. usable — not blocked, not base-axis `rejected` (Q1 hard-cap);
+   *   2. premium filter — a premium request skips premium-capped accounts;
+   *   3. atomic in-flight cap — under maxInflightPerAccount (DL-2226);
    *   4. session cap — under maxSessionsPerAccount bound warm sessions.
    * Then within the surviving pool, a PACE TIE-BAND: accounts within paceTieBand
    * of the best paceScore are "equally behind" → spread a concurrent burst across
@@ -584,12 +537,11 @@ export class AccountManager {
       if (premiumOk.length) usable = premiumOk;
     }
     const { counts } = this._activeSessionCounts();
-    const fiveHourOk = usable.filter(a => this._fiveHourEligible(a));
-    const base = fiveHourOk.length ? fiveHourOk : usable;
-    // Probe-gate + graduated 5h cap: 1 while unproven, 1 in the 5h warn band,
-    // maxInflightPerAccount when proven with ample headroom (see _inflightCapFor).
-    const underCap = base.filter(a => (a._inflight || 0) < this._inflightCapFor(a));
-    const capped = underCap.length ? underCap : base;
+    // Atomic in-flight cap (DL-2226): an account at maxInflightPerAccount takes no
+    // new bind, so a burst spills across accounts in pace order. This is the only
+    // in-flight admission gate — reactive-only dropped the graduated probe-gate.
+    const underCap = usable.filter(a => (a._inflight || 0) < this.maxInflightPerAccount);
+    const capped = underCap.length ? underCap : usable;
     // Hard session cap (instances limit) — a burst spills beyond maxSessionsPerAccount.
     const underSession = capped.filter(a => (counts[a.index] || 0) < this.maxSessionsPerAccount);
     const pool = underSession.length ? underSession : capped;
@@ -633,30 +585,24 @@ export class AccountManager {
     if (a) a._inflight = Math.max(0, (a._inflight || 0) - 1);
   }
 
-  // D-2286: atomic dispatch probe-gate. Checks the account against its GRADUATED cap
-  // (_inflightCapFor: 1 while UNPROVEN/just-recovered → exactly ONE probe in flight,
-  // opening to maxInflightPerAccount once a 200 proves headroom) and reserves the slot
-  // in the SAME synchronous step. Single-threaded JS makes the check+increment atomic,
-  // so a concurrent recovery herd can't all pass while _inflight is still 0 (the TOCTOU
-  // that let 7+ requests pile onto one just-recovered account and burst-429 it — the
-  // 06-15 cascade). server.js calls this at dispatch instead of the bind-time filter
-  // (which races) + a separate noteInflightStart (which doesn't gate). Returns true if
-  // a slot was reserved — caller MUST pair it with noteInflightEnd — or false if the
-  // account is at its graduated cap (caller holds for a slot, preserving affinity).
+  // DL-2226: atomic in-flight reserve — check maxInflightPerAccount and reserve the
+  // slot in ONE synchronous step, so a concurrent burst can't all pass while
+  // _inflight is still 0 (the TOCTOU that let a recovery herd dogpile one account).
+  // covered by herd-recovery.test. Returns true if a slot was reserved — caller MUST
+  // pair it with noteInflightEnd — or false at the cap (caller holds for a slot).
   tryReserveInflight(accountIndex) {
     const a = this.accounts[accountIndex];
     if (!a) return false;
-    if ((a._inflight || 0) >= this._inflightCapFor(a)) return false;
+    if ((a._inflight || 0) >= this.maxInflightPerAccount) return false;
     a._inflight = (a._inflight || 0) + 1;
     return true;
   }
 
-  // D-2226: is this account at/over its HARD in-flight cap? server.js uses this to
+  // DL-2226: is this account at/over its in-flight cap? server.js uses this to
   // briefly HOLD a warm-stuck request until one of the account's own in-flight
-  // slots frees — preserving cache-affinity — instead of piling on (→ burst-429)
-  // or churning the warm session onto another account. New binds already exclude
-  // at-cap accounts via _inflightCapFor; this guards the warm-stick + all-at-cap
-  // fallback paths that bypass that filter and reach the dispatcher directly.
+  // slots frees — preserving cache-affinity — instead of piling on or churning the
+  // warm session onto another account. Guards the warm-stick + all-at-cap fallback
+  // paths that reach the dispatcher directly (covered by pace-controller.test).
   atInflightCap(accountIndex) {
     const a = this.accounts[accountIndex];
     return !!a && (a._inflight || 0) >= this.maxInflightPerAccount;
@@ -1201,20 +1147,17 @@ export class AccountManager {
     return false;
   }
 
-  // Real hard limits — using past these risks an actual 429. unified-status
-  // `rejected` is the server telling us this account is over (allowed_warning
-  // is NOT a trigger — ~24% of normal requests carry it).
+  // Q1 explicit-server-signal hard cap: the account's BASE (5h/7d) axis carries
+  // unified-status `rejected` — the server saying it is over. Excluded from
+  // selection until its reset clears the status (_clearExpiredQuotas nulls it on the
+  // 7d reset). Reactive, not predictive: `allowed_warning` (≈24% of normal requests)
+  // is NOT a trigger, and a utilization number never is. covered by selection.test,
+  // per-family-reject.test, capacity.test.
   _atHardLimit(account) {
-    // DL-3032 (operator directive): PREDICTION REMOVED. This PREDICTED a hard limit
-    // from the unified utilization headers (5h/7d ≥ switchThreshold, or status
-    // `rejected`) and excluded the account from selection BEFORE Anthropic actually
-    // refused a request. Anthropic's own 429 is the authoritative signal — we react to
-    // it (failover), we do not pre-empt it. An account is only unusable when genuinely
-    // errored/exhausted (_isBlocked), never on a predicted header threshold.
-    return false;
+    return !!account && account.quota?.unifiedStatus === 'rejected';
   }
 
-  // Usable — not blocked and below the 0.98 hard ceiling.
+  // Usable — not blocked and not base-axis `rejected` (Q1 hard cap).
   _isUsable(account) {
     if (this._isBlocked(account)) return false;
     this._clearExpiredQuotas(account);
@@ -1277,9 +1220,9 @@ export class AccountManager {
       if (oiStatus === 'rejected') {
         account.quota.premiumReset = oiResetMs && oiResetMs > nowMs ? oiResetMs : null;
         // Bench premium-only: usable for every non-premium model throughout. Fall back
-        // to the backoff cap when Anthropic sends no forward-dated reset.
+        // to a bounded re-probe when Anthropic sends no forward-dated reset.
         account._premiumRejectedUntil = (oiResetMs && oiResetMs > nowMs)
-          ? oiResetMs : nowMs + this.backoffCapSec * 1000;
+          ? oiResetMs : nowMs + PREMIUM_REJECT_FALLBACK_MS;
       } else {
         account.quota.premiumReset = null;
         account._premiumRejectedUntil = 0; // recovered
@@ -1385,160 +1328,51 @@ export class AccountManager {
   }
 
   /**
-   * Mark an account as rate-limited (429). ONE bounded backoff: bench the account
-   * for backoffSec (or an explicit upstream retry-after, clamped to
-   * allThrottledCapSec), plus small random jitter so a burst of 429s doesn't
-   * cluster every account's window on the same instant. A genuinely capped account
-   * is still excluded by _atHardLimit (its 429 carries unified ≈ 1.0 / status
-   * `rejected`), so the short re-probe never hammers a real cap.
+   * Mark an account rate-limited (429) — reactive-only. The server's explicit signal
+   * is the only one obeyed (no prediction, no ladder, no utilization thresholds):
+   *   • a premium (7d_oi) 429 is scoped to the premium axis — it must NOT bench the
+   *     whole account, which stays usable for non-premium models (Q1 signal 3);
+   *   • a retry-after benches that one account for exactly the stated duration —
+   *     honored verbatim (Q2), a longer retry-after extends an existing bench, a
+   *     shorter one never shrinks it;
+   *   • a header-less (or non-positive) 429 does NOT bench — it just fails over.
+   * covered by reactive-bench.test, per-family-reject.test.
    */
   markRateLimited(accountIndex, retryAfterSeconds) {
     const account = this.accounts[accountIndex];
     if (!account) return;
-    // DL-3032 (operator directive): REACTIVE-ONLY rate limiting. No prediction, no
-    // escalating ladder, no utilization guessing. Exactly ONE signal is obeyed:
-    // Anthropic's explicit retry-after on a real 429 — bench that one account for
-    // exactly the server-stated duration so selection moves to the rest of the pool
-    // (without this, a genuinely capped account ranks FIRST in pace order — lowest
-    // weekly utilization — and generates an endless 429/failover storm). A header-less
-    // 429 does NOT bench: it just fails over for that request.
+    // Q1 signal 3 (DL-2841): a premium-scoped 429 (premium axis rejected, base axes
+    // NOT rejected) benches the premium axis only — never the account. updateQuota
+    // runs first in the 429 path and has already set _premiumRejectedUntil, so premium
+    // binds skip this account while non-premium keeps flowing. Benching here would
+    // stall its Sonnet/Opus/Haiku traffic too.
+    if (this._premiumRejected(account) && account.quota?.unifiedStatus !== 'rejected') {
+      console.log(`[TeamClaude] Account "${account.name}" premium-tier (7d_oi) capped — NOT benching account; stays usable for non-premium models`);
+      return;
+    }
+    // Q1 signal 1 / Q2: obey an explicit server retry-after, verbatim. Bench that one
+    // account so selection moves to the rest of the pool; a longer retry-after extends
+    // an existing bench, a shorter one never shrinks it. Log when the server asks for
+    // more than 15 min (the server is the authority; a clamp would re-probe an account
+    // it told us to leave alone).
     if (retryAfterSeconds != null && !isNaN(retryAfterSeconds) && retryAfterSeconds > 0) {
       const until = Date.now() + retryAfterSeconds * 1000;
       if (!(account.status === 'throttled' && account.rateLimitedUntil >= until)) {
         account.status = 'throttled';
         account.rateLimitedUntil = until;
         account._lastBenchSec = Math.round(retryAfterSeconds);
-        console.log(`[TeamClaude] Account "${account.name}" rate limited +${account._lastBenchSec}s (server retry-after)`);
+        const overLong = retryAfterSeconds > 15 * 60 ? ' — over 15min, honored verbatim (Q2)' : '';
+        console.log(`[TeamClaude] Account "${account.name}" rate limited +${account._lastBenchSec}s (server retry-after)${overLong}`);
       }
     }
-    return;
-    // eslint-disable-next-line no-unreachable
-    const now = Date.now();
-
-    // D-2286: concurrent-burst debounce. If this account is ALREADY benched from
-    // this cycle (throttled, time remaining), a 429 arriving now is a sibling of the
-    // same concurrent burst — NOT a fresh post-recovery probe failure. Incrementing
-    // the streak per in-flight 429 is what drove 60s→4m→15m in 3 seconds and the
-    // false all-throttled cascade (06-15, D-2286 forensic). Keep the existing bench:
-    // don't increment the streak, don't re-bench, don't re-log. A genuine SEQUENTIAL
-    // failure still escalates — by then the bench has expired and _sweepAll flipped
-    // status back to 'active', so this guard passes. A server retry-after still
-    // EXTENDS the bench when it's longer than what we already hold.
-    if (account.status === 'throttled' && account.rateLimitedUntil > now) {
-      account._proven = false;
-      if (retryAfterSeconds != null && !isNaN(retryAfterSeconds)) {
-        const until = now + Math.min(retryAfterSeconds * 1000, this.backoffCapSec * 1000);
-        if (until > account.rateLimitedUntil) {
-          account.rateLimitedUntil = until;
-          account._lastBenchSec = Math.round((until - now) / 1000);
-        }
-      }
-      return;
-    }
-
-    // DL-2841: a premium-tier (7d_oi) 429 is scoped to the per-model weekly sub-limit,
-    // not the account. updateQuota (run first in the 429 path) already recorded the
-    // premium bench and kept account-wide status on the base axes. Do NOT throttle the
-    // whole account here — that would stall its Sonnet/Opus/Haiku traffic too. The
-    // premium request itself still fails over (server.js), and premium binds avoid this
-    // account (_premiumRejected) until the sub-limit resets, but non-premium keeps flowing.
-    const q = account.quota;
-    const premiumScoped = this._premiumRejected(account)
-      && (q.unified5h == null || q.unified5h < this.fiveHourSoftCeiling)
-      && (q.unified7d == null || q.unified7d < this.switchThreshold);
-    if (premiumScoped) {
-      console.log(`[TeamClaude] Account "${account.name}" premium-tier (7d_oi) capped — NOT benching account; stays usable for non-premium models`);
-      return;
-    }
-
-    account._429streak = (account._429streak || 0) + 1;
-    account._proven = false; // D-2104 probe-gate: a 429 un-proves it → re-probe with 1 on recovery
-
-    // D-2179: learn this account's 5h cap from the burn at the FIRST 429 of a
-    // streak (the moment it hit the wall). EMA across cap events; later 429s in the
-    // same streak don't re-teach (burn keeps climbing while benched-then-probed).
-    if (account._429streak === 1) {
-      const burn5h = this._burnWindow(account, 5);
-      if (burn5h > 0) {
-        account._capEst5h = account._capEst5h == null
-          ? burn5h
-          : account._capEst5h * (1 - this.capEmaAlpha) + burn5h * this.capEmaAlpha;
-      }
-    }
-
-    const capMs = this.backoffCapSec * 1000;
-    let baseMs, why, isBurst = false;
-    if (retryAfterSeconds != null && !isNaN(retryAfterSeconds)) {
-      baseMs = Math.min(retryAfterSeconds * 1000, capMs);          // server told us exactly
-      why = 'retry-after';
-    } else {
-      // D-2226: classify the header-less 429 by WHICH limit axis is actually hot.
-      // A 429 while utilization sits well below the hard ceiling is a BURST /
-      // concurrency limit (clears in seconds) — NOT quota exhaustion — so bench it
-      // on the short escalating ladder, not to the window reset. Only bench-to-reset
-      // when the account is genuinely AT a cap (5h ≥ soft ceiling, weekly ≥ hard
-      // ceiling, or the server flagged unified-status `rejected`): there the reset
-      // IS the soonest real recovery. Benching a transient burst to the always-far
-      // reset (clamped to backoffCapSec) is what sidelined a half-full account for
-      // 15 minutes and drove the false "all-throttled" cascade.
-      const u5h = account.quota.unified5h;
-      const u7d = account.quota.unified7d;
-      const nearCap = account.quota.unifiedStatus === 'rejected'
-        || (u5h != null && u5h >= this.fiveHourSoftCeiling)
-        || (u7d != null && u7d >= this.switchThreshold);
-      const resets = [account.quota.unified5hReset, account.quota.unified7dReset].filter(Boolean);
-      const reset = resets.length ? Math.min(...resets) : null;
-      if (nearCap && reset && reset > now) {
-        baseMs = Math.min(reset - now, capMs);            // genuine quota cap → wait for the reset
-        why = 'quota-reset';
-      } else {
-        // Header-blind burst (the Max OAuth norm): escalating ladder by consecutive
-        // 429s. Any success resets the streak (noteAccountSuccess), so a transient
-        // burst recovers in ~backoffBaseSec while a persistent one escalates.
-        // D-2286: FULL JITTER (AWS "Exponential Backoff and Jitter") — spread the
-        // bench across [base, ladder] so simultaneously-benched accounts DON'T expire
-        // together and re-form the synchronized recovery herd. The ladder ceiling
-        // still grows with the streak; jitter only de-synchronizes WHEN each account
-        // frees. backoffJitterSec === 0 keeps it deterministic (= ladder) for tests.
-        //
-        // DL-3032: utilization-aware CONCURRENCY class. When both base axes sit at/under
-        // burstUtilMax the 429 is a concurrency/burst blip on a near-idle account, not
-        // quota pressure — cap the ladder ceiling at burstBenchCapSec (≪ backoffCapSec)
-        // so a synchronized low-util burst frees in ~2min instead of climbing to 15m and
-        // benching the whole pool into the false all-throttled hold. Mid-band (an axis
-        // above burstUtilMax but below the near-cap ceilings) keeps the full ladder —
-        // there the account is genuinely working and a longer bench is warranted.
-        const concurrencyClass = u5h != null && u5h <= this.burstUtilMax
-          && (u7d == null || u7d <= this.burstUtilMax);
-        const benchCapMs = concurrencyClass ? this.burstBenchCapSec * 1000 : capMs;
-        const ladderMs = Math.min(this.backoffBaseSec * 1000 * this.backoffFactor ** (account._429streak - 1), benchCapMs);
-        if (this.backoffJitterSec > 0) {
-          const floorMs = Math.min(this.backoffBaseSec * 1000, ladderMs);
-          baseMs = floorMs + Math.random() * (ladderMs - floorMs);
-        } else {
-          baseMs = ladderMs;
-        }
-        why = concurrencyClass ? `burst-cc×${account._429streak}` : `burst×${account._429streak}`;
-        isBurst = true;
-      }
-    }
-    // D-2286: retry-after + quota-reset keep the small additive de-sync jitter; a
-    // burst already carries full jitter above, so don't double-jitter it.
-    const jitterMs = isBurst ? 0 : Math.random() * this.backoffJitterSec * 1000;
-    account.status = 'throttled';
-    account.rateLimitedUntil = now + baseMs + jitterMs;
-    account._lastBenchSec = Math.round((baseMs + jitterMs) / 1000);
-    console.log(`[TeamClaude] Account "${account.name}" rate limited +${account._lastBenchSec}s (${why}, streak ${account._429streak})`);
-    this._ledgerDirty = true; this._maybeSaveLedger(); // D-2179: persist the learned cap
   }
 
-  /** A successful response on an account — reset its 429 streak (ends the ladder). */
+  /** A successful response on an account — mark it proven + recalibrate its cap. */
   noteAccountSuccess(accountIndex) {
     const a = this.accounts[accountIndex];
     if (!a) return;
-    if (a._429streak) { a._429streak = 0; a._lastBenchSec = 0; }
-    a._proven = true; // D-2104 probe-gate: a 200 proves headroom → open the in-flight cap to maxInflightPerAccount
-    this._recalibrateCap(a); // DL-3032: relax a stale learned cap toward proven headroom
+    a._proven = true; // a 200 proves headroom → opens the in-flight cap
+    this._recalibrateCap(a); // success-taught cap recalibration (reporting only)
   }
 
   /**
@@ -1579,8 +1413,7 @@ export class AccountManager {
   /**
    * Retry-after (seconds) to hand the client when EVERY account is throttled.
    * Real-reset-aware (soonest genuine reset across the pool), clamped to
-   * [backoffSec, allThrottledCapSec], with upward-only jitter so we never tell the
-   * client to retry BEFORE the real reset (which would just earn another 429).
+   * [backoffSec, allThrottledCapSec]. covered by reactive-bench.test.
    */
   allThrottledBackoff() {
     const now = Date.now();
@@ -1598,7 +1431,6 @@ export class AccountManager {
     }
     let secs = soonest === Infinity ? this.backoffBaseSec : (soonest - now) / 1000;
     secs = Math.max(this.backoffBaseSec, Math.min(this.allThrottledCapSec, secs));
-    if (this.backoffJitterSec > 0) secs += Math.random() * secs * 0.15; // upward-only de-sync jitter
     return Math.max(1, Math.ceil(secs));
   }
 
@@ -1632,7 +1464,7 @@ export class AccountManager {
       const dead = a.status === 'error' || a.status === 'exhausted';
       return {
         name: a.name, status: a.status,
-        benched, benchSec, streak: a._429streak || 0, inflight: a._inflight || 0,
+        benched, benchSec, inflight: a._inflight || 0,
         burn5h, capEst5h: cap, headroomTok,
         constrained, nearCap: constrained,   // nearCap retained as an alias for existing readers (status label)
         live: !benched && !dead && !this._atHardLimit(a),
@@ -1649,7 +1481,7 @@ export class AccountManager {
 
     let verdict;
     if (live.length === 0) verdict = 'red';
-    else if (benchedAll.length > 0 || accounts.some(a => a.streak >= 2) || slotHeadroom <= 1) verdict = 'yellow';
+    else if (benchedAll.length > 0 || slotHeadroom <= 1) verdict = 'yellow';
     else verdict = 'green';
 
     return {
@@ -1666,13 +1498,16 @@ export class AccountManager {
   }
 
   /**
-   * True when EVERY account is at a genuine hard limit (the header path). Used by
-   * the server hold-loop to stop holding a genuinely-capped pool. Folds the former
-   * server.js local copy (the D-1741 TODO) into the class.
+   * Q1 signal 2: true when EVERY account is server-`rejected` for this request's axis
+   * — the pool is hard-capped, so the server hold-loop stops holding (a stated reset
+   * says recovery is hours out) and fires the apikey last resort immediately (DL-2420).
+   * Base-axis rejection counts for any request; premium (7d_oi) rejection counts only
+   * for a premium model. covered by capacity.test.
    */
-  allHardCapped() {
+  allHardCapped(model = null) {
     if (!this.accounts.length) return false;
-    return this.accounts.every(a => this._atHardLimit(a));
+    const premium = this._isPremiumModel(model);
+    return this.accounts.every(a => this._atHardLimit(a) || (premium && this._premiumRejected(a)));
   }
 
   /**
@@ -1961,7 +1796,6 @@ export class AccountManager {
         type: a.type,
         status: a.status,
         inflight: a._inflight || 0, // D1DX (D-1903): live concurrent in-flight count
-        streak: a._429streak || 0,  // D1DX (D-2179): consecutive-429 ladder depth
         benchSec: (a.status === 'throttled' && a.rateLimitedUntil)
           ? Math.max(0, Math.ceil((a.rateLimitedUntil - Date.now()) / 1000)) : 0,
         premiumCappedSec: this._premiumRejected(a) // DL-2841: premium-tier (7d_oi) capped, still usable for non-premium

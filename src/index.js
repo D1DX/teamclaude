@@ -108,21 +108,16 @@ async function serverCommand() {
     cacheAffinityWindowSec: config.cacheAffinityWindowSec ?? 300,
     bindingEvictSec: config.bindingEvictSec ?? 1800,
     // Pace-to-weekly-line controller (D-2104, real-data rebuild)
-    fiveHourSoftCeiling: config.fiveHourSoftCeiling ?? 0.90,   // never-stall rail: no new load at/over this 5h util
-    fiveHourWarnCeiling: config.fiveHourWarnCeiling ?? 0.75,   // in-flight cap drops to 1 in [warn, soft) — slow-drain a near-cap account
     farOverLineThreshold: config.farOverLineThreshold ?? 0.10, // rebind a warm session only when this far past its weekly line
     rampTiers: config.rampTiers ?? undefined,                  // hours→weight ramp before 7d-reset (constructor default)
     paceTieBand: config.paceTieBand ?? 0.10,                   // anti-dogpile: accounts within this of the best paceScore spread by load
-    maxInflightPerAccount: config.maxInflightPerAccount ?? 5,  // proven-account in-flight cap (unproven = 1, the probe-gate) — D-2236
+    maxInflightPerAccount: config.maxInflightPerAccount ?? 5,  // atomic in-flight cap per account — D-2236
     maxSessionsPerAccount: config.maxSessionsPerAccount ?? 7,  // hard cap on bound warm sessions per account (instances limit) — D-2236
     premiumModelPattern: config.premiumModelPattern ?? 'fable|mythos', // DL-2841: regex for the flagship/premium weekly tier (Anthropic's 7d_oi sub-axis) — a premium-capped account is skipped for these models only, stays usable for the rest
-    // 429 handling — escalating backoff
-    backoffSec: config.backoffSec ?? 60,           // streak-1 bench (ladder base)
-    backoffFactor: config.backoffFactor ?? 4,      // ×per consecutive 429
-    backoffCapSec: config.backoffCapSec ?? 900,    // ladder ceiling (15m)
+    // 429 handling — reactive-only bench
+    backoffSec: config.backoffSec ?? 60,           // all-throttled client retry-after floor
     allThrottledCapSec: config.allThrottledCapSec ?? 600,
-    // Capacity model
-    capEmaAlpha: config.capEmaAlpha ?? 0.3,
+    // Capacity model (reporting only)
     capSoftCeiling: config.capSoftCeiling ?? 0.75,
     softConcurrencyPerAccount: config.softConcurrencyPerAccount ?? 3,
     // Ledger (observability)
@@ -773,7 +768,7 @@ async function capacityCommand() {
   const reset = data.soonestResetSec ? ` · next free ${fmtDur(data.soonestResetSec)}` : '';
   console.log(`${mark} ${String(data.verdict).toUpperCase()}  headroom ${data.headroom} session(s) · live ${data.liveAccounts}/${data.total} · benched ${data.benched} · warm ${data.warmSessions}${reset}`);
   for (const a of (data.accounts || [])) {
-    const state = a.benched ? `benched ${fmtDur(a.benchSec)} (streak ${a.streak})`
+    const state = a.benched ? `benched ${fmtDur(a.benchSec)}`
       : a.nearCap ? 'near cap'
       : a.live ? 'live' : a.status;
     const cap = a.capEst5h != null

@@ -239,6 +239,7 @@ async function forwardRequest(req, res, body, accountManager, upstream, retryCou
   // one-shot parse; a non-JSON / unparseable body → model unknown → treated non-premium.
   let reqModel = null;
   if (body && body.length) { try { reqModel = JSON.parse(body.toString('utf8')).model || null; } catch { /* model unknown */ } }
+  ctx.reqModel = reqModel; // Q1: the hold loop consults allHardCapped(model) for premium pool-wide rejection
   // D1DX (D-2420): the apikey is admitted only once the hold loop has set
   // ctx.allowApikey (max wait elapsed, or pool hard-capped). Normal binds keep it
   // gated so an all-OAuth-throttled pool returns null → HOLD, not the paid key.
@@ -251,15 +252,12 @@ async function forwardRequest(req, res, body, accountManager, upstream, retryCou
     return holdForThrottle(req, res, body, accountManager, upstream, hooks, reqId, ctx, logDir);
   }
 
-  // D-2286: atomic dispatch probe-gate (supersedes the D-2226 warm-path hold + the
-  // separate synchronous reserve). tryReserveInflight checks the account against its
-  // GRADUATED cap (_inflightCapFor: 1 while UNPROVEN/just-recovered) AND reserves the
-  // slot in one synchronous step, so a concurrent recovery herd can't all clear the
-  // cap while _inflight is still 0 — exactly ONE request probes a just-recovered
-  // account; the rest HOLD here for a slot (cache-affinity preserved, no rebind).
-  // _pickAccountForBinding still pre-filters at-cap accounts from NEW binds; this is
-  // the dispatch-time gate that the bind-time filter's TOCTOU let the 06-15 herd slip
-  // through (8 sessions each read _inflight=0 and dogpiled one just-freed account).
+  // DL-2226: atomic in-flight reserve. tryReserveInflight checks maxInflightPerAccount
+  // AND reserves the slot in one synchronous step, so a concurrent burst can't all
+  // clear the cap while _inflight is still 0 — the rest HOLD here for a slot
+  // (cache-affinity preserved, no rebind). _pickAccountForBinding pre-filters at-cap
+  // accounts from NEW binds; this is the dispatch-time gate the bind-time filter's
+  // TOCTOU would otherwise let a recovery herd slip through.
   let reserved = accountManager.tryReserveInflight(account.index);
   if (!reserved) {
     const SLOT_POLL_MS = 200, SLOT_BUDGET_MS = 5000;
@@ -273,9 +271,8 @@ async function forwardRequest(req, res, body, accountManager, upstream, retryCou
     if (res.destroyed) { if (reserved) accountManager.noteInflightEnd(account.index); return; }
     if (!reserved) {
       // Budget exhausted and still no slot — never refuse. Reserve unconditionally and
-      // dispatch; with the D-2286 streak-debounce a resulting burst-429 benches ~60s,
-      // and by 5s the in-flight probe has almost certainly resolved the account's
-      // proven state anyway (cap opens, or it benched and we'd have re-selected).
+      // dispatch; a resulting header-less 429 just fails over (reactive-only, no bench),
+      // and by 5s an in-flight slot has almost certainly freed anyway.
       accountManager.noteInflightStart(account.index);
       reserved = true;
     }
@@ -498,9 +495,8 @@ async function forwardRequest(req, res, body, accountManager, upstream, retryCou
     }
     // --- end D1DX 5xx backoff patch ---
 
-    // D1DX patch (D-1705 S3): a genuine success ends any all-throttled episode —
-    // reopen the half-open recovery gate + reset the escalation streak.
-    // D-1728: also clear this account's per-account 429 backoff streak.
+    // A genuine success marks the account proven (opens its in-flight cap) and
+    // recalibrates its success-taught 5h cap (reporting only).
     if (upstreamRes.status < 400) {
       accountManager.noteSuccess();
       accountManager.noteAccountSuccess(account.index);
@@ -633,7 +629,7 @@ async function holdForThrottle(req, res, body, accountManager, upstream, hooks, 
   const hasApikey = accountManager.hasUsableApikey?.() === true;
   if (hasApikey) {
     const fireAtMs = Math.max(0, (HOLD.apikeyDeadlineSec - HOLD.apikeyLeadSec) * 1000);
-    const hardCapped = accountManager.allHardCapped();
+    const hardCapped = accountManager.allHardCapped(ctx.reqModel);
     if (hardCapped || elapsedMs >= fireAtMs) {
       ctx.allowApikey = true;
       console.log(`[TeamClaude] apikey last-resort for ${reqId} after ${Math.round(elapsedMs / 1000)}s (${hardCapped ? 'OAuth hard-capped' : `deadline ${HOLD.apikeyDeadlineSec}s`})`);
@@ -645,7 +641,7 @@ async function holdForThrottle(req, res, body, accountManager, upstream, hooks, 
   // budget, then an honest reset-aware 429. allHardCapped short-circuits — holding a
   // genuinely capped pool with no apikey would just hang the agent before erroring.
   const remainingMs = HOLD.budgetSec * 1000 - elapsedMs;
-  if (remainingMs <= 0 || accountManager.allHardCapped()) {
+  if (remainingMs <= 0 || accountManager.allHardCapped(ctx.reqModel)) {
     return sendAllThrottled429(res, accountManager, ctx);
   }
 

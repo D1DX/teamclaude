@@ -19,22 +19,17 @@ export function createDefaultConfig() {
     upstream: 'https://api.anthropic.com',
     warmOnStartup: true,           // ping each account at boot to anchor rate-limit windows
     // ── Routing (D1DX, D-2104) — real-data pace-to-weekly-line ──
-    switchThreshold: 0.98,         // HARD unusable ceiling on real unified-5h/7d utilization
+    switchThreshold: 0.98,         // reporting band only (the near-ceiling display log)
     cacheAffinityWindowSec: 300,   // a session sticks to its account while used within this window
     bindingEvictSec: 1800,         // drop an idle session binding after this long
-    fiveHourSoftCeiling: 0.90,     // never-stall rail: no NEW load at/over this 5h utilization
-    fiveHourWarnCeiling: 0.75,     // in-flight cap drops to 1 in [warn, soft) — slow-drain a near-cap account, no burst overshoot
     farOverLineThreshold: 0.10,    // rebind a warm session only when this far past its weekly pace line
     paceTieBand: 0.10,             // anti-dogpile: accounts within this of the best paceScore spread by load
-    maxInflightPerAccount: 5,      // proven-account in-flight cap (unproven = 1, the probe-gate) — D-2236: 3→5 for deadline throughput
+    maxInflightPerAccount: 5,      // atomic in-flight cap per account — D-2236: 3→5 for deadline throughput
     maxSessionsPerAccount: 7,      // hard cap on bound warm sessions per account (instances limit) — D-2236: 4→7 for deadline throughput
-    backoffSec: 60,                // 429 escalating-backoff base: streak-1 bench (+ jitter)
-    backoffFactor: 4,              // ×per consecutive 429 (60s → 4m → 15m)
-    backoffCapSec: 900,            // escalating-backoff ceiling (15m)
+    backoffSec: 60,                // all-throttled client retry-after floor
     allThrottledCapSec: 600,       // max client retry-after when EVERY account is throttled
-    // ── Capacity model (D-2179) ──
-    capEmaAlpha: 0.3,              // EMA weight when learning an account's 5h cap from 429s
-    capSoftCeiling: 0.75,          // publish headroom below this fraction of the learned cap
+    // ── Capacity model (reporting only) ──
+    capSoftCeiling: 0.75,          // publish headroom below this fraction of the success-taught cap
     softConcurrencyPerAccount: 3,  // warm sessions per live account before headroom runs out
     // ── Logs + ledger (observability) ──
     logRequests: false,            // per-request full-body dumps (verbose) — debug only
