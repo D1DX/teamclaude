@@ -59,9 +59,8 @@ const H = 3600 * 1000, D = 24 * H;
   const max = Math.max(...counts), min = Math.min(...counts);
   ok('6 sessions spread evenly across 3 accounts (parallel capacity)', max - min <= 1 && counts.reduce((s, c) => s + c, 0) === 6); }
 
-// (D-2179) reset-proximity boost + the old per-account backoff escalation are
-// removed — the escalating 429 ladder, streak reset, and retry-after clamp are
-// covered in escalating-backoff.test.mjs.
+// The reactive bench contract (retry-after verbatim, header-less never benches) is
+// covered in reactive-bench.test.mjs; this suite only exercises session routing.
 
 // ── eviction: idle bindings are dropped ───────────────────────────────────────
 { const am = mk({ bindingEvictSec: 1 });
