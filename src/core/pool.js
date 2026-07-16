@@ -48,7 +48,8 @@ export function createAccounts(rawAccounts) {
     credential: acct.accessToken || acct.apiKey,
     upstream: acct.upstream || null,   // D-2655: per-account upstream override (GLM/OpenRouter last-resort)
     model: acct.model || null,         // D-2655: rewrite body.model for this account
-    provider: acct.provider || null,   // D-2655: OpenRouter provider routing (fp8 pin)
+    provider: acct.provider || null,   // D-2655: OpenRouter provider routing (fp8 pin) — also the seam adapter selector (§7)
+    modelMap: acct.modelMap || null,   // §7 slice-8 grammar: family → outbound model id (dormant; no live account declares it)
     refreshToken: acct.refreshToken || null,
     expiresAt: acct.expiresAt || null,
     status: 'active',
@@ -83,7 +84,8 @@ export function addAccount(mgr, acctData) {
     credential: acctData.accessToken || acctData.apiKey,
     upstream: acctData.upstream || null,   // D-2655
     model: acctData.model || null,         // D-2655
-    provider: acctData.provider || null,   // D-2655
+    provider: acctData.provider || null,   // D-2655 pin + seam adapter selector (§7)
+    modelMap: acctData.modelMap || null,   // §7 slice-8 grammar (dormant)
     refreshToken: acctData.refreshToken || null,
     expiresAt: acctData.expiresAt || null,
     status: 'active',

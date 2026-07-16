@@ -12,7 +12,7 @@
   ],
   "scripts": {
     "start": "node src/index.js",
-    "test": "node test/selection.test.mjs && node test/pace-controller.test.mjs && node test/reactive-bench.test.mjs && node test/herd-recovery.test.mjs && node test/token-flush.test.mjs && node test/token-store-race.test.mjs && node test/capacity.test.mjs && node test/session-routing.test.mjs && node test/all-throttled-hold.test.mjs && node test/fleet.test.mjs && node test/tree.test.mjs && node test/version.test.mjs && node test/quota-reset-storm.test.mjs && node test/deck-snapshot.test.mjs && node test/warm-headroom.test.mjs && node test/per-family-reject.test.mjs && node test/http-auth.test.mjs && node test/config-perms.test.mjs && node test/http-passthrough.test.mjs && node test/model.test.mjs && node test/advisor-routing.test.mjs && node test/quota-probe.test.mjs"
+    "test": "node test/selection.test.mjs && node test/pace-controller.test.mjs && node test/reactive-bench.test.mjs && node test/herd-recovery.test.mjs && node test/token-flush.test.mjs && node test/token-store-race.test.mjs && node test/capacity.test.mjs && node test/session-routing.test.mjs && node test/all-throttled-hold.test.mjs && node test/fleet.test.mjs && node test/tree.test.mjs && node test/version.test.mjs && node test/quota-reset-storm.test.mjs && node test/deck-snapshot.test.mjs && node test/warm-headroom.test.mjs && node test/per-family-reject.test.mjs && node test/http-auth.test.mjs && node test/config-perms.test.mjs && node test/http-passthrough.test.mjs && node test/model.test.mjs && node test/advisor-routing.test.mjs && node test/quota-probe.test.mjs && node test/provider-seam.test.mjs"
   },
   "keywords": [
     "claude",
