@@ -20,6 +20,8 @@ import { join } from 'node:path';
 import { decideHold } from '../core/hold-policy.js';
 import { streamResponse, extractUsageFromBody } from './sse.js';
 import { parseRequestModel, parseAdvisorModel, parseRequestEffort } from '../model.js';
+import { resolveProvider } from '../providers/provider.js';
+import '../providers/anthropic.js'; // self-registers the default 'anthropic' adapter
 
 const HOP_BY_HOP_HEADERS = new Set([
   'host', 'connection', 'keep-alive', 'transfer-encoding',
@@ -275,67 +277,52 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
     return forwardRequest(req, res, body, accountManager, upstream, retryCount + 1, hooks, reqId, ctx, logDir);
   }
 
-  // Build upstream request headers
-  const isOAuth = account.type === 'oauth';
+  // Build upstream request headers. Strip the inbound proxy `x-api-key` and the
+  // hop-by-hop / accept-encoding headers (Node fetch auto-decompresses, which
+  // would mismatch the Content-Encoding we forward). The provider adapter sets the
+  // UPSTREAM credential below.
   const headers = {};
   for (const [key, value] of Object.entries(req.headers)) {
     const lk = key.toLowerCase();
     if (HOP_BY_HOP_HEADERS.has(lk)) continue;
     if (lk === 'x-api-key') continue;
-    // Strip accept-encoding: Node fetch auto-decompresses, which would
-    // mismatch the Content-Encoding header we forward to the client
     if (lk === 'accept-encoding') continue;
     headers[key] = value;
   }
 
-  // --- D1DX patch: defend against claude-code OAuth-beta clobber regression.
-  // Claude Code 2.1.121+ intermittently drops `oauth-2025-04-20` from
-  // `anthropic-beta` when model-level betas are merged in (Object.assign
-  // source-order bug; OpenClaw #41444). Server returns 401 with misleading
-  // "OAuth authentication is currently not supported". Always ensure the
-  // gate is present on OAuth-account requests.
-  if (isOAuth) {
-    const REQUIRED_OAUTH_BETA = 'oauth-2025-04-20';
-    const betaKey = Object.keys(headers).find(k => k.toLowerCase() === 'anthropic-beta');
-    const existing = betaKey ? String(headers[betaKey]).split(',').map(s => s.trim()).filter(Boolean) : [];
-    if (!existing.includes(REQUIRED_OAUTH_BETA)) {
-      existing.unshift(REQUIRED_OAUTH_BETA);
-      headers[betaKey || 'anthropic-beta'] = existing.join(',');
-    }
-  }
-  // --- end D1DX patch ---
+  // Provider seam (architecture-v3 §7): the adapter owns ALL upstream SHAPE — the
+  // credential + OAuth-beta injection, the base URL (honoring the D-2655 per-account
+  // override), and the outbound model map. Policy (selection/failover/hold) already
+  // ran in core; an adapter only describes its upstream, it never softens a gate.
+  const provider = resolveProvider(account);
+  provider.applyAuth(account, headers);
 
-  if (isOAuth) {
-    headers['authorization'] = `Bearer ${account.credential}`;
-  } else {
-    headers['x-api-key'] = account.credential;
-  }
-
-  // --- D1DX patch (D-2655): per-account upstream + model override for the
-  // apikey last-resort (GLM-5.2 via OpenRouter). Fires ONLY for an apikey
-  // account that declares its own `upstream`; OAuth + plain Anthropic-apikey
-  // are untouched. Rewrites body.model, pins the fp8 provider, swaps to Bearer.
-  let effectiveUpstream = upstream;
+  // mapModel: resolve the outbound model for this account. null = this account is
+  // NOT a route for reqModel — the no-alternative signal (§5 / DL-2536). Unreachable
+  // today (no live account declares a modelMap); when a future modelMap omits a
+  // family the client gets an honest 429, never a silent cross-model substitution.
   let outBody = body;
-  if (account.type === 'apikey' && account.upstream) {
-    effectiveUpstream = account.upstream;
-    if (account.model && body.length > 0) {
-      try {
-        const parsed = JSON.parse(body.toString());
-        parsed.model = account.model;
-        if (account.provider) parsed.provider = account.provider;
-        outBody = Buffer.from(JSON.stringify(parsed));
-        for (const k of Object.keys(headers)) {
-          if (k.toLowerCase() === 'content-length') delete headers[k];
-        }
-      } catch { /* non-JSON body — forward unchanged */ }
-    }
-    delete headers['x-api-key'];
-    headers['authorization'] = `Bearer ${account.credential}`;
+  const mapped = provider.mapModel(reqModel, account);
+  if (mapped === null) {
+    accountManager.noteInflightEnd(account.index); // release the reserved slot
+    return sendNoRoute429(res, accountManager, ctx, reqModel);
   }
-  // --- end D1DX patch (D-2655) ---
+  // Rewrite the outbound body only when the mapping changes the model or pins a
+  // provider — a no-op on the default path, byte-for-byte the D-2655 rewrite on the
+  // apikey leg (parsed.model + optional provider pin; drop the stale content-length).
+  if (body.length > 0 && (mapped.model !== reqModel || mapped.provider != null)) {
+    try {
+      const parsed = JSON.parse(body.toString());
+      parsed.model = mapped.model;
+      if (mapped.provider != null) parsed.provider = mapped.provider;
+      outBody = Buffer.from(JSON.stringify(parsed));
+      for (const k of Object.keys(headers)) {
+        if (k.toLowerCase() === 'content-length') delete headers[k];
+      }
+    } catch { /* non-JSON body — forward unchanged */ }
+  }
 
-  const upstreamUrl = `${effectiveUpstream}${req.url}`;
+  const upstreamUrl = `${provider.baseUrl(account)}${req.url}`;
   const method = req.method;
 
   // Build log sections
@@ -376,14 +363,8 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
       redirect: 'manual',
     });
 
-    // Extract rate limit headers
-    const rateLimitHeaders = {};
-    for (const [key, value] of upstreamRes.headers.entries()) {
-      if (key.startsWith('anthropic-ratelimit-')) {
-        rateLimitHeaders[key] = value;
-      }
-    }
-    accountManager.updateQuota(account.index, rateLimitHeaders);
+    // Extract this upstream's rate-limit headers via the adapter (§7 parseQuota).
+    accountManager.updateQuota(account.index, provider.parseQuota(upstreamRes.headers));
 
     // --- D1DX patch (D-1642): 429 → immediate failover (upstream PR #13).
     // A 429 means this account is rate-limited or out of quota. Mark it
@@ -393,11 +374,10 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
     // Once every account is throttled, getActiveAccount() returns null on the
     // next pass and the client gets a 429 with a proper retry-after to back off.
     if (upstreamRes.status === 429) {
-      // D1DX patch (D-1705 S1): pass the header through as-is (null when absent)
-      // so markRateLimited derives the real window from the unified resets
-      // instead of defaulting to a blind 60s.
-      const hdr = parseInt(upstreamRes.headers.get('retry-after'), 10);
-      const headerRetryAfter = isNaN(hdr) ? null : hdr;
+      // D1DX patch (D-1705 S1): the adapter classifies the explicit signal — the
+      // server retry-after as-is (null when absent) so markRateLimited derives the
+      // real window from the unified resets instead of a blind 60s (§7 reactive-only).
+      const { retryAfterSec: headerRetryAfter } = provider.classifyRateLimit(upstreamRes);
       // Discard the 429 response body
       await upstreamRes.body?.cancel();
       accountManager.markRateLimited(account.index, headerRetryAfter);
@@ -510,14 +490,14 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
 
     if (isStreaming) {
       const streamLog = logDir ? [] : null;
-      await streamResponse(upstreamRes.body, res, account.index, accountManager, streamLog, sessionId);
+      await streamResponse(upstreamRes.body, res, account.index, accountManager, streamLog, sessionId, provider);
       if (logDir) {
         logSections.push(`=== RESPONSE BODY (streamed) ===\n${streamLog.join('')}`);
         writeRequestLog(logDir, reqId, logSections);
       }
     } else {
       const buf = Buffer.from(await upstreamRes.arrayBuffer());
-      extractUsageFromBody(buf, account.index, accountManager, sessionId);
+      extractUsageFromBody(buf, account.index, accountManager, sessionId, provider);
       if (logDir) {
         try {
           logSections.push(`=== RESPONSE BODY ===\n${JSON.stringify(JSON.parse(buf.toString()), null, 2)}`);
@@ -656,6 +636,29 @@ function sendAllThrottled429(res, accountManager, ctx) {
     error: {
       type: 'rate_limit_error',
       message: `All ${accountManager.accounts.length} accounts throttled. Retry in ${retryAfter}s.`,
+    },
+  }));
+}
+
+// The no-alternative 429 (§5 / DL-2536): the account picked for this session has
+// no route for the requested model (its modelMap omits that family). Return an
+// honest, reset-aware 429 the client retries/reroutes, never a silent cross-model
+// substitution. Extends the envelope Claude Code already handles natively. This is
+// the mechanism only — unreachable today (no live account declares a modelMap); the
+// route choices (which models map where) stay UNANSWERED operator menus (DL-2536).
+function sendNoRoute429(res, accountManager, ctx, model) {
+  ctx.status = 429;
+  if (res.headersSent) return;
+  const retryAfter = accountManager.allThrottledBackoff();
+  res.writeHead(429, {
+    'Content-Type': 'application/json',
+    'retry-after': String(retryAfter),
+  });
+  res.end(JSON.stringify({
+    type: 'error',
+    error: {
+      type: 'rate_limit_error',
+      message: `No fallback route for ${model ?? 'the requested model'}. Retry in ${retryAfter}s.`,
     },
   }));
 }

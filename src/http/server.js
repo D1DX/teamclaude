@@ -12,6 +12,8 @@ import { mkdir } from 'node:fs/promises';
 import { BUILD } from '../version.js';
 import { handleAdminRoute } from './admin.js';
 import { forwardRequest, relayRaw, relayStream, isClientCredentialPath, configureForward } from './forward.js';
+import { configureProviders, resolveUpstream } from '../providers/provider.js';
+import '../providers/anthropic.js'; // self-registers the default 'anthropic' adapter
 
 // #81 (4fc849a): constant-time proxy-key comparison. A plain `!==` leaks the
 // match length via early-exit timing; timingSafeEqual doesn't. Returns false on
@@ -25,7 +27,10 @@ export function safeKeyEqual(a, b) {
 }
 
 export function createProxyServer(accountManager, config, hooks = {}) {
-  const upstream = config.upstream || 'https://api.anthropic.com';
+  // The default upstream for the RAW passthrough paths (token relay + #83 client-
+  // credential streams). The per-account forward path resolves its own origin via
+  // the provider adapter (§7); the literal lives once, under providers/.
+  const upstream = resolveUpstream(config);
   const proxyApiKey = config.proxy?.apiKey;
   // D1DX (D-1728): per-request full-body dumps are OFF unless `logRequests` is
   // explicitly true. This nulls the dump dir, so all the per-request log-section
@@ -37,6 +42,8 @@ export function createProxyServer(accountManager, config, hooks = {}) {
 
   // D1DX patch (D-1741): resolve the all-throttled hold knobs once, before serving.
   configureForward(config);
+  // Provider seam (§7): fold config.upstream into the default adapter's origin.
+  configureProviders(config);
 
   if (logDir) {
     mkdir(logDir, { recursive: true }).catch(() => {});
@@ -64,7 +71,7 @@ export function createProxyServer(accountManager, config, hooks = {}) {
       // `/health`) is a connectivity probe Claude Code / monitors fire ~every 30s.
       // Anthropic returns 404 for it, so WITHOUT this short-circuit every probe is
       // forwarded upstream on a real Max account — burning a token refresh + a
-      // selection + a real round-trip to api.anthropic.com, AND emitting a
+      // selection + a real upstream round-trip, AND emitting a
       // `GET / → <acct> (404)` oplog line (23% of the daily log on 2026-06-05) +
       // consuming the all-throttled path during saturation (234 spurious 429s that
       // day). Answer it locally with 200, no routing, and return BEFORE the request

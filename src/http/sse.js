@@ -13,7 +13,7 @@
 /**
  * Stream an SSE response to the client, parsing usage data along the way.
  */
-export async function streamResponse(webStream, res, accountIndex, accountManager, streamLog, sessionId = null) {
+export async function streamResponse(webStream, res, accountIndex, accountManager, streamLog, sessionId = null, provider = null) {
   const reader = webStream.getReader();
   const decoder = new TextDecoder();
   let sseBuffer = '';
@@ -40,7 +40,7 @@ export async function streamResponse(webStream, res, accountIndex, accountManage
       sseBuffer = events.pop(); // keep incomplete event
 
       for (const event of events) {
-        parseSSEUsage(event, accountIndex, accountManager, sessionId);
+        parseSSEUsage(event, accountIndex, accountManager, sessionId, provider);
       }
 
       // Handle backpressure — also bail out if client disconnects,
@@ -56,7 +56,7 @@ export async function streamResponse(webStream, res, accountIndex, accountManage
 
     // Parse any remaining buffer
     if (sseBuffer.trim()) {
-      parseSSEUsage(sseBuffer, accountIndex, accountManager, sessionId);
+      parseSSEUsage(sseBuffer, accountIndex, accountManager, sessionId, provider);
     }
   } finally {
     // Cancel upstream reader to stop consuming data nobody needs
@@ -65,45 +65,38 @@ export async function streamResponse(webStream, res, accountIndex, accountManage
   }
 }
 
-export function parseSSEUsage(event, accountIndex, accountManager, sessionId = null) {
+export function parseSSEUsage(event, accountIndex, accountManager, sessionId = null, provider = null) {
   const dataLine = event.split('\n').find(l => l.startsWith('data: '));
   if (!dataLine) return;
 
   try {
     const data = JSON.parse(dataLine.slice(6));
+    // Provider seam (§7): the adapter owns the upstream's usage SHAPE (token +
+    // cache-split extraction). D-2169: input + cache tokens + model land on
+    // message_start; output tokens arrive on message_delta (no model — the
+    // binding remembers it).
     if (data.type === 'message_start' && data.message?.usage) {
-      // D-2169: input + cache tokens + model land on message_start. Output
-      // tokens arrive on message_delta (no model — the binding remembers it).
+      const u = provider.parseUsage(data.message.usage);
       accountManager.updateUsage(
-        accountIndex, data.message.usage.input_tokens || 0, 0, sessionId,
-        { ..._cacheOpts(data.message.usage), model: data.message.model || null },
+        accountIndex, u.inputTokens, 0, sessionId,
+        { cacheCreate5m: u.cacheCreate5m, cacheCreate1h: u.cacheCreate1h, cacheRead: u.cacheRead, model: data.message.model || null },
       );
     } else if (data.type === 'message_delta' && data.usage) {
-      accountManager.updateUsage(accountIndex, 0, data.usage.output_tokens || 0, sessionId);
+      accountManager.updateUsage(accountIndex, 0, provider.parseUsage(data.usage).outputTokens, sessionId);
     }
   } catch {
     // not valid JSON, skip
   }
 }
 
-// D-2169: split a usage object's cache-creation into 5m vs 1h. When the API
-// omits the breakdown, treat all cache-creation as 5m (Claude Code's default TTL).
-function _cacheOpts(usage) {
-  const cc = usage.cache_creation || {};
-  let c5 = cc.ephemeral_5m_input_tokens;
-  let c1 = cc.ephemeral_1h_input_tokens;
-  if (c5 == null && c1 == null) { c5 = usage.cache_creation_input_tokens || 0; c1 = 0; }
-  else { c5 = c5 || 0; c1 = c1 || 0; }
-  return { cacheCreate5m: c5, cacheCreate1h: c1, cacheRead: usage.cache_read_input_tokens || 0 };
-}
-
-export function extractUsageFromBody(buffer, accountIndex, accountManager, sessionId = null) {
+export function extractUsageFromBody(buffer, accountIndex, accountManager, sessionId = null, provider = null) {
   try {
     const json = JSON.parse(buffer.toString());
     if (json.usage) {
+      const u = provider.parseUsage(json.usage);
       accountManager.updateUsage(
-        accountIndex, json.usage.input_tokens || 0, json.usage.output_tokens || 0, sessionId,
-        { ..._cacheOpts(json.usage), model: json.model || null },
+        accountIndex, u.inputTokens, u.outputTokens, sessionId,
+        { cacheCreate5m: u.cacheCreate5m, cacheCreate1h: u.cacheCreate1h, cacheRead: u.cacheRead, model: json.model || null },
       );
     }
   } catch {
