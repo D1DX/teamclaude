@@ -44,7 +44,7 @@ export function loadLedger(mgr) {
       }
     }
   } catch { /* missing/corrupt → start empty */ }
-  pruneLedger(mgr);
+  mgr._pruneLedger();
 }
 
 // Atomic save (tmp + rename) so a crash mid-write can't corrupt the ledger.
@@ -104,7 +104,7 @@ export function ledgerTouch(mgr, sessionId, accountName, inputTokens, outputToke
 export function maybeSaveLedger(mgr) {
   if (!mgr.ledgerPath || !mgr._ledgerDirty) return;
   if (Date.now() - mgr._ledgerLastSaveAt < mgr.ledgerSaveMs) return;
-  saveLedger(mgr);
+  mgr.saveLedger();
 }
 
 // Per-issue rollup across ALL ledger entries (durable, all sessions). The

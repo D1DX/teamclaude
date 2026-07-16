@@ -14,7 +14,7 @@ export function noteAccountSuccess(mgr, accountIndex) {
   const a = mgr.accounts[accountIndex];
   if (!a) return;
   a._proven = true;
-  recalibrateCap(mgr, a);
+  mgr._recalibrateCap(a);
 }
 
 // Recalibrate the learned 5h cap on a successful response so a burst-driven low

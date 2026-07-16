@@ -41,7 +41,7 @@ export function updateUsage(mgr, accountIndex, inputTokens, outputTokens, sessio
 
   // Feed the rolling burn buckets — the billable load toward the rate limit:
   // uncached input + cache writes + output; cache reads are ~free, so excluded.
-  recordBurn(mgr, account,
+  mgr._recordBurn(account,
     (inputTokens || 0) + (opts.cacheCreate5m || 0) + (opts.cacheCreate1h || 0) + (outputTokens || 0));
 
   const sb = sessionId ? mgr.sessionBindings.get(sessionId) : null;

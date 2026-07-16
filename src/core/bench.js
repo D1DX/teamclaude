@@ -26,8 +26,8 @@ export function premiumRejected(mgr, account) {
 // no network, no timer.
 export function sweepAll(mgr) {
   for (const account of mgr.accounts) {
-    isBlocked(mgr, account);       // side effect: flips an expired throttle back to active
-    clearExpiredQuotas(mgr, account);
+    mgr._isBlocked(account);       // side effect: flips an expired throttle back to active
+    mgr._clearExpiredQuotas(account);
   }
 }
 
@@ -79,9 +79,9 @@ export function atHardLimit(mgr, account) {
 
 // Usable — not blocked and not base-axis `rejected` (Q1 hard cap).
 export function isUsable(mgr, account) {
-  if (isBlocked(mgr, account)) return false;
-  clearExpiredQuotas(mgr, account);
-  return !atHardLimit(mgr, account);
+  if (mgr._isBlocked(account)) return false;
+  mgr._clearExpiredQuotas(account);
+  return !mgr._atHardLimit(account);
 }
 
 // Tier-3 fallback (pure): the soonest-to-reset account, reactivated only if its
@@ -115,7 +115,7 @@ export function markRateLimited(mgr, accountIndex, retryAfterSeconds) {
   if (!account) return;
   // Premium-scoped 429 (premium axis rejected, base axes NOT rejected): bench the
   // premium axis only. Benching here would stall its Sonnet/Opus/Haiku traffic too.
-  if (premiumRejected(mgr, account) && account.quota?.unifiedStatus !== 'rejected') {
+  if (mgr._premiumRejected(account) && account.quota?.unifiedStatus !== 'rejected') {
     console.log(`[TeamClaude] Account "${account.name}" premium-tier (7d_oi) capped — NOT benching account; stays usable for non-premium models`);
     return;
   }
@@ -141,6 +141,6 @@ export function markRateLimited(mgr, accountIndex, retryAfterSeconds) {
 // for any request; premium (7d_oi) rejection counts only for a premium model.
 export function allHardCapped(mgr, model = null) {
   if (!mgr.accounts.length) return false;
-  const premium = isPremiumModel(mgr, model);
-  return mgr.accounts.every(a => atHardLimit(mgr, a) || (premium && premiumRejected(mgr, a)));
+  const premium = mgr._isPremiumModel(model);
+  return mgr.accounts.every(a => mgr._atHardLimit(a) || (premium && mgr._premiumRejected(a)));
 }

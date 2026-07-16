@@ -41,7 +41,7 @@ export function paceLine(mgr, account) {
 // <0 = ahead (over-pace). Unknown utilization → treated as 0 used (behind).
 export function paceGap(mgr, account) {
   const used = account.quota.unified7d ?? 0;
-  return paceLine(mgr, account) - used;
+  return mgr._paceLine(account) - used;
 }
 
 // End-of-cycle ramp: as the account nears its 7d reset, escalate preference to
@@ -64,7 +64,7 @@ export function rampBoost(mgr, account) {
 
 // Selection score: behind-line gap + end-of-cycle ramp. Highest wins.
 export function paceScore(mgr, account) {
-  return paceGap(mgr, account) + rampBoost(mgr, account);
+  return mgr._paceGap(account) + mgr._rampBoost(account);
 }
 
 // Pick the account to (re)bind a session to. Layered eligibility — each set falls
@@ -105,8 +105,8 @@ export function pickAccountForBinding(mgr, { allowApikey = false, model = null }
   // Hard session cap (instances limit) — a burst spills beyond maxSessionsPerAccount.
   const underSession = capped.filter(a => (counts[a.index] || 0) < mgr.maxSessionsPerAccount);
   const pool = underSession.length ? underSession : capped;
-  const best = pool.reduce((m, a) => Math.max(m, paceScore(mgr, a)), -Infinity);
-  const band = pool.filter(a => best - paceScore(mgr, a) <= mgr.paceTieBand);
+  const best = pool.reduce((m, a) => Math.max(m, mgr._paceScore(a)), -Infinity);
+  const band = pool.filter(a => best - mgr._paceScore(a) <= mgr.paceTieBand);
   return band.reduce((b, a) => {
     const ca = counts[a.index] || 0, cb = counts[b.index] || 0;
     if (ca !== cb) return ca < cb ? a : b;
