@@ -2,6 +2,7 @@ import http from 'node:http';
 import { writeFile, mkdir } from 'node:fs/promises';
 import { join } from 'node:path';
 import { BUILD } from './version.js';
+import { decideHold } from './core/hold-policy.js';
 
 
 const HOP_BY_HOP_HEADERS = new Set([
@@ -617,43 +618,37 @@ async function holdForThrottle(req, res, body, accountManager, upstream, hooks, 
   const elapsedMs = Date.now() - ctx.throttleHoldStart;
   if (res.destroyed) return;
 
-  // D1DX (D-2420): paid-key last resort. With a usable apikey configured, fire it
-  // — instead of holding further or 429ing — when EITHER (a) the OAuth pool is
-  // genuinely hard-capped (real weekly/5h exhaustion; resets hours out, holding
-  // can't recover it), OR (b) the max wait has elapsed (apikeyDeadlineSec minus a
-  // small lead, so the key fires just before the client's own request timeout).
-  // Subscriptions are ALWAYS tried first and to the maximum; the paid key is the
-  // very last thing before the request would otherwise fail. ctx.allowApikey opens
-  // the gate in _pickAccountForBinding for the re-attempt (OAuth is still preferred
-  // if one recovered in the same tick — allowApikey only widens the fallback).
+  // The DECISION is pure (core/hold-policy.js); this loop owns the req/res + the
+  // forwardRequest recursion. hasUsableApikey is called once (it sweeps expired
+  // throttles as a side effect); allHardCapped is a side-effect-free read.
   const hasApikey = accountManager.hasUsableApikey?.() === true;
-  if (hasApikey) {
-    const fireAtMs = Math.max(0, (HOLD.apikeyDeadlineSec - HOLD.apikeyLeadSec) * 1000);
-    const hardCapped = accountManager.allHardCapped(ctx.reqModel);
-    if (hardCapped || elapsedMs >= fireAtMs) {
-      ctx.allowApikey = true;
-      console.log(`[TeamClaude] apikey last-resort for ${reqId} after ${Math.round(elapsedMs / 1000)}s (${hardCapped ? 'OAuth hard-capped' : `deadline ${HOLD.apikeyDeadlineSec}s`})`);
-      return forwardRequest(req, res, body, accountManager, upstream, 0, hooks, reqId, ctx, logDir);
-    }
+  const hardCapped = accountManager.allHardCapped(ctx.reqModel);
+  const decision = decideHold({
+    elapsedMs, hasApikey, hardCapped,
+    budgetSec: HOLD.budgetSec,
+    apikeyDeadlineSec: HOLD.apikeyDeadlineSec,
+    apikeyLeadSec: HOLD.apikeyLeadSec,
+    pollSec: HOLD.pollSec,
+  });
+
+  // Paid-key last resort (DL-2420): open the gate + re-attempt. ctx.allowApikey
+  // widens _pickAccountForBinding's fallback — OAuth is still preferred if one
+  // recovered in the same tick. Subscriptions are always tried first, to the max.
+  if (decision.action === 'open-apikey') {
+    ctx.allowApikey = true;
+    console.log(`[TeamClaude] apikey last-resort for ${reqId} after ${Math.round(elapsedMs / 1000)}s (${hardCapped ? 'OAuth hard-capped' : `deadline ${HOLD.apikeyDeadlineSec}s`})`);
+    return forwardRequest(req, res, body, accountManager, upstream, 0, hooks, reqId, ctx, logDir);
   }
 
-  // No apikey to fall to (or not yet due): legacy D-1741 hold to the OAuth-recovery
-  // budget, then an honest reset-aware 429. allHardCapped short-circuits — holding a
-  // genuinely capped pool with no apikey would just hang the agent before erroring.
-  const remainingMs = HOLD.budgetSec * 1000 - elapsedMs;
-  if (remainingMs <= 0 || accountManager.allHardCapped(ctx.reqModel)) {
+  // Hold budget spent, or a genuinely hard-capped pool with no apikey (holding
+  // can't recover it): an honest reset-aware 429.
+  if (decision.action === 'give-up') {
     return sendAllThrottled429(res, accountManager, ctx);
   }
 
-  // Poll: short, anti-herd jitter. Never sleep past the OAuth-recovery budget, nor
-  // (when an apikey is configured) past the apikey fire point — so the key fires on
-  // time at the deadline rather than one poll late.
-  const baseMs = HOLD.pollSec * 1000;
-  let ceilMs = remainingMs;
-  if (hasApikey) {
-    ceilMs = Math.min(ceilMs, Math.max(0, (HOLD.apikeyDeadlineSec - HOLD.apikeyLeadSec) * 1000 - elapsedMs));
-  }
-  const waitMs = Math.min(ceilMs, baseMs + Math.floor(Math.random() * baseMs));
+  // Poll: short, anti-herd jitter within the ceiling the decision computed (never
+  // past the OAuth-recovery budget, nor — with an apikey — past the fire point).
+  const waitMs = Math.min(decision.ceilMs, decision.baseMs + Math.floor(Math.random() * decision.baseMs));
 
   ctx.throttleHolds = (ctx.throttleHolds || 0) + 1;
   if (ctx.throttleHolds === 1 || ctx.throttleHolds % 6 === 0) {

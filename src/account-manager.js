@@ -10,6 +10,7 @@ import { getActiveAccount as selGetActiveAccount, pickAccountForBinding as selPi
 import { noteInflightStart as dispNoteInflightStart, noteInflightEnd as dispNoteInflightEnd, tryReserveInflight as dispTryReserveInflight, atInflightCap as dispAtInflightCap } from './core/dispatch.js';
 import { sweepAll as benchSweepAll, clearExpiredQuotas as benchClearExpiredQuotas, isBlocked as benchIsBlocked, atHardLimit as benchAtHardLimit, isUsable as benchIsUsable, soonestUsableOrNull as benchSoonestUsableOrNull, isPremiumModel as benchIsPremiumModel, premiumRejected as benchPremiumRejected, markRateLimited as benchMarkRateLimited, allHardCapped as benchAllHardCapped } from './core/bench.js';
 import { updateQuota as quotaUpdateQuota } from './core/quota.js';
+import { allThrottledBackoff as holdAllThrottledBackoff } from './core/hold-policy.js';
 
 // D1DX (D-1728): D1DX session presence registry — used only to resolve a
 // session emoji for log/TUI display. Best-effort; never load-bearing for routing.
@@ -797,29 +798,8 @@ export class AccountManager {
     this._ledgerDirty = true;
   }
 
-  /**
-   * Retry-after (seconds) to hand the client when EVERY account is throttled.
-   * Real-reset-aware (soonest genuine reset across the pool), clamped to
-   * [backoffSec, allThrottledCapSec]. covered by reactive-bench.test.
-   */
-  allThrottledBackoff() {
-    const now = Date.now();
-    let soonest = Infinity;
-    for (const a of this.accounts) {
-      const candidates = [
-        a.rateLimitedUntil,
-        a.quota.unified5hReset,
-        a.quota.unified7dReset,
-        a.quota.resetsAt ? new Date(a.quota.resetsAt).getTime() : null,
-      ];
-      for (const t of candidates) {
-        if (t && t > now && t < soonest) soonest = t;
-      }
-    }
-    let secs = soonest === Infinity ? this.backoffBaseSec : (soonest - now) / 1000;
-    secs = Math.max(this.backoffBaseSec, Math.min(this.allThrottledCapSec, secs));
-    return Math.max(1, Math.ceil(secs));
-  }
+  // Reset-aware all-throttled client retry-after (core/hold-policy.js).
+  allThrottledBackoff() { return holdAllThrottledBackoff(this); }
 
   /** A successful upstream response — no all-throttled episode state to clear now. */
   noteSuccess() { /* no-op: simplified rails have no episode streak */ }
