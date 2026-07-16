@@ -1,5 +1,5 @@
-import { readFile, writeFile, mkdir, rename } from 'node:fs/promises';
-import { writeFileSync, mkdirSync, renameSync } from 'node:fs';
+import { readFile, writeFile, mkdir, rename, chmod } from 'node:fs/promises';
+import { writeFileSync, mkdirSync, renameSync, chmodSync } from 'node:fs';
 import { join, dirname } from 'node:path';
 import { homedir } from 'node:os';
 import { randomBytes } from 'node:crypto';
@@ -93,6 +93,11 @@ async function _writeConfigAtomic(config) {
   await mkdir(dirname(path), { recursive: true });
   const tmp = path + '.tmp';
   await writeFile(tmp, JSON.stringify(config, null, 2) + '\n', { mode: 0o600 });
+  // #81 (4fc849a): `mode` above is honored only when the tmp is CREATED; a leftover
+  // tmp from a crashed prior write keeps its old perms. Force 0600 before the rename
+  // so the file that lands at `path` (proxy apiKey + account tokens) is never
+  // world-readable. rename preserves the tmp's mode, so `path` inherits 0600.
+  await chmod(tmp, 0o600);
   await rename(tmp, path);
 }
 
@@ -118,6 +123,9 @@ export function saveConfigSync(config) {
   // keeps the exit flush from tripping the async writer's rename (harmless but noisy).
   const tmp = path + '.sync.tmp';
   writeFileSync(tmp, JSON.stringify(config, null, 2) + '\n', { mode: 0o600 });
+  // #81 (4fc849a): enforce 0600 unconditionally (mode is honored only on tmp
+  // creation; a leftover tmp keeps its old perms). rename preserves the mode.
+  chmodSync(tmp, 0o600);
   renameSync(tmp, path);
 }
 

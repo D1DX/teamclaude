@@ -7,10 +7,22 @@
 //   to end: auth-exempt localhost, health short-circuit, the /v1/messages path).
 
 import http from 'node:http';
+import { timingSafeEqual } from 'node:crypto';
 import { mkdir } from 'node:fs/promises';
 import { BUILD } from '../version.js';
 import { handleAdminRoute } from './admin.js';
 import { forwardRequest, relayRaw, configureForward } from './forward.js';
+
+// #81 (4fc849a): constant-time proxy-key comparison. A plain `!==` leaks the
+// match length via early-exit timing; timingSafeEqual doesn't. Returns false on
+// any type/length mismatch (a missing header is `undefined`) before comparing.
+export function safeKeyEqual(a, b) {
+  if (typeof a !== 'string' || typeof b !== 'string') return false;
+  const ba = Buffer.from(a);
+  const bb = Buffer.from(b);
+  if (ba.length !== bb.length) return false;
+  return timingSafeEqual(ba, bb);
+}
 
 export function createProxyServer(accountManager, config, hooks = {}) {
   const upstream = config.upstream || 'https://api.anthropic.com';
@@ -36,7 +48,7 @@ export function createProxyServer(accountManager, config, hooks = {}) {
       const clientKey = req.headers['x-api-key'];
       const remoteAddr = req.socket.remoteAddress;
       const isLocal = remoteAddr === '127.0.0.1' || remoteAddr === '::1' || remoteAddr === '::ffff:127.0.0.1';
-      if (proxyApiKey && clientKey !== proxyApiKey && !isLocal) {
+      if (proxyApiKey && !safeKeyEqual(clientKey, proxyApiKey) && !isLocal) {
         res.writeHead(401, { 'Content-Type': 'application/json' });
         res.end(JSON.stringify({
           type: 'error',
