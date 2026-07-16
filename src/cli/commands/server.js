@@ -1,6 +1,7 @@
 import { join } from 'node:path';
 import { AccountManager } from '../../account-manager.js';
 import { createProxyServer } from '../../http/server.js';
+import { Prober } from '../../auth/prober.js';
 import { TUI } from '../../tui.js';
 import { loadOrCreateConfig, loadConfig, saveConfig, saveConfigSync, atomicConfigUpdate } from '../../config.js';
 import { resolveLogDir, appendOpLog, pruneOldLogs, setLogRetentionHours } from '../../oplog.js';
@@ -62,6 +63,15 @@ export async function serverCommand() {
   // survive a restart; saved debounced on the hot path + on shutdown below.
   accountManager.setLedgerPath(join(resolveLogDir(config), 'usage-ledger.json'));
   accountManager.loadLedger();
+
+  // DL-3105: zero-spend quota probe — DISABLED BY DEFAULT. Opt in with
+  // config.quotaProbeSeconds > 0; it then reads each OAuth account's
+  // /api/oauth/usage on that interval, feeding REPORTING only (never admission,
+  // never message spend). Constructed here (in scope for the shutdown paths);
+  // started after warm + listen below when enabled.
+  const quotaProbeMs = Number.isFinite(config.quotaProbeSeconds) && config.quotaProbeSeconds > 0
+    ? config.quotaProbeSeconds * 1000 : 0;
+  const prober = new Prober(accountManager, { intervalMs: quotaProbeMs });
 
   // Persist refreshed tokens back to config (re-read from disk to avoid clobbering
   // accounts added externally, e.g. by `teamclaude import` while server is running)
@@ -143,7 +153,7 @@ export async function serverCommand() {
         if (!diskConfig) return 0;
         return syncAccountsFromDisk(diskConfig, config, accountManager);
       },
-      onQuit: () => { flushTokensSync(); accountManager.saveLedger(); server.close(() => process.exit(0)); },
+      onQuit: () => { prober.stop(); flushTokensSync(); accountManager.saveLedger(); server.close(() => process.exit(0)); },
     });
     hooks = {
       onRequestStart: (id, info) => tui.onRequestStart(id, info),
@@ -276,6 +286,10 @@ export async function serverCommand() {
       console.log(sep);
       console.log('');
     }
+    // DL-3105: start the zero-spend quota probe once the server is up (no-op unless
+    // config.quotaProbeSeconds > 0). Post-warm so the first probe doesn't collide
+    // with the startup warm; unref'd timer so it never keeps the process alive.
+    prober.start();
   });
 
   // D-2236: process-level safety net. The per-request handler (server.js) catches
@@ -318,12 +332,14 @@ export async function serverCommand() {
   if (!tui) {
     process.on('SIGINT', () => {
       console.log('\n[TeamClaude] Shutting down...');
+      prober.stop();
       flushTokensSync();
       accountManager.saveLedger();
       server.close(() => process.exit(0));
     });
     process.on('SIGTERM', () => {
       console.log('\n[TeamClaude] Shutting down...');
+      prober.stop();
       flushTokensSync();
       accountManager.saveLedger();
       server.close(() => process.exit(0));

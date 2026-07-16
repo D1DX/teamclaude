@@ -123,7 +123,13 @@ export class TUI {
 
   onRequestRouted(id, info) {
     const r = this.active.get(id);
-    if (r) r.account = info.account;
+    if (r) {
+      r.account = info.account;
+      // DL-2785 data: carry the parsed model + effort on the live request record
+      // for the model·effort Activity tag (this render never builds the tag yet).
+      if (info.model != null) r.model = info.model;
+      if (info.effort != null) r.effort = info.effort;
+    }
   }
 
   onRequestEnd(id, info) {

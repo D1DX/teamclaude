@@ -19,6 +19,7 @@ import { writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { decideHold } from '../core/hold-policy.js';
 import { streamResponse, extractUsageFromBody } from './sse.js';
+import { parseRequestModel, parseAdvisorModel, parseRequestEffort } from '../model.js';
 
 const HOP_BY_HOP_HEADERS = new Set([
   'host', 'connection', 'keep-alive', 'transfer-encoding',
@@ -201,16 +202,25 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
   // the cache window lapses. No header (warmer / health / non-CC) → global
   // getActiveAccount() fallback (unchanged behavior).
   const sessionId = req.headers['x-claude-code-session-id'] || null;
-  // DL-2841: parse the outbound model so selection can avoid a premium-tier (7d_oi)
-  // capped account for premium requests only (non-premium keeps flowing to it). Cheap
-  // one-shot parse; a non-JSON / unparseable body → model unknown → treated non-premium.
-  let reqModel = null;
-  if (body && body.length) { try { reqModel = JSON.parse(body.toString('utf8')).model || null; } catch { /* model unknown */ } }
-  ctx.reqModel = reqModel; // Q1: the hold loop consults allHardCapped(model) for premium pool-wide rejection
+  // DL-3105: streaming, byte-exact parse of the outbound body (model.js) — replaces
+  // the whole-body JSON.parse. reqModel = the executor (top-level `model`); advisorModel
+  // = a model nested in the advisor tool (Claude Code's advisor tool, DL-2841), which
+  // spends its own quota tier and so must steer selection too. Effort is data-only for
+  // the Deck tag (DL-2785). Never mistakes a `"model"` in conversation text for the
+  // real field; an unparseable body → all null → treated non-premium.
+  let reqModel = null, advisorModel = null, reqEffort = null;
+  if (body && body.length) {
+    reqModel = parseRequestModel(body);
+    advisorModel = parseAdvisorModel(body);
+    reqEffort = parseRequestEffort(body);
+  }
+  ctx.reqModel = reqModel;         // Q1: the hold loop consults allHardCapped(model, advisor)
+  ctx.advisorModel = advisorModel; // DL-2841: premium skip must see the advisor model too
+  ctx.reqEffort = reqEffort;       // DL-2785: data only (Activity tag), never admission
   // D1DX (D-2420): the apikey is admitted only once the hold loop has set
   // ctx.allowApikey (max wait elapsed, or pool hard-capped). Normal binds keep it
   // gated so an all-OAuth-throttled pool returns null → HOLD, not the paid key.
-  const account = accountManager.getAccountForSession(sessionId, { allowApikey: ctx.allowApikey === true, model: reqModel });
+  const account = accountManager.getAccountForSession(sessionId, { allowApikey: ctx.allowApikey === true, model: reqModel, advisorModel });
   if (!account) {
     // D1DX patch (D-1741): all accounts throttled at selection time — HOLD the
     // inference request and poll for one to free up, instead of returning a 429
@@ -247,7 +257,7 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
 
   // Track which account handles this request
   ctx.account = account.name;
-  hooks.onRequestRouted?.(reqId, { account: account.name });
+  hooks.onRequestRouted?.(reqId, { account: account.name, model: reqModel, effort: reqEffort });
 
   // In-flight slot already reserved above (atomically via tryReserveInflight, or the
   // never-refuse fallback). Released by the dispatch try/finally below, or explicitly
@@ -588,7 +598,7 @@ async function holdForThrottle(req, res, body, accountManager, upstream, hooks, 
   // forwardRequest recursion. hasUsableApikey is called once (it sweeps expired
   // throttles as a side effect); allHardCapped is a side-effect-free read.
   const hasApikey = accountManager.hasUsableApikey?.() === true;
-  const hardCapped = accountManager.allHardCapped(ctx.reqModel);
+  const hardCapped = accountManager.allHardCapped(ctx.reqModel, ctx.advisorModel);
   const decision = decideHold({
     elapsedMs, hasApikey, hardCapped,
     budgetSec: HOLD.budgetSec,

@@ -110,3 +110,31 @@ export function updateQuota(mgr, accountIndex, headers) {
     console.log(`[TeamClaude] Account "${account.name}" at ${(weeklyUtil * 100).toFixed(1)}% weekly — near ceiling`);
   }
 }
+
+// Apply a zero-spend /api/oauth/usage probe result (auth/prober.js, DL-3105).
+// REPORTING ONLY — deliberately narrower than updateQuota: it writes utilization +
+// reset onto the base 5h/7d axes (the pace line + capacity + Deck display read
+// these) and the premium sub-axis utilization for display, but it NEVER touches an
+// admission signal (unifiedStatus, premiumStatus, _premiumRejectedUntil) and NEVER
+// counts a request. "reactive-only stands": admission flips only on a real 429.
+// buckets are the normalized { utilization, resetAt } shape from oauth.fetchUsage.
+export function applyProbeUsage(mgr, accountIndex, usage) {
+  const account = mgr.accounts[accountIndex];
+  if (!account || !usage) return;
+  const nowMs = Date.now();
+  // Store a bucket's util + reset, honoring the D-2236 guard: never store a reset
+  // already in the past (clear the window so the next observation repopulates it).
+  const apply = (bucket, utilKey, resetKey) => {
+    if (!bucket) return;
+    if (bucket.utilization != null) account.quota[utilKey] = bucket.utilization;
+    if (bucket.resetAt != null) {
+      if (bucket.resetAt > nowMs) account.quota[resetKey] = bucket.resetAt;
+      else { account.quota[resetKey] = null; account.quota[utilKey] = null; }
+    }
+  };
+  apply(usage.fiveHour, 'unified5h', 'unified5hReset');
+  apply(usage.sevenDay, 'unified7d', 'unified7dReset');
+  // Premium (7d_oi) sub-axis utilization for the Deck only — the probe never sets
+  // the _premiumRejectedUntil admission bench (a real premium 429 does, updateQuota).
+  apply(usage.sevenDayFable, 'premiumUtil', 'premiumReset');
+}

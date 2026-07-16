@@ -17,7 +17,7 @@ export function getActiveAccount(mgr, opts = {}) {
   // call always picks. A premium request never sticks on a premium-capped account.
   if (mgr._didBootSelect && current && mgr._isUsable(current)
       && !mgr._apikeyShouldYield(current)
-      && !(mgr._isPremiumModel(opts.model) && mgr._premiumRejected(current))) {
+      && !(mgr._premiumRequested(opts) && mgr._premiumRejected(current))) {
     return current; // stay cache-warm
   }
   mgr._didBootSelect = true;
@@ -77,7 +77,7 @@ export function paceScore(mgr, account) {
 // Then a PACE TIE-BAND: accounts within paceTieBand of the best paceScore are
 // "equally behind" → spread a concurrent burst across them by load (fewest warm
 // sessions, then fewest in-flight) instead of dogpiling the single best.
-export function pickAccountForBinding(mgr, { allowApikey = false, model = null } = {}) {
+export function pickAccountForBinding(mgr, { allowApikey = false, model = null, advisorModel = null } = {}) {
   const usableAll = mgr.accounts.filter(a => mgr._isUsable(a));
   if (usableAll.length === 0) return mgr._soonestUsableOrNull();
   // apikey accounts are a STRICT last resort: an apikey has no weekly line → flat-0
@@ -90,9 +90,10 @@ export function pickAccountForBinding(mgr, { allowApikey = false, model = null }
   else if (allowApikey) usable = usableAll;            // last resort → admit apikey
   else return null;                                    // only apikey usable, not yet allowed → HOLD
   // A premium-tier request must avoid premium-capped accounts (they serve non-premium
-  // fine but would 429 this model). Fall back to the unfiltered set only if every
-  // candidate is premium-capped (then it 429s honestly rather than never binding).
-  if (mgr._isPremiumModel(model)) {
+  // fine but would 429 this model). Premium = executor OR nested advisor model premium
+  // (DL-2841). Fall back to the unfiltered set only if every candidate is premium-capped
+  // (then it 429s honestly rather than never binding).
+  if (mgr._premiumRequested({ model, advisorModel })) {
     const premiumOk = usable.filter(a => !mgr._premiumRejected(a));
     if (premiumOk.length) usable = premiumOk;
   }

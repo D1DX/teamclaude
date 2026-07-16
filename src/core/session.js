@@ -32,8 +32,9 @@ export function getAccountForSession(mgr, sessionId, opts = {}) {
     // normal over-pace never churns a warm session).
     const farOverLine = acct ? mgr._paceGap(acct) < -mgr.farOverLineThreshold : false;
     // A premium-tier request on a premium-capped bound account must rebind, else
-    // every premium request on it would 429. Non-premium requests keep the binding.
-    const premiumMiss = mgr._isPremiumModel(opts.model) && mgr._premiumRejected(acct);
+    // every premium request on it would 429. Premium = executor OR nested advisor
+    // model (DL-2841). Non-premium requests keep the binding.
+    const premiumMiss = mgr._premiumRequested(opts) && mgr._premiumRejected(acct);
     if (acct && warm && !mgr._isBlocked(acct) && !mgr._atHardLimit(acct)
         && !farOverLine
         && !mgr._apikeyShouldYield(acct) && !premiumMiss) {

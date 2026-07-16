@@ -12,8 +12,8 @@ import { createAccounts, addAccount as poolAddAccount, removeAccount as poolRemo
 import { getAccountForSession as sessGetAccountForSession, activeSessionCounts as sessActiveSessionCounts, evictStaleBindings as sessEvictStaleBindings, sessionBindingSummary as sessBindingSummary, sessionAggregate as sessAggregate } from './core/session.js';
 import { getActiveAccount as selGetActiveAccount, pickAccountForBinding as selPickAccountForBinding, paceLine as selPaceLine, paceGap as selPaceGap, rampBoost as selRampBoost, paceScore as selPaceScore, apikeyShouldYield as selApikeyShouldYield, hasUsableApikey as selHasUsableApikey, switchTo as selSwitchTo } from './core/selection.js';
 import { noteInflightStart as dispNoteInflightStart, noteInflightEnd as dispNoteInflightEnd, tryReserveInflight as dispTryReserveInflight, atInflightCap as dispAtInflightCap } from './core/dispatch.js';
-import { sweepAll as benchSweepAll, clearExpiredQuotas as benchClearExpiredQuotas, isBlocked as benchIsBlocked, atHardLimit as benchAtHardLimit, isUsable as benchIsUsable, soonestUsableOrNull as benchSoonestUsableOrNull, isPremiumModel as benchIsPremiumModel, premiumRejected as benchPremiumRejected, markRateLimited as benchMarkRateLimited, allHardCapped as benchAllHardCapped } from './core/bench.js';
-import { updateQuota as quotaUpdateQuota } from './core/quota.js';
+import { sweepAll as benchSweepAll, clearExpiredQuotas as benchClearExpiredQuotas, isBlocked as benchIsBlocked, atHardLimit as benchAtHardLimit, isUsable as benchIsUsable, soonestUsableOrNull as benchSoonestUsableOrNull, isPremiumModel as benchIsPremiumModel, premiumRejected as benchPremiumRejected, premiumRequested as benchPremiumRequested, markRateLimited as benchMarkRateLimited, allHardCapped as benchAllHardCapped } from './core/bench.js';
+import { updateQuota as quotaUpdateQuota, applyProbeUsage as quotaApplyProbeUsage } from './core/quota.js';
 import { allThrottledBackoff as holdAllThrottledBackoff } from './core/hold-policy.js';
 
 // D1DX (D-1728): D1DX session presence registry — used only to resolve a
@@ -214,6 +214,10 @@ export class AccountManager {
 
   // Is this account currently premium-tier (7d_oi) capped? (core/bench.js).
   _premiumRejected(account) { return benchPremiumRejected(this, account); }
+
+  // Does this request need a premium account — executor OR advisor model premium
+  // (DL-2841 advisor-aware premium skip)? (core/bench.js).
+  _premiumRequested(opts) { return benchPremiumRequested(this, opts); }
 
   // End-of-cycle ramp (control law #3): as the account nears its 7d-reset, escalate
   // preference to drain unused weekly quota before it resets (use-it-or-lose-it).
@@ -571,6 +575,11 @@ export class AccountManager {
   // Update an account's quota from upstream response headers (core/quota.js).
   updateQuota(accountIndex, headers) { return quotaUpdateQuota(this, accountIndex, headers); }
 
+  // Apply a zero-spend /api/oauth/usage probe result — REPORTING ONLY (core/quota.js).
+  // Writes utilization/reset for pace + capacity; never an admission signal, never
+  // counts a request. Fed by auth/prober.js (DL-3105).
+  applyProbeUsage(accountIndex, usage) { return quotaApplyProbeUsage(this, accountIndex, usage); }
+
   // Cumulative token usage + cost + burn buckets from a response (accounting/usage.js).
   updateUsage(accountIndex, inputTokens, outputTokens, sessionId = null, opts = {}) {
     return usageUpdateUsage(this, accountIndex, inputTokens, outputTokens, sessionId, opts);
@@ -595,7 +604,8 @@ export class AccountManager {
   computeCapacity() { return capComputeCapacity(this); }
 
   // Q1 signal 2: every account server-`rejected` for this request's axis (core/bench.js).
-  allHardCapped(model = null) { return benchAllHardCapped(this, model); }
+  // advisorModel: premium (7d_oi) rejection counts when executor OR advisor is premium.
+  allHardCapped(model = null, advisorModel = null) { return benchAllHardCapped(this, model, advisorModel); }
 
   /**
    * Ensure an OAuth account's token is fresh, refreshing if needed.
@@ -690,7 +700,14 @@ export class AccountManager {
 
   onRequestRouted(id, info) {
     const r = this._active.get(id);
-    if (r) r.account = info.account;
+    if (r) {
+      r.account = info.account;
+      // DL-2785 data: surface the parsed executor model + effort on the live
+      // request record so the Deck's model·effort Activity tag can render them
+      // (this module never builds the tag — data only).
+      if (info.model != null) r.model = info.model;
+      if (info.effort != null) r.effort = info.effort;
+    }
   }
 
   onRequestEnd(id, info) {

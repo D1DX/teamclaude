@@ -24,6 +24,8 @@ export async function importCredentials(filePath) {
 }
 
 const PROFILE_URL = 'https://api.anthropic.com/api/oauth/profile';
+const USAGE_URL = 'https://api.anthropic.com/api/oauth/usage';
+const OAUTH_USAGE_BETA = 'oauth-2025-04-20';
 const DEFAULT_TOKEN_ENDPOINT = 'https://platform.claude.com/v1/oauth/token';
 const DEFAULT_CLIENT_ID = '9d1c250a-e61b-44d9-88ed-5944d1962f5e';
 
@@ -136,6 +138,87 @@ export async function fetchProfile(accessToken) {
     };
   } catch (err) {
     return { error: err.message || String(err) };
+  }
+}
+
+// ── Zero-spend quota probe (DL-3105, upstream #49) ─────────────────────────
+// GET /api/oauth/usage reads an OAuth account's live utilization/reset WITHOUT
+// consuming any message quota — the account never rotates onto real traffic to
+// learn its window. Feeds REPORTING/capacity only (auth/prober.js →
+// applyProbeUsage); reactive-only admission is untouched.
+
+// Find the per-model weekly bucket in the usage payload's limits[] array — the
+// model-scoped weekly quota (e.g. Fable) lives there, while the legacy
+// seven_day_<model> top-level keys read null. Returns the raw bucket or null.
+export function findScopedWeeklyLimit(data, modelNamePattern) {
+  const limits = Array.isArray(data?.limits) ? data.limits : [];
+  const entry = limits.find((l) =>
+    l && l.group === 'weekly' && l.scope?.model?.display_name
+    && modelNamePattern.test(l.scope.model.display_name));
+  if (!entry) return null;
+  return { utilization: entry.percent, resets_at: entry.resets_at };
+}
+
+// Normalize a raw usage bucket to { utilization (0-1), resetAt (ms epoch) }.
+// Accepts the several field spellings the endpoint uses; percentages are 0-100,
+// resets are epoch seconds/ms or an ISO string. Returns null on a missing bucket.
+export function normalizeUsageBucket(bucket) {
+  if (!bucket || typeof bucket !== 'object') return null;
+
+  const rawPct = bucket.used_percentage ?? bucket.utilization ?? bucket.usedPercentage;
+  const parsedPct = typeof rawPct === 'number' ? rawPct : parseFloat(rawPct);
+  const utilization = Number.isFinite(parsedPct) ? parsedPct / 100 : null;
+
+  const rawReset = bucket.resets_at ?? bucket.resetsAt ?? bucket.reset_at ?? bucket.resetAt;
+  let resetAt = null;
+  if (typeof rawReset === 'number') {
+    resetAt = rawReset < 1e12 ? rawReset * 1000 : rawReset;
+  } else if (typeof rawReset === 'string') {
+    const asNum = Number(rawReset);
+    if (Number.isFinite(asNum) && rawReset.trim() !== '') {
+      resetAt = asNum < 1e12 ? asNum * 1000 : asNum;
+    } else {
+      const parsed = Date.parse(rawReset);
+      if (Number.isFinite(parsed)) resetAt = parsed;
+    }
+  }
+
+  return { utilization, resetAt };
+}
+
+// Read an OAuth account's quota from the zero-spend /api/oauth/usage endpoint.
+// Returns { fiveHour, sevenDay, sevenDayFable } normalized buckets on success,
+// or { error, status } on failure (status 401 signals a stale token → retry
+// after a forced refresh). Consumes NO message quota.
+export async function fetchUsage(accessToken) {
+  try {
+    const res = await fetch(USAGE_URL, {
+      headers: {
+        'Authorization': `Bearer ${accessToken}`,
+        'anthropic-beta': OAUTH_USAGE_BETA,
+        'Accept': 'application/json',
+      },
+    });
+
+    if (!res.ok) {
+      let detail = '';
+      try {
+        const body = await res.json();
+        detail = body?.error?.message || JSON.stringify(body).slice(0, 200);
+      } catch {
+        detail = await res.text().catch(() => '');
+      }
+      return { error: `HTTP ${res.status}${detail ? ': ' + detail : ''}`, status: res.status };
+    }
+
+    const data = await res.json();
+    return {
+      fiveHour: normalizeUsageBucket(data?.five_hour),
+      sevenDay: normalizeUsageBucket(data?.seven_day),
+      sevenDayFable: normalizeUsageBucket(findScopedWeeklyLimit(data, /fable/i)),
+    };
+  } catch (err) {
+    return { error: err.message || String(err), status: null };
   }
 }
 

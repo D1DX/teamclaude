@@ -21,6 +21,16 @@ export function premiumRejected(mgr, account) {
   return !!account && account._premiumRejectedUntil > Date.now();
 }
 
+// Does this request need a premium (7d_oi) account? True when EITHER the executor
+// model OR a nested advisor model (Claude Code's advisor tool, DL-2841) is premium.
+// An advisor request keeps the executor in the top-level `model` and nests the
+// advisor's model in tools[]; if the advisor model is premium (Fable) it must skip
+// a premium-capped account even when the executor (Opus/Sonnet) is not — else the
+// advisor sub-call lands on a capped account and Claude Code disables the advisor.
+export function premiumRequested(mgr, { model = null, advisorModel = null } = {}) {
+  return mgr._isPremiumModel(model) || mgr._isPremiumModel(advisorModel);
+}
+
 // Sweep ALL accounts (every request + every status read): clear an expired throttle
 // (a freed account rejoins the pool immediately) and stale quota windows. In-memory,
 // no network, no timer.
@@ -138,9 +148,11 @@ export function markRateLimited(mgr, accountIndex, retryAfterSeconds) {
 // Q1 signal 2: true when EVERY account is server-`rejected` for this request's axis
 // — the pool is hard-capped, so the hold loop stops holding (recovery is hours out)
 // and fires the apikey last resort immediately (DL-2420). Base-axis rejection counts
-// for any request; premium (7d_oi) rejection counts only for a premium model.
-export function allHardCapped(mgr, model = null) {
+// for any request; premium (7d_oi) rejection counts only for a premium request —
+// executor OR advisor model premium (DL-2841), so an all-premium-capped pool fires
+// the apikey for a Fable advisor request instead of holding on OAuth forever.
+export function allHardCapped(mgr, model = null, advisorModel = null) {
   if (!mgr.accounts.length) return false;
-  const premium = mgr._isPremiumModel(model);
+  const premium = mgr._premiumRequested({ model, advisorModel });
   return mgr.accounts.every(a => mgr._atHardLimit(a) || (premium && mgr._premiumRejected(a)));
 }
