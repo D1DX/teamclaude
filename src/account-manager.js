@@ -3,22 +3,8 @@ import { readFileSync, writeFileSync, renameSync, readdirSync, statSync, openSyn
 import { homedir } from 'node:os';
 import { join } from 'node:path';
 import { systemSnapshot as _systemSnapshot } from './infra/system.js';
+import { priceFor, CACHE_WRITE_5M_MULT, CACHE_WRITE_1H_MULT, CACHE_READ_MULT } from './accounting/pricing.js';
 
-// D1DX (D-2169): per-model API pricing, $/Mtok [input, output]. The Messages API
-// returns no cost field — we compute the API-equivalent cost from token usage +
-// the response's `model`. Cache multipliers (of the INPUT rate): write-5m 1.25×,
-// write-1h 2×, read 0.1×. Family parsed from the model string; unknown → opus
-// (Claude Code is predominantly Opus). Override per-family via opts.pricing.
-const PRICING = {
-  fable:  [10, 50],   // claude-fable-5 / mythos-5 (new top tier)
-  mythos: [10, 50],
-  opus:   [5, 25],    // opus 4.x
-  sonnet: [3, 15],    // sonnet 4.x
-  haiku:  [1, 5],     // haiku 4.5
-};
-const CACHE_WRITE_5M_MULT = 1.25;
-const CACHE_WRITE_1H_MULT = 2.0;
-const CACHE_READ_MULT = 0.1;
 // DL-2841: premium (7d_oi) sub-axis reject with no server-stated reset — bench the
 // premium axis for this long, then re-probe. Only fires when Anthropic sends a
 // `rejected` premium status but no forward-dated reset (rare); the next premium
@@ -208,7 +194,7 @@ export class AccountManager {
     this._ledgerLastSaveAt = 0;
 
     // D1DX (D-2169): per-model price overrides (family → [in$, out$] per Mtok).
-    // Falls back to the PRICING table above per family.
+    // Falls back per family to the default table in accounting/pricing.js.
     this.pricing = opts.pricing ?? null;
 
     // ── D-2697: server-side live request stream (Activity panel) ──
@@ -222,18 +208,11 @@ export class AccountManager {
     this._log = [];           // [{ t, msg }] newest-first, capped at LOG_CAP
   }
 
-  // D1DX (D-2169): resolve $/Mtok [input, output] for a model string. Family
-  // parsed from the string; unknown → opus (CC is mostly Opus).
+  // D1DX (D-2169): resolve $/Mtok [input, output] for a model string. Delegated
+  // to accounting/pricing.js (the price table + family match live there); passes
+  // this manager's per-family overrides (opts.pricing).
   _priceFor(model) {
-    const m = String(model || '').toLowerCase();
-    let key = 'opus';
-    if (m.includes('fable')) key = 'fable';
-    else if (m.includes('mythos')) key = 'mythos';
-    else if (m.includes('opus')) key = 'opus';
-    else if (m.includes('sonnet')) key = 'sonnet';
-    else if (m.includes('haiku')) key = 'haiku';
-    const [inp, out] = (this.pricing && this.pricing[key]) || PRICING[key];
-    return { in: inp, out };
+    return priceFor(model, this.pricing);
   }
 
   // D1DX patch: actively sweep ALL accounts every request + on every status read,
