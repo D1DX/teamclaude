@@ -75,5 +75,31 @@ const recover = (am, i) => { am.accounts[i].status = 'active'; am.accounts[i].ra
   ok('full-jitter bench stays within [base, ladder] (60..900s)',
      benchSec(am, 0) >= 60 && benchSec(am, 0) <= 900 && benchSec(am, 1) >= 60 && benchSec(am, 1) <= 900); }
 
+// ── 6. DL-3032 S5: capacity reports the TRUTH — 10 low-util accounts all read live ─
+// The 07-16 defect: computeCapacity reported 1/12 "live" while 10/12 accounts served at
+// u5h 0.1–0.9 (a learned-cap nearCap exclusion), so orchestrators gated spawns on a
+// false red. Now a learned-cap account is `constrained` (feeds headroom) but stays live.
+{ const am = mk(10, { capSoftCeiling: 0.75 });
+  for (let i = 0; i < 10; i++) {
+    am.accounts[i].quota.unified5h = 0.10 + i * 0.05;         // 0.10 … 0.55 — all serving, none benched/hard-capped
+    am.accounts[i]._capEst5h = 100000;                        // a learned cap
+    am._recordBurn(am.accounts[i], 90000);                    // burn past 0.75×cap → the would-be nearCap exclusion
+  }
+  const c = am.computeCapacity();
+  ok('DL-3032: 10 active low-util accounts ALL report live (≥10), not excluded by the learned cap',
+     c.liveAccounts >= 10);
+  ok('DL-3032: every such account is flagged constrained (feeds headroom, not liveness)',
+     c.accounts.every(a => a.constrained === true));
+  ok('DL-3032: the pool is NOT falsely RED while every account is serving', c.verdict !== 'red'); }
+
+// ── 7. DL-3032 S4: a near-idle account never benches past burstBenchCapSec ─────
+// Even under genuine sequential 429s, a concurrency-class (low-util) account's bench
+// caps at burstBenchCapSec — so a low-util 429 pattern can't sideline the pool for 15m.
+{ const am = mk(1, { backoffSec: 60, backoffFactor: 4, backoffCapSec: 900, burstUtilMax: 0.30, burstBenchCapSec: 120 });
+  am.accounts[0].quota.unified5h = 0.10;                      // near-idle → concurrency class
+  for (let k = 0; k < 5; k++) { am.markRateLimited(0, null); recover(am, 0); }
+  am.markRateLimited(0, null);                                // deep sequential streak on a near-idle account
+  ok('DL-3032: a low-util account never benches past burstBenchCapSec (120s, not 900s)', benchSec(am, 0) === 120); }
+
 console.log(`\n${pass} passed, ${fail} failed`);
 process.exit(fail === 0 ? 0 : 1);

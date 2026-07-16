@@ -173,6 +173,8 @@ export class AccountManager {
       _lastBenchSec: 0,    // last bench duration in seconds (display + capacity)
       _burn: null,         // Map(hourEpoch → tokens) — rolling burn buckets (≤168 = 7d)
       _capEst5h: null,     // learned 5h cap: EMA of burn5h at the first 429 of each streak
+      _maxSuccessBurn5h: null, // DL-3032: max observed SUCCESSFUL 5h burn — the recalibration target
+      _capEstAt: 0,        // DL-3032: last capEst recalibration instant (ms) — drives time-decay
       _proven: false,      // D-2104 probe-gate: returned a 200 in this active spell? unproven → in-flight cap 1
       _premiumRejectedUntil: 0, // DL-2841: ms — the account is premium-tier (7d_oi) capped until this instant; usable for non-premium models throughout
     }));
@@ -254,6 +256,15 @@ export class AccountManager {
     this.backoffCapSec      = opts.backoffCapSec      ?? 900;  // ladder ceiling (15m)
     this.allThrottledCapSec = opts.allThrottledCapSec ?? 600;  // client retry-after cap
     this.backoffJitterSec   = opts.backoffJitterSec   ?? this.backoffBaseSec; // de-sync spread (0 = deterministic)
+    // DL-3032: utilization-aware burst class. A header-less 429 whose base axes are
+    // BOTH at/under burstUtilMax is a concurrency/burst blip (clears in seconds), not
+    // quota — cap its bench at burstBenchCapSec instead of climbing the full ladder to
+    // backoffCapSec, so a synchronized low-util burst can't bench the whole pool for
+    // minutes and produce the false all-throttled hold cascade. Mid-band (util between
+    // burstUtilMax and the near-cap ceilings) keeps the escalating ladder; near-cap
+    // still benches to the axis reset.
+    this.burstUtilMax       = opts.burstUtilMax       ?? 0.30;  // ≤ this on all base axes → concurrency class
+    this.burstBenchCapSec   = opts.burstBenchCapSec   ?? 120;   // bench ceiling for concurrency-class 429s
 
     // ── Capacity model (D-2179) ──
     // Per-account hourly burn buckets (≤168 = 7d) feed a learned 5h cap (EMA of
@@ -262,6 +273,11 @@ export class AccountManager {
     this.capEmaAlpha               = opts.capEmaAlpha               ?? 0.3;
     this.capSoftCeiling            = opts.capSoftCeiling            ?? 0.75;
     this.softConcurrencyPerAccount = opts.softConcurrencyPerAccount ?? 3;
+    // DL-3032: learned-cap recalibration. The EMA cap is learned at a 429 moment and
+    // never decayed — a burst-driven low estimate freezes and falsely trips nearCap.
+    // capEst decays toward the max observed SUCCESSFUL 5h burn (proven headroom) with
+    // this half-life, and raises immediately when a success burns past capEst×capSoftCeiling.
+    this.capDecayHalfLifeHours     = opts.capDecayHalfLifeHours     ?? 24;
 
     this._sessionTagCache = { at: 0, rows: null }; // cached sessions.json read for emoji tags
 
@@ -1057,6 +1073,7 @@ export class AccountManager {
             a._burn = new Map(s.burn.filter(([k]) => k >= hr - 168)); // re-prune to 7d
           }
           if (s.capEst5h != null) a._capEst5h = s.capEst5h;
+          if (s.maxSuccessBurn5h != null) a._maxSuccessBurn5h = s.maxSuccessBurn5h; // DL-3032
         }
       }
     } catch { /* missing/corrupt → start empty */ }
@@ -1076,6 +1093,7 @@ export class AccountManager {
           usage: { ...a.usage },
           burn: a._burn ? [...a._burn] : [],
           capEst5h: a._capEst5h ?? null,
+          maxSuccessBurn5h: a._maxSuccessBurn5h ?? null, // DL-3032: proven-headroom recalibration floor
         };
       }
       const tmp = this.ledgerPath + '.tmp';
@@ -1463,14 +1481,25 @@ export class AccountManager {
         // together and re-form the synchronized recovery herd. The ladder ceiling
         // still grows with the streak; jitter only de-synchronizes WHEN each account
         // frees. backoffJitterSec === 0 keeps it deterministic (= ladder) for tests.
-        const ladderMs = Math.min(this.backoffBaseSec * 1000 * this.backoffFactor ** (account._429streak - 1), capMs);
+        //
+        // DL-3032: utilization-aware CONCURRENCY class. When both base axes sit at/under
+        // burstUtilMax the 429 is a concurrency/burst blip on a near-idle account, not
+        // quota pressure — cap the ladder ceiling at burstBenchCapSec (≪ backoffCapSec)
+        // so a synchronized low-util burst frees in ~2min instead of climbing to 15m and
+        // benching the whole pool into the false all-throttled hold. Mid-band (an axis
+        // above burstUtilMax but below the near-cap ceilings) keeps the full ladder —
+        // there the account is genuinely working and a longer bench is warranted.
+        const concurrencyClass = u5h != null && u5h <= this.burstUtilMax
+          && (u7d == null || u7d <= this.burstUtilMax);
+        const benchCapMs = concurrencyClass ? this.burstBenchCapSec * 1000 : capMs;
+        const ladderMs = Math.min(this.backoffBaseSec * 1000 * this.backoffFactor ** (account._429streak - 1), benchCapMs);
         if (this.backoffJitterSec > 0) {
           const floorMs = Math.min(this.backoffBaseSec * 1000, ladderMs);
           baseMs = floorMs + Math.random() * (ladderMs - floorMs);
         } else {
           baseMs = ladderMs;
         }
-        why = `burst×${account._429streak}`;
+        why = concurrencyClass ? `burst-cc×${account._429streak}` : `burst×${account._429streak}`;
         isBurst = true;
       }
     }
@@ -1490,6 +1519,42 @@ export class AccountManager {
     if (!a) return;
     if (a._429streak) { a._429streak = 0; a._lastBenchSec = 0; }
     a._proven = true; // D-2104 probe-gate: a 200 proves headroom → open the in-flight cap to maxInflightPerAccount
+    this._recalibrateCap(a); // DL-3032: relax a stale learned cap toward proven headroom
+  }
+
+  /**
+   * DL-3032: recalibrate the learned 5h cap on a successful response so a
+   * burst-driven low estimate can't stay frozen and falsely flag the account
+   * `constrained`. The EMA cap (learned only at 429 moments) never decayed — a
+   * concurrency-429 at low burn taught a low cap that then persisted forever. Two moves:
+   *   (1) immediate RAISE — a success that burned past capEst×capSoftCeiling proves the
+   *       soft ceiling is higher than believed, so lift capEst to put this burn back at
+   *       the ceiling (the account clearly serves more than we thought);
+   *   (2) time-DECAY toward the max observed successful 5h burn (proven headroom) with a
+   *       capDecayHalfLifeHours half-life, so a stale estimate relaxes toward reality
+   *       even without a boundary-crossing success.
+   * No-op until a cap has been learned (capEst null → constrained can't fire anyway).
+   */
+  _recalibrateCap(account) {
+    if (!account) return;
+    const now = Date.now();
+    const burn5h = this._burnWindow(account, 5);
+    if (burn5h > 0) account._maxSuccessBurn5h = Math.max(account._maxSuccessBurn5h || 0, burn5h);
+    if (account._capEst5h == null) { account._capEstAt = now; return; }
+    // (1) immediate raise on a success above the soft ceiling
+    if (burn5h > account._capEst5h * this.capSoftCeiling) {
+      account._capEst5h = burn5h / this.capSoftCeiling;
+    }
+    // (2) decay toward proven headroom (max successful burn)
+    const target = account._maxSuccessBurn5h || 0;
+    const last = account._capEstAt || now;
+    const dtHours = (now - last) / 3600000;
+    if (dtHours > 0 && this.capDecayHalfLifeHours > 0 && target > 0) {
+      const k = Math.pow(0.5, dtHours / this.capDecayHalfLifeHours);
+      account._capEst5h = target + (account._capEst5h - target) * k;
+    }
+    account._capEstAt = now;
+    this._ledgerDirty = true;
   }
 
   /**
@@ -1538,19 +1603,29 @@ export class AccountManager {
       const burn5h = this._burnWindow(a, 5);
       const cap = a._capEst5h ?? null;
       const headroomTok = cap != null ? Math.max(0, Math.round(cap * this.capSoftCeiling - burn5h)) : null;
-      const nearCap = cap != null && burn5h >= cap * this.capSoftCeiling;
+      // DL-3032: the learned soft cap now flags CONSTRAINED (feeds headroom) — it no
+      // longer removes the account from `live`. An account past its EMA soft cap is
+      // still serving; excluding it produced the false red/yellow that gated
+      // orchestrator spawns while most of the pool was active (1/12 "live" vs 10/12
+      // serving). Liveness is base-axis truth only (not benched, not dead, not
+      // hard-capped); the constraint shrinks published headroom instead.
+      const constrained = cap != null && burn5h >= cap * this.capSoftCeiling;
       const dead = a.status === 'error' || a.status === 'exhausted';
       return {
         name: a.name, status: a.status,
         benched, benchSec, streak: a._429streak || 0, inflight: a._inflight || 0,
-        burn5h, capEst5h: cap, headroomTok, nearCap,
-        live: !benched && !dead && !this._atHardLimit(a) && !nearCap,
+        burn5h, capEst5h: cap, headroomTok,
+        constrained, nearCap: constrained,   // nearCap retained as an alias for existing readers (status label)
+        live: !benched && !dead && !this._atHardLimit(a),
       };
     });
     const live = accounts.filter(a => a.live);
     const benchedAll = accounts.filter(a => a.benched);
     const { active: warmSessions } = this._activeSessionCounts();
-    const slotHeadroom = Math.max(0, live.length * this.softConcurrencyPerAccount - warmSessions);
+    // DL-3032: a constrained (near learned-cap) account is live but contributes no
+    // fresh concurrency headroom — only UNCONSTRAINED live accounts add slots.
+    const unconstrainedLive = live.filter(a => !a.constrained);
+    const slotHeadroom = Math.max(0, unconstrainedLive.length * this.softConcurrencyPerAccount - warmSessions);
     const soonestResetSec = benchedAll.length ? Math.min(...benchedAll.map(a => a.benchSec)) : 0;
 
     let verdict;

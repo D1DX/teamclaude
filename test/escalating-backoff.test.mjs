@@ -73,6 +73,39 @@ const recover = (am, i) => { am.accounts[i].status = 'active'; am.accounts[i].ra
   am.markRateLimited(0, null);
   ok('a burst-429 below the caps uses the ladder, NOT the far reset (60s)', benchSec(am, 0) === 60); }
 
+// ── DL-3032 S4: utilization-aware CONCURRENCY class. A header-less 429 with BOTH base
+//    axes at/under burstUtilMax caps the bench at burstBenchCapSec instead of climbing
+//    the full ladder — a synchronized low-util burst can't sideline the pool for
+//    minutes. Mid-band (an axis above burstUtilMax) keeps the ladder; near-cap benches
+//    to the reset. jitter pinned 0 for exact values. ─
+{ const am = mk({ backoffSec: 60, backoffFactor: 4, backoffCapSec: 900, burstUtilMax: 0.30, burstBenchCapSec: 120 });
+  am.accounts[0].quota.unified5h = 0.10;                      // near-idle → concurrency class
+  am.accounts[0].quota.unified7d = 0.05;
+  am.markRateLimited(0, null);
+  ok('S4: concurrency-class streak 1 benches the base (60s, ≤120s cap)', benchSec(am, 0) === 60);
+  recover(am, 0); am.markRateLimited(0, null);                // ladder wants 240s → capped to 120s
+  ok('S4: concurrency-class streak 2 caps at burstBenchCapSec (120s, not 240s)', benchSec(am, 0) === 120);
+  recover(am, 0); am.markRateLimited(0, null); recover(am, 0); am.markRateLimited(0, null);
+  ok('S4: a concurrency-class deep streak never exceeds burstBenchCapSec (120s, not 900s)', benchSec(am, 0) === 120); }
+
+{ const am = mk({ backoffSec: 60, backoffFactor: 4, backoffCapSec: 900, burstUtilMax: 0.30, burstBenchCapSec: 120 });
+  am.accounts[0].quota.unified5h = 0.50;                      // mid-band → NOT concurrency class
+  am.markRateLimited(0, null); recover(am, 0); am.markRateLimited(0, null); // sequential → streak 2
+  ok('S4: mid-band (u5h 0.5) keeps the full escalating ladder (240s, not capped to 120s)', benchSec(am, 0) === 240); }
+
+{ const am = mk({ backoffSec: 60, backoffCapSec: 900, burstBenchCapSec: 120 });
+  am.accounts[0].quota.unified5h = 0.92;                      // ≥ fiveHourSoftCeiling 0.90 → genuine cap
+  am.accounts[0].quota.unified5hReset = Date.now() + 300000;  // 300s out
+  am.markRateLimited(0, null);
+  ok('S4: a near-cap (u5h 0.92) 429 benches to the axis reset (≈300s), not the burst cap',
+     benchSec(am, 0) >= 299 && benchSec(am, 0) <= 301); }
+
+{ const am = mk({ backoffSec: 60, backoffFactor: 4, burstUtilMax: 0.30, burstBenchCapSec: 120 });
+  am.accounts[0].quota.unified5h = 0.10;                      // idle 5h …
+  am.accounts[0].quota.unified7d = 0.60;                      // … but 7d well above burstUtilMax
+  am.markRateLimited(0, null); recover(am, 0); am.markRateLimited(0, null); // streak 2
+  ok('S4: a hot 7d axis disqualifies the concurrency class (full ladder 240s)', benchSec(am, 0) === 240); }
+
 // ── learned cap: EMA of burn5h at the FIRST 429 of each streak ────────────────
 { const am = mk({ capEmaAlpha: 0.5 });
   am._recordBurn(am.accounts[0], 200000);
@@ -81,9 +114,32 @@ const recover = (am, i) => { am.accounts[i].status = 'active'; am.accounts[i].ra
   am._recordBurn(am.accounts[0], 100000);             // burn5h now 300k
   recover(am, 0); am.markRateLimited(0, null);        // streak 2 (sequential) — only the 1st of a streak teaches
   ok('a later 429 in the same streak does NOT re-teach the cap', am.accounts[0]._capEst5h === 200000);
-  am.noteAccountSuccess(0);                            // success → fresh streak
+  am.accounts[0]._429streak = 0;                       // fresh streak (a success resets it; set directly to
+                                                       // isolate the EMA-at-429 path from DL-3032 success-recalibration)
   recover(am, 0); am.markRateLimited(0, null);        // streak 1 again → EMA toward 300k: 0.5×200k + 0.5×300k
   ok('a fresh streak EMAs the cap toward the new burn (250k)', am.accounts[0]._capEst5h === 250000); }
+
+// ── DL-3032 S5: capEst recalibration on SUCCESS — the learned cap no longer freezes at
+//    a burst-taught low value. A success burning past capEst×capSoftCeiling RAISES the
+//    cap immediately; otherwise it time-DECAYS toward the max observed successful burn. ─
+{ const am = mk({ capSoftCeiling: 0.75, capDecayHalfLifeHours: 24 });
+  const a = am.accounts[0];
+  a._capEst5h = 100000;                                       // learned low at a burst moment
+  am._recordBurn(a, 90000);                                   // a success burns 90k > 0.75×100k = 75k
+  am.noteAccountSuccess(0);
+  ok('S5: a success above capEst×capSoftCeiling RAISES capEst (90k/0.75 = 120k)',
+     Math.round(a._capEst5h) === 120000);
+  ok('S5: the max successful burn is tracked as the decay target', a._maxSuccessBurn5h === 90000); }
+
+{ const am = mk({ capSoftCeiling: 0.75, capDecayHalfLifeHours: 24 });
+  const a = am.accounts[0];
+  a._capEst5h = 200000;
+  a._maxSuccessBurn5h = 100000;                               // proven-headroom target = 100k
+  a._capEstAt = Date.now() - 24 * 3600000;                    // one half-life ago
+  am._recordBurn(a, 50000);                                   // small success burn (below the ceiling → no raise)
+  am.noteAccountSuccess(0);
+  ok('S5: capEst decays halfway toward the max successful burn over one half-life (≈150k)',
+     Math.round(a._capEst5h) >= 149000 && Math.round(a._capEst5h) <= 151000); }
 
 // ── burn window: only the last N whole-hour buckets count ─────────────────────
 { const am = mk();

@@ -47,15 +47,19 @@ const mk = (opts = {}) => new AccountManager([
   ok('an all-benched pool is RED with 0 live', c.verdict === 'red' && c.liveAccounts === 0);
   ok('RED carries soonestResetSec for scheduling (≈200s)', c.soonestResetSec >= 199 && c.soonestResetSec <= 201); }
 
-// ── near-cap (learned) excludes an account from live ──────────────────────────
+// ── DL-3032 S5: near-cap (learned) flags CONSTRAINED but STAYS live ───────────
 { const am = mk({ capSoftCeiling: 0.75 });
   const a = am.accounts[0];
   a._capEst5h = 100000;
-  am._recordBurn(a, 80000);                                   // 80k ≥ 0.75×100k = 75k → near cap
+  am._recordBurn(a, 80000);                                   // 80k ≥ 0.75×100k = 75k → constrained
   const c = am.computeCapacity();
   const row = c.accounts.find(x => x.name === 'a0');
-  ok('an account past its learned soft cap is flagged nearCap', row.nearCap === true);
-  ok('a nearCap account is not counted live', row.live === false && c.liveAccounts === 2); }
+  ok('an account past its learned soft cap is flagged constrained', row.constrained === true);
+  ok('nearCap alias still set for existing readers', row.nearCap === true);
+  ok('DL-3032: a constrained account STILL counts live (serving, not excluded)',
+     row.live === true && c.liveAccounts === 3);
+  ok('DL-3032: a constrained account adds no fresh slot headroom (2 unconstrained × 3 = 6)',
+     c.headroom === 6); }
 
 // ── headroom shrinks as warm sessions fill slots ──────────────────────────────
 { const am = mk({ softConcurrencyPerAccount: 2 });
