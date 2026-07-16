@@ -3,7 +3,8 @@ import { readFileSync, writeFileSync, renameSync, readdirSync, statSync, openSyn
 import { homedir } from 'node:os';
 import { join } from 'node:path';
 import { systemSnapshot as _systemSnapshot } from './infra/system.js';
-import { priceFor, CACHE_WRITE_5M_MULT, CACHE_WRITE_1H_MULT, CACHE_READ_MULT } from './accounting/pricing.js';
+import { priceFor } from './accounting/pricing.js';
+import { updateUsage as usageUpdateUsage, recordBurn as usageRecordBurn, burnWindow as usageBurnWindow } from './accounting/usage.js';
 import { createAccounts, addAccount as poolAddAccount, removeAccount as poolRemoveAccount } from './core/pool.js';
 import { getAccountForSession as sessGetAccountForSession, activeSessionCounts as sessActiveSessionCounts, evictStaleBindings as sessEvictStaleBindings, sessionBindingSummary as sessBindingSummary, sessionAggregate as sessAggregate } from './core/session.js';
 import { getActiveAccount as selGetActiveAccount, pickAccountForBinding as selPickAccountForBinding, paceLine as selPaceLine, paceGap as selPaceGap, rampBoost as selRampBoost, paceScore as selPaceScore, apikeyShouldYield as selApikeyShouldYield, hasUsableApikey as selHasUsableApikey, switchTo as selSwitchTo } from './core/selection.js';
@@ -219,27 +220,10 @@ export class AccountManager {
   // Selection score: behind-line gap + end-of-cycle ramp (core/selection.js).
   _paceScore(account) { return selPaceScore(this, account); }
 
-  // ── Capacity model helpers (D-2179) ──────────────────
-  // Per-account hourly burn buckets: Map(hourEpoch → tokens), pruned to 7d. Cheap
-  // (≤168 entries) and the only forward signal we have when Max OAuth sends no
-  // rate-limit headers — the learned cap is derived from these at 429 time.
-  _recordBurn(account, tokens) {
-    if (!account || !tokens) return;
-    const hr = Math.floor(Date.now() / 3600000);
-    if (!account._burn) account._burn = new Map();
-    account._burn.set(hr, (account._burn.get(hr) || 0) + tokens);
-    const cutoff = hr - 168; // keep 7d
-    for (const k of account._burn.keys()) if (k < cutoff) account._burn.delete(k);
-  }
+  // ── Capacity-model burn buckets (accounting/usage.js) ──────────────────
+  _recordBurn(account, tokens) { return usageRecordBurn(this, account, tokens); }
 
-  // Sum of burn (tokens) over the last `hours` whole-hour buckets.
-  _burnWindow(account, hours) {
-    if (!account || !account._burn) return 0;
-    const cutoff = Math.floor(Date.now() / 3600000) - hours;
-    let sum = 0;
-    for (const [k, v] of account._burn) if (k >= cutoff) sum += v;
-    return sum;
-  }
+  _burnWindow(account, hours) { return usageBurnWindow(this, account, hours); }
 
   /**
    * Pick the account to (re)bind a session to (pace controller; covered by
@@ -699,57 +683,9 @@ export class AccountManager {
   // Update an account's quota from upstream response headers (core/quota.js).
   updateQuota(accountIndex, headers) { return quotaUpdateQuota(this, accountIndex, headers); }
 
-  /**
-   * Update cumulative token usage from response body data.
-   *
-   * D1DX (D-2169): also computes API-equivalent COST. message_start carries
-   * input_tokens (uncached) + cache tokens + the model; message_delta carries
-   * output_tokens only — so the model is remembered on the binding from
-   * message_start and reused for the output-side cost. opts: { cacheCreate5m,
-   * cacheCreate1h, cacheRead, model }.
-   */
+  // Cumulative token usage + cost + burn buckets from a response (accounting/usage.js).
   updateUsage(accountIndex, inputTokens, outputTokens, sessionId = null, opts = {}) {
-    const account = this.accounts[accountIndex];
-    if (!account) return;
-    if (inputTokens) account.usage.totalInputTokens += inputTokens;
-    if (outputTokens) account.usage.totalOutputTokens += outputTokens;
-
-    // D-2179: feed the rolling burn buckets (capacity model). Count the billable
-    // load that pushes toward the rate limit — uncached input + cache writes +
-    // output; cache reads are ~free, so they're excluded.
-    this._recordBurn(account,
-      (inputTokens || 0) + (opts.cacheCreate5m || 0) + (opts.cacheCreate1h || 0) + (outputTokens || 0));
-
-    const sb = sessionId ? this.sessionBindings.get(sessionId) : null;
-    // Resolve the model for pricing: explicit (message_start) → remember it;
-    // else the binding's last-seen model (message_delta) → else null (→ opus).
-    const model = opts.model || sb?.model || null;
-    if (opts.model && sb) sb.model = opts.model;
-    const price = this._priceFor(model);
-    const cacheCreate5m = opts.cacheCreate5m || 0;
-    const cacheCreate1h = opts.cacheCreate1h || 0;
-    const cacheRead = opts.cacheRead || 0;
-    const cost = (
-      (inputTokens || 0) * price.in
-      + cacheCreate5m * price.in * CACHE_WRITE_5M_MULT
-      + cacheCreate1h * price.in * CACHE_WRITE_1H_MULT
-      + cacheRead * price.in * CACHE_READ_MULT
-      + (outputTokens || 0) * price.out
-    ) / 1e6;
-    account.usage.totalCost = (account.usage.totalCost || 0) + cost;
-
-    // D-1728: per-session attribution for the live dashboard. Only attributes
-    // when the session still has a binding.
-    if (sessionId) {
-      if (sb) {
-        if (inputTokens) { sb.requests++; sb.inputTokens += inputTokens; }
-        if (outputTokens) sb.outputTokens += outputTokens;
-        sb.cost = (sb.cost || 0) + cost;
-      }
-      // D-1728 S6: durable ledger (survives idle-eviction + restart).
-      this._ledgerTouch(sessionId, account.name, inputTokens, outputTokens, cost, model);
-      this._maybeSaveLedger();
-    }
+    return usageUpdateUsage(this, accountIndex, inputTokens, outputTokens, sessionId, opts);
   }
 
   // Mark an account rate-limited (429) — reactive-only (core/bench.js).
