@@ -9,12 +9,8 @@ import { getAccountForSession as sessGetAccountForSession, activeSessionCounts a
 import { getActiveAccount as selGetActiveAccount, pickAccountForBinding as selPickAccountForBinding, paceLine as selPaceLine, paceGap as selPaceGap, rampBoost as selRampBoost, paceScore as selPaceScore, apikeyShouldYield as selApikeyShouldYield, hasUsableApikey as selHasUsableApikey, switchTo as selSwitchTo } from './core/selection.js';
 import { noteInflightStart as dispNoteInflightStart, noteInflightEnd as dispNoteInflightEnd, tryReserveInflight as dispTryReserveInflight, atInflightCap as dispAtInflightCap } from './core/dispatch.js';
 import { sweepAll as benchSweepAll, clearExpiredQuotas as benchClearExpiredQuotas, isBlocked as benchIsBlocked, atHardLimit as benchAtHardLimit, isUsable as benchIsUsable, soonestUsableOrNull as benchSoonestUsableOrNull, isPremiumModel as benchIsPremiumModel, premiumRejected as benchPremiumRejected, markRateLimited as benchMarkRateLimited, allHardCapped as benchAllHardCapped } from './core/bench.js';
+import { updateQuota as quotaUpdateQuota } from './core/quota.js';
 
-// DL-2841: premium (7d_oi) sub-axis reject with no server-stated reset — bench the
-// premium axis for this long, then re-probe. Only fires when Anthropic sends a
-// `rejected` premium status but no forward-dated reset (rare); the next premium
-// response carries the real reset and supersedes it. covered by per-family-reject.test.
-const PREMIUM_REJECT_FALLBACK_MS = 15 * 60 * 1000; // 15m
 // D1DX (D-1728): D1DX session presence registry — used only to resolve a
 // session emoji for log/TUI display. Best-effort; never load-bearing for routing.
 const SESSIONS_REGISTRY = join(homedir(), '.claude', 'state', 'sessions.json');
@@ -699,107 +695,8 @@ export class AccountManager {
 
   _switchTo(account, reason) { return selSwitchTo(this, account, reason); }
 
-  /**
-   * Update an account's quota tracking from upstream response headers.
-   */
-  updateQuota(accountIndex, headers) {
-    const account = this.accounts[accountIndex];
-    if (!account) return;
-
-    // Unified rate limits (Claude Max)
-    const u5h = parseFloat(headers['anthropic-ratelimit-unified-5h-utilization']);
-    const u7d = parseFloat(headers['anthropic-ratelimit-unified-7d-utilization']);
-    if (!isNaN(u5h)) account.quota.unified5h = u5h;
-    if (!isNaN(u7d)) account.quota.unified7d = u7d;
-
-    // D-2236: never store a reset timestamp already in the past. At a window
-    // boundary Anthropic can briefly report a <=now reset; storing it makes
-    // _clearExpiredQuotas re-log "session quota reset" on EVERY subsequent sweep
-    // (it only nulls the window, but the next response re-populates the passed
-    // reset) — and because the TUI patches console.log -> _addLog -> render() ->
-    // computeCapacity() -> _sweepAll(), that storm recurses into a stack overflow.
-    // A passed reset means the window has rolled: clear util + reset so the next
-    // response repopulates a live (future-dated) window instead.
-    const nowMs = Date.now();
-    const r5h = headers['anthropic-ratelimit-unified-5h-reset'];
-    const r7d = headers['anthropic-ratelimit-unified-7d-reset'];
-    if (r5h) {
-      const t = parseInt(r5h, 10) * 1000;
-      if (t > nowMs) account.quota.unified5hReset = t;
-      else { account.quota.unified5hReset = null; account.quota.unified5h = null; }
-    }
-    if (r7d) {
-      const t = parseInt(r7d, 10) * 1000;
-      if (t > nowMs) account.quota.unified7dReset = t;
-      else { account.quota.unified7dReset = null; account.quota.unified7d = null; account.quota.unifiedStatus = null; }
-    }
-
-    // DL-2841: parse the premium-tier weekly sub-axis (`unified-7d_oi-*`). Anthropic
-    // emits it only on premium-model requests; it goes `rejected`/util 1.0 when that
-    // tier's separate weekly cap is hit, while the base 5h/7d axes stay `allowed`.
-    const oiStatus = headers['anthropic-ratelimit-unified-7d_oi-status'];
-    if (oiStatus) {
-      account.quota.premiumStatus = oiStatus;
-      const oiUtil = parseFloat(headers['anthropic-ratelimit-unified-7d_oi-utilization']);
-      if (!isNaN(oiUtil)) account.quota.premiumUtil = oiUtil;
-      const oiReset = headers['anthropic-ratelimit-unified-7d_oi-reset'];
-      const oiResetMs = oiReset ? parseInt(oiReset, 10) * 1000 : null;
-      if (oiStatus === 'rejected') {
-        account.quota.premiumReset = oiResetMs && oiResetMs > nowMs ? oiResetMs : null;
-        // Bench premium-only: usable for every non-premium model throughout. Fall back
-        // to a bounded re-probe when Anthropic sends no forward-dated reset.
-        account._premiumRejectedUntil = (oiResetMs && oiResetMs > nowMs)
-          ? oiResetMs : nowMs + PREMIUM_REJECT_FALLBACK_MS;
-      } else {
-        account.quota.premiumReset = null;
-        account._premiumRejectedUntil = 0; // recovered
-      }
-    }
-
-    // The top-line `unified-status` is REQUEST-MODEL-scoped: on a premium request it
-    // MIRRORS the 7d_oi sub-axis (rejected) even though the account's base budget is
-    // fine. Storing that as the account-wide status benched the whole account for every
-    // model (DL-2841 stuck trap). Keep account-wide status on the BASE axes: derive it
-    // from the explicit per-axis statuses when present; only fall back to the top-line
-    // when no premium sub-axis is in play.
-    const s5 = headers['anthropic-ratelimit-unified-5h-status'];
-    const s7 = headers['anthropic-ratelimit-unified-7d-status'];
-    const uStatus = headers['anthropic-ratelimit-unified-status'];
-    if (s5 || s7) {
-      account.quota.unifiedStatus = (s5 === 'rejected' || s7 === 'rejected')
-        ? 'rejected'
-        : (s7 || s5); // allowed | allowed_warning from the base axes
-    } else if (uStatus && !oiStatus) {
-      account.quota.unifiedStatus = uStatus; // no sub-axis → top-line is account-wide
-    }
-    // else: a premium request with no explicit base-axis headers — leave account-wide
-    // status untouched rather than clobber it from the premium-mirrored top-line.
-
-    // Standard rate limits (API key accounts)
-    const tokensLimit = parseInt(headers['anthropic-ratelimit-tokens-limit'], 10);
-    const tokensRemaining = parseInt(headers['anthropic-ratelimit-tokens-remaining'], 10);
-    const tokensReset = headers['anthropic-ratelimit-tokens-reset'];
-    const requestsLimit = parseInt(headers['anthropic-ratelimit-requests-limit'], 10);
-    const requestsRemaining = parseInt(headers['anthropic-ratelimit-requests-remaining'], 10);
-    const requestsReset = headers['anthropic-ratelimit-requests-reset'];
-
-    if (!isNaN(tokensLimit)) account.quota.tokensLimit = tokensLimit;
-    if (!isNaN(tokensRemaining)) account.quota.tokensRemaining = tokensRemaining;
-    if (!isNaN(requestsLimit)) account.quota.requestsLimit = requestsLimit;
-    if (!isNaN(requestsRemaining)) account.quota.requestsRemaining = requestsRemaining;
-
-    if (tokensReset) account.quota.resetsAt = tokensReset;
-    else if (requestsReset) account.quota.resetsAt = requestsReset;
-
-    account.usage.totalRequests++;
-    account.usage.lastUsed = new Date().toISOString();
-
-    // Log when an account is near the hard ceiling.
-    const weeklyUtil = account.quota.unified7d;
-    if (weeklyUtil != null && weeklyUtil >= this.switchThreshold - 0.05) {
-      console.log(`[TeamClaude] Account "${account.name}" at ${(weeklyUtil * 100).toFixed(1)}% weekly — near ceiling`);
-    }
-  }
+  // Update an account's quota from upstream response headers (core/quota.js).
+  updateQuota(accountIndex, headers) { return quotaUpdateQuota(this, accountIndex, headers); }
 
   /**
    * Update cumulative token usage from response body data.
