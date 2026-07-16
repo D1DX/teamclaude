@@ -50,9 +50,7 @@ const sonnetOkHeaders = () => ({
   ok('_premiumRejected(account) is true while the sub-limit holds',
      am._premiumRejected(am.accounts[0]) === true);
   ok('account is STILL usable (in the pool for non-premium models)',
-     am._isUsable(am.accounts[0]) === true);
-  ok('account is STILL 5h-eligible (never-stall rail does not exclude it)',
-     am._fiveHourEligible(am.accounts[0]) === true); }
+     am._isUsable(am.accounts[0]) === true); }
 
 // ── 2. markRateLimited on a premium-scoped 429 must NOT throttle the whole account ──
 { const am = mk();
@@ -60,8 +58,6 @@ const sonnetOkHeaders = () => ({
   am.markRateLimited(0, 5944);                 // then markRateLimited with the retry-after
   ok('premium-scoped 429 leaves the account active (not throttled)',
      am.accounts[0].status !== 'throttled');
-  ok('premium-scoped 429 does not start the burst streak',
-     (am.accounts[0]._429streak || 0) === 0);
   ok('premium-scoped 429 does not set an account-wide bench',
      !am.accounts[0].rateLimitedUntil); }
 

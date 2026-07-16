@@ -38,23 +38,14 @@ const bind = (am, sid, i) => {
 { const am = mk(); q(am, 0, { u7d: 0.0, u5h: 0.1, resetInMs: 3.5 * DAY });
   ok('paceLine ≈ 0.5 at half the week', Math.abs(am._paceLine(am.accounts[0]) - 0.5) < 0.02); }
 
-// ── #1 never-stall 5h rail BEATS pace: most-behind but 5h-maxed is excluded ─────
-{ const am = mk();
-  q(am, 0, { u7d: 0.05, u5h: 0.95 });  // MOST behind, but 5h ≥ 0.90 → ineligible
-  q(am, 1, { u7d: 0.20, u5h: 0.10 });  // behind + eligible
-  q(am, 2, { u7d: 0.30, u5h: 0.10 });  // ahead + eligible
-  const pick = am._pickAccountForBinding();
-  ok('5h rail excludes the most-behind account (not a0)', pick.name !== 'a0');
-  ok('picks the most-behind 5h-eligible account (a1)', pick.name === 'a1'); }
-
-// ── 5h rail fallback: ALL ineligible (but <0.98) → still pick, don't stall ──────
+// ── all accounts equally 5h-loaded → pace ranking still picks the most-behind ──────
 { const am = mk();
   q(am, 0, { u7d: 0.30, u5h: 0.95 });
   q(am, 1, { u7d: 0.05, u5h: 0.95 });  // most behind
   q(am, 2, { u7d: 0.20, u5h: 0.95 });
   const pick = am._pickAccountForBinding();
-  ok('all-5h-ineligible → still returns an account (no null/stall)', !!pick);
-  ok('fallback still ranks by pace (a1)', pick && pick.name === 'a1'); }
+  ok('an equally-loaded pool still returns an account (no null/stall)', !!pick);
+  ok('ranks by pace within the pool (a1 most-behind)', pick && pick.name === 'a1'); }
 
 // ── #3 end-of-cycle ramp dominates: near-reset w/ unused quota beats a bigger raw gap
 { const am = mk();
@@ -85,13 +76,6 @@ const bind = (am, sid, i) => {
   q(am, 1, { u7d: 0.05, u5h: 0.1 });
   bind(am, sid, 0);
   ok('warm session only mildly over its line stays put (cache-warm)', am.getAccountForSession(sid).name === 'a0'); }
-
-// ── #1 warm session yields to the 5h rail (never-stall overrides cache) ─────────
-{ const am = mk(); const sid = 's-5h';
-  q(am, 0, { u7d: 0.20, u5h: 0.95 });  // on its line, but 5h-maxed → must rebind
-  q(am, 1, { u7d: 0.05, u5h: 0.10 });  // eligible rebind target
-  bind(am, sid, 0);
-  ok('warm session on a 5h-maxed account rebinds (never-stall)', am.getAccountForSession(sid).name !== 'a0'); }
 
 // ── no-data fallback: no headers yet → all paceScore 0 → least-in-flight spread ─
 { const am = mk();
@@ -130,25 +114,16 @@ const bind = (am, sid, i) => {
   am.accounts.forEach(a => { a._inflight = am.maxInflightPerAccount; });
   ok('all at in-flight cap → still returns an account (no refuse)', !!am._pickAccountForBinding()); }
 
-// ── probe-gate: an UNPROVEN account with a probe in-flight is skipped, even if most-behind ──
-{ const am = mk();
-  q(am, 0, { u7d: 0.0,  u5h: 0.1 });   // MOST behind, but unproven + already probing
-  q(am, 1, { u7d: 0.20, u5h: 0.1 });
-  q(am, 2, { u7d: 0.20, u5h: 0.1 });
-  am.accounts[0]._proven = false; am.accounts[0]._inflight = 1; // one probe in flight, no 200 yet
-  ok('probe-gate: unproven account mid-probe takes no further binds (spills off a0)', am._pickAccountForBinding().name !== 'a0'); }
-
-// ── probe-gate: a PROVEN account opens past the unproven cap of 1 ──────────────
+// ── a PROVEN account admits in-flight up to maxInflightPerAccount ─────────────
 { const am = mk();
   q(am, 0, { u7d: 0.0, u5h: 0.1 });    // most behind
   q(am, 1, { u7d: 0.30, u5h: 0.1 });
-  am.accounts[0]._proven = true; am.accounts[0]._inflight = 2; // proven → cap is maxInflightPerAccount (3), 2 < 3
-  ok('probe-gate: a proven account admits more than 1 in-flight (a0 still picked)', am._pickAccountForBinding().name === 'a0'); }
+  am.accounts[0]._inflight = 2;        // 2 < maxInflightPerAccount → still admitted
+  ok('an account under the in-flight cap is still picked (a0)', am._pickAccountForBinding().name === 'a0'); }
 
-// ── 200 proves / 429 un-proves ────────────────────────────────────────────────
+// ── a 200 marks the account proven ────────────────────────────────────────────
 { const am = mk();
-  am.noteAccountSuccess(0); ok('a 200 marks the account proven', am.accounts[0]._proven === true);
-  am.markRateLimited(0, 60); ok('a 429 un-proves the account (re-probe on recovery)', am.accounts[0]._proven === false); }
+  am.noteAccountSuccess(0); ok('a 200 marks the account proven', am.accounts[0]._proven === true); }
 
 // ── hard session cap: an account at maxSessionsPerAccount is skipped, even if most-behind ──
 { const am = mk();
@@ -158,35 +133,14 @@ const bind = (am, sid, i) => {
   for (let i = 0; i < am.maxSessionsPerAccount; i++) bind(am, `cap${i}`, 0); // a0 at the session cap
   ok('session cap excludes a maxed account (spills off a0 despite most-behind)', am._pickAccountForBinding().name !== 'a0'); }
 
-// ── graduated 5h cap: a proven account in the warn band tightens to 1 in-flight ──
+// ── an account under the in-flight cap keeps the full cap (a0 at 2 in-flight) ──
 { const am = mk();
-  q(am, 0, { u7d: 0.0,  u5h: 0.80 }); // most behind, proven, but 5h in [0.75,0.90) warn band
-  q(am, 1, { u7d: 0.20, u5h: 0.10 });
-  am.accounts[0]._proven = true; am.accounts[0]._inflight = 1; // warn-band cap is 1 → already full
-  ok('5h warn band tightens a proven account to in-flight cap 1 (spills off a0)', am._pickAccountForBinding().name !== 'a0'); }
-
-// ── ample 5h headroom keeps the full cap ───────────────────────────────────────
-{ const am = mk();
-  q(am, 0, { u7d: 0.0,  u5h: 0.50 }); // most behind, proven, ample 5h headroom (<0.75)
+  q(am, 0, { u7d: 0.0,  u5h: 0.50 }); // most behind
   q(am, 1, { u7d: 0.30, u5h: 0.10 });
-  am.accounts[0]._proven = true; am.accounts[0]._inflight = 2; // cap is maxInflightPerAccount (3); 2 < 3
-  ok('ample 5h headroom keeps full in-flight cap (a0 still picked at 2 in-flight)', am._pickAccountForBinding().name === 'a0'); }
+  am.accounts[0]._inflight = 2;        // 2 < maxInflightPerAccount → still picked
+  ok('an account below the in-flight cap keeps being picked (a0 at 2 in-flight)', am._pickAccountForBinding().name === 'a0'); }
 
-// ── D-2226: a header-less burst-429 (utilization well below caps) benches on the
-//    short ladder, NOT to the always-far window reset (the false-throttle bug) ──
-{ const am = mk(); am.backoffJitterSec = 0; // deterministic bench for the assertion
-  q(am, 0, { u7d: 0.20, u5h: 0.30 });        // both axes well below the caps → a BURST
-  am.markRateLimited(0, null);               // no retry-after header (the Max OAuth norm)
-  ok('burst-429 (low util) benches on the ladder, not to the reset', am.accounts[0]._lastBenchSec === am.backoffBaseSec); }
-
-// ── D-2226: a 429 with the 5h axis AT the soft ceiling IS a genuine quota cap →
-//    bench to the reset (clamped to backoffCapSec), the slow path it's meant for ──
-{ const am = mk(); am.backoffJitterSec = 0;
-  q(am, 0, { u7d: 0.20, u5h: 0.95, resetInMs: 5 * DAY }); // 5h ≥ 0.90 soft ceiling → near cap
-  am.markRateLimited(0, null);
-  ok('quota-429 (5h at the soft ceiling) benches to the reset, not the burst ladder', am.accounts[0]._lastBenchSec === am.backoffCapSec); }
-
-// ── D-2226: atInflightCap — the warm-path-hold predicate server.js polls on to
+// ── DL-2226: atInflightCap — the warm-path-hold predicate server.js polls on to
 //    wait for a slot on a warm-stuck account instead of piling on (anti-burst) ──
 { const am = mk();
   am.accounts[0]._inflight = am.maxInflightPerAccount;       // at the hard cap

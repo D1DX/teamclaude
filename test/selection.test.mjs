@@ -13,9 +13,11 @@ const mk = () => new AccountManager([
   { name: 'a2', type: 'oauth', accessToken: 'x', refreshToken: 'r', expiresAt: Date.now() + 1e9 },
 ], 0.98);
 
-// ── eager sweep: expired throttles clear across the WHOLE pool, not just current ─
-{ const am = mk(); am.markRateLimited(1, -60);
-  ok('throttle set (pre-sweep)', am.accounts[1].status === 'throttled');
+// ── reactive bench + eager sweep: a retry-after benches; an expired bench clears
+//    across the WHOLE pool, not just current (reactive contract: reactive-bench.test) ─
+{ const am = mk(); am.markRateLimited(1, 300);
+  ok('a retry-after benches (throttled pre-sweep)', am.accounts[1].status === 'throttled');
+  am.accounts[1].rateLimitedUntil = Date.now() - 1000; // window elapsed
   am._sweepAll();
   ok('_sweepAll clears EXPIRED throttle on a non-current acct', am.accounts[1].status === 'active' && am.accounts[1].rateLimitedUntil === null); }
 

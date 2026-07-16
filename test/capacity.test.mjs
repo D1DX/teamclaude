@@ -29,17 +29,6 @@ const mk = (opts = {}) => new AccountManager([
   ok('benched / live counts reflect the bench', c.benched === 1 && c.liveAccounts === 2);
   ok('soonestResetSec ≈ the benched bench (300s)', c.soonestResetSec >= 299 && c.soonestResetSec <= 301); }
 
-// ── yellow: a deep streak (≥2) keeps the pool cautious even when not benched ───
-{ const am = mk();
-  // D-2286: build the streak SEQUENTIALLY (recover between 429s) — a concurrent burst
-  // is now debounced to streak 1, so two back-to-back calls no longer reach streak 2.
-  am.markRateLimited(0, null);
-  am.accounts[0].status = 'active'; am.accounts[0].rateLimitedUntil = 0; // bench expired + re-probed
-  am.markRateLimited(0, null);                                // sequential → streak 2
-  am.accounts[0].status = 'active'; am.accounts[0].rateLimitedUntil = null; // bench cleared, streak kept
-  const c = am.computeCapacity();
-  ok('a deep 429 streak keeps the pool YELLOW (no bench)', c.verdict === 'yellow' && c.benched === 0); }
-
 // ── red: every account benched → 0 live ───────────────────────────────────────
 { const am = mk();
   for (let i = 0; i < 3; i++) am.markRateLimited(i, 200);
@@ -74,22 +63,28 @@ const mk = (opts = {}) => new AccountManager([
   for (const a of am.accounts) a.quota.unifiedStatus = 'rejected';
   ok('allHardCapped is true when every account is header-rejected', am.allHardCapped() === true); }
 
-// ── persistence: per-account usage + capacity model survive a restart ─────────
+// ── persistence: per-account usage + SUCCESS-taught capacity model survive a restart ─
+// K (§6): the learned cap is no longer taught at a 429 (that machinery is gone). It is
+// success-taught (recalibrated on 200s) — that cap + the max-successful-burn target +
+// the burn buckets persist; the 429-teach path does not.
 { const dir = mkdtempSync(join(tmpdir(), 'tc-cap-'));
   const p = join(dir, 'usage-ledger.json');
   const am = mk(); am.setLedgerPath(p);
   am.updateUsage(0, 50000, 10000, 'S1');                  // account usage + burn (60k)
   am._recordBurn(am.accounts[0], 140000);                 // push 5h burn to ~200k
-  am.markRateLimited(0, null);                            // learn a 5h cap from the burn
+  am.accounts[0]._capEst5h = 100000;                      // a prior cap (however it arose)
+  am.noteAccountSuccess(0);                               // success recalibrates the cap (reporting)
   const cap = am.accounts[0]._capEst5h;
+  const maxBurn = am.accounts[0]._maxSuccessBurn5h;
   const burn5h = am._burnWindow(am.accounts[0], 5);
   am.saveLedger();
   const am2 = mk(); am2.setLedgerPath(p); am2.loadLedger(); // restart simulation
   ok('per-account cumulative usage survives restart',
      am2.accounts[0].usage.totalInputTokens === 50000 && am2.accounts[0].usage.totalOutputTokens === 10000);
-  ok('learned 5h cap survives restart', am2.accounts[0]._capEst5h === cap && cap === 200000);
+  ok('the success-recalibrated 5h cap survives restart', am2.accounts[0]._capEst5h === cap);
+  ok('the max successful burn (recalibration target) survives restart',
+     am2.accounts[0]._maxSuccessBurn5h === maxBurn && maxBurn === 200000);
   ok('burn buckets survive restart', am2._burnWindow(am2.accounts[0], 5) === burn5h && burn5h === 200000);
-  ok('the 429 streak is NOT persisted (reset on restart)', am2.accounts[0]._429streak === 0);
   ok('the per-issue ledger still round-trips alongside', am2.ledgerByIssue().reduce((s, g) => s + g.tokens, 0) === 60000);
   rmSync(dir, { recursive: true, force: true }); }
 
