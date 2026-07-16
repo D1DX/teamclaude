@@ -7,6 +7,7 @@ import { priceFor, CACHE_WRITE_5M_MULT, CACHE_WRITE_1H_MULT, CACHE_READ_MULT } f
 import { createAccounts, addAccount as poolAddAccount, removeAccount as poolRemoveAccount } from './core/pool.js';
 import { getAccountForSession as sessGetAccountForSession, activeSessionCounts as sessActiveSessionCounts, evictStaleBindings as sessEvictStaleBindings, sessionBindingSummary as sessBindingSummary, sessionAggregate as sessAggregate } from './core/session.js';
 import { getActiveAccount as selGetActiveAccount, pickAccountForBinding as selPickAccountForBinding, paceLine as selPaceLine, paceGap as selPaceGap, rampBoost as selRampBoost, paceScore as selPaceScore, apikeyShouldYield as selApikeyShouldYield, hasUsableApikey as selHasUsableApikey, switchTo as selSwitchTo } from './core/selection.js';
+import { noteInflightStart as dispNoteInflightStart, noteInflightEnd as dispNoteInflightEnd, tryReserveInflight as dispTryReserveInflight, atInflightCap as dispAtInflightCap } from './core/dispatch.js';
 
 // DL-2841: premium (7d_oi) sub-axis reject with no server-stated reset — bench the
 // premium axis for this long, then re-probe. Only fires when Anthropic sends a
@@ -280,43 +281,16 @@ export class AccountManager {
   // Is a usable apikey last-resort configured? (core/selection.js) — hold loop checks this.
   hasUsableApikey() { return selHasUsableApikey(this); }
 
-  // ── D1DX patch (D-1903): per-account in-flight accounting ──────────
-  // server.js brackets each real upstream attempt with start/end so the count
-  // reflects concurrent requests actually hitting an account right now. Bounded
-  // + clamped so a missed end (it shouldn't happen — server.js guards + finally)
-  // can never wedge an account permanently above its cap.
-  noteInflightStart(accountIndex) {
-    const a = this.accounts[accountIndex];
-    if (a) a._inflight = (a._inflight || 0) + 1;
-  }
+  // ── Per-account in-flight accounting (core/dispatch.js) ──────────
+  noteInflightStart(accountIndex) { return dispNoteInflightStart(this, accountIndex); }
 
-  noteInflightEnd(accountIndex) {
-    const a = this.accounts[accountIndex];
-    if (a) a._inflight = Math.max(0, (a._inflight || 0) - 1);
-  }
+  noteInflightEnd(accountIndex) { return dispNoteInflightEnd(this, accountIndex); }
 
-  // DL-2226: atomic in-flight reserve — check maxInflightPerAccount and reserve the
-  // slot in ONE synchronous step, so a concurrent burst can't all pass while
-  // _inflight is still 0 (the TOCTOU that let a recovery herd dogpile one account).
-  // covered by herd-recovery.test. Returns true if a slot was reserved — caller MUST
-  // pair it with noteInflightEnd — or false at the cap (caller holds for a slot).
-  tryReserveInflight(accountIndex) {
-    const a = this.accounts[accountIndex];
-    if (!a) return false;
-    if ((a._inflight || 0) >= this.maxInflightPerAccount) return false;
-    a._inflight = (a._inflight || 0) + 1;
-    return true;
-  }
+  // DL-2226: atomic in-flight reserve (check+set in one step) — core/dispatch.js.
+  tryReserveInflight(accountIndex) { return dispTryReserveInflight(this, accountIndex); }
 
-  // DL-2226: is this account at/over its in-flight cap? server.js uses this to
-  // briefly HOLD a warm-stuck request until one of the account's own in-flight
-  // slots frees — preserving cache-affinity — instead of piling on or churning the
-  // warm session onto another account. Guards the warm-stick + all-at-cap fallback
-  // paths that reach the dispatcher directly (covered by pace-controller.test).
-  atInflightCap(accountIndex) {
-    const a = this.accounts[accountIndex];
-    return !!a && (a._inflight || 0) >= this.maxInflightPerAccount;
-  }
+  // DL-2226: at/over the in-flight cap? (core/dispatch.js) — server holds for a slot.
+  atInflightCap(accountIndex) { return dispAtInflightCap(this, accountIndex); }
 
   // Tier-3 fallback (pure): the soonest-to-reset account, reactivated only if its
   // reset has actually passed; else null (= genuinely exhausted → honest 429).
