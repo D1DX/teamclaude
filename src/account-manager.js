@@ -6,6 +6,7 @@ import { systemSnapshot as _systemSnapshot } from './infra/system.js';
 import { priceFor, CACHE_WRITE_5M_MULT, CACHE_WRITE_1H_MULT, CACHE_READ_MULT } from './accounting/pricing.js';
 import { createAccounts, addAccount as poolAddAccount, removeAccount as poolRemoveAccount } from './core/pool.js';
 import { getAccountForSession as sessGetAccountForSession, activeSessionCounts as sessActiveSessionCounts, evictStaleBindings as sessEvictStaleBindings, sessionBindingSummary as sessBindingSummary, sessionAggregate as sessAggregate } from './core/session.js';
+import { getActiveAccount as selGetActiveAccount, pickAccountForBinding as selPickAccountForBinding, paceLine as selPaceLine, paceGap as selPaceGap, rampBoost as selRampBoost, paceScore as selPaceScore, apikeyShouldYield as selApikeyShouldYield, hasUsableApikey as selHasUsableApikey, switchTo as selSwitchTo } from './core/selection.js';
 
 // DL-2841: premium (7d_oi) sub-axis reject with no server-stated reset — bench the
 // premium axis for this long, then re-probe. Only fires when Anthropic sends a
@@ -182,21 +183,7 @@ export class AccountManager {
    * Get the best available account (sticky while the current one is preferred).
    * Returns null only if every account is hard-capped / throttled with no reset yet.
    */
-  getActiveAccount(opts = {}) {
-    this._sweepAll();
-    const current = this.accounts[this.currentIndex];
-    // Sticky while the current account is usable; otherwise (re)pick the
-    // least-loaded usable account. First-ever call always picks.
-    if (this._didBootSelect && current && this._isUsable(current)
-        && !this._apikeyShouldYield(current)
-        && !(this._isPremiumModel(opts.model) && this._premiumRejected(current))) { // DL-2841: don't stick a premium request on a premium-capped account
-      return current; // stay cache-warm (until it nears its 5h ceiling — never-stall)
-    }
-    this._didBootSelect = true;
-    const chosen = this._pickAccountForBinding(opts);
-    if (chosen) this._switchTo(chosen, `account "${chosen.name}" (pace: behind weekly line)`);
-    return chosen;
-  }
+  getActiveAccount(opts = {}) { return selGetActiveAccount(this, opts); }
 
   // ── D1DX patch (D-1728): per-session cache-affinity routing ─────
   /**
@@ -219,20 +206,10 @@ export class AccountManager {
   // window elapsed. Window = [reset-7d, reset]; line = 1 - timeLeft/7d. A null
   // reset (not yet observed) → line 0, so the account reads as "behind" and gets
   // traffic that then populates its headers (self-priming).
-  _paceLine(account) {
-    const reset = account.quota.unified7dReset;
-    if (!reset) return 0;
-    const weekMs = 7 * 24 * 3600 * 1000;
-    const elapsed = 1 - (reset - Date.now()) / weekMs;
-    return Math.max(0, Math.min(1, elapsed));
-  }
+  _paceLine(account) { return selPaceLine(this, account); }
 
-  // How far BEHIND its weekly line the account is. >0 = behind (wants more load);
-  // <0 = ahead (over-pace). Unknown utilization → treated as 0 used (behind).
-  _paceGap(account) {
-    const used = account.quota.unified7d ?? 0;
-    return this._paceLine(account) - used;
-  }
+  // How far BEHIND its weekly line the account is (core/selection.js).
+  _paceGap(account) { return selPaceGap(this, account); }
 
   // DL-2841: is this outbound model in the premium/flagship weekly tier (the one
   // Anthropic meters on the `unified-7d_oi` sub-axis)? Config-driven regex; default
@@ -252,24 +229,10 @@ export class AccountManager {
   // End-of-cycle ramp (control law #3): as the account nears its 7d-reset, escalate
   // preference to drain unused weekly quota before it resets (use-it-or-lose-it).
   // Boost = unusedWeeklyFraction × tierWeight(hoursToReset). 0 outside all tiers.
-  _rampBoost(account) {
-    const reset = account.quota.unified7dReset;
-    if (!reset) return 0;
-    const hoursToReset = (reset - Date.now()) / 3600000;
-    if (hoursToReset < 0) return 0;
-    let weight = 0;
-    for (const tier of this.rampTiers) {            // ascending by hours
-      if (hoursToReset <= tier.hours) { weight = tier.weight; break; }
-    }
-    if (!weight) return 0;
-    const unused = Math.max(0, 1 - (account.quota.unified7d ?? 0));
-    return unused * weight;
-  }
+  _rampBoost(account) { return selRampBoost(this, account); }
 
-  // Selection score: behind-line gap + end-of-cycle ramp. Highest wins.
-  _paceScore(account) {
-    return this._paceGap(account) + this._rampBoost(account);
-  }
+  // Selection score: behind-line gap + end-of-cycle ramp (core/selection.js).
+  _paceScore(account) { return selPaceScore(this, account); }
 
   // ── Capacity model helpers (D-2179) ──────────────────
   // Per-account hourly burn buckets: Map(hourEpoch → tokens), pruned to 7d. Cheap
@@ -309,68 +272,13 @@ export class AccountManager {
    * or ramping near its reset) sits alone in the band and still concentrates load
    * — bounded by the caps so it drains without 429ing.
    */
-  _pickAccountForBinding({ allowApikey = false, model = null } = {}) {
-    const usableAll = this.accounts.filter(a => this._isUsable(a));
-    if (usableAll.length === 0) return this._soonestUsableOrNull();
-    // D1DX (D-2182): apikey accounts are a STRICT last resort. An apikey has no
-    // weekly line → flat-0 paceScore, which otherwise beats any OAuth account a
-    // hair over its pace-line (negative score) and parks PAID traffic while healthy
-    // Max headroom sits idle. OAuth is always preferred.
-    //
-    // D1DX (D-2420): the apikey is gated behind the all-throttled HOLD. When every
-    // OAuth account is throttled, normal binding (allowApikey=false) returns null
-    // so the server HOLDS and polls for an OAuth account to recover, instead of
-    // burning the PAID key on a transient header-less 429 (clears in ~60-140s).
-    // Only the hold-loop's last-resort attempt (server.js, after the max wait
-    // elapses or the pool is genuinely hard-capped) passes allowApikey=true to
-    // admit the apikey. _apikeyShouldYield still migrates a session off the apikey
-    // the moment an OAuth account recovers.
-    const oauthUsable = usableAll.filter(a => a.type !== 'apikey');
-    let usable;
-    if (oauthUsable.length) usable = oauthUsable;        // OAuth available → use it
-    else if (allowApikey) usable = usableAll;            // last resort → admit apikey
-    else return null;                                    // only apikey usable, not yet allowed → HOLD
-    // DL-2841: a premium-tier request (e.g. Fable) must avoid accounts whose premium
-    // sub-limit (7d_oi) is currently capped — they serve non-premium fine but would 429
-    // this model. Fall back to the unfiltered set only if every candidate is
-    // premium-capped (then the request 429s honestly rather than never binding).
-    if (this._isPremiumModel(model)) {
-      const premiumOk = usable.filter(a => !this._premiumRejected(a));
-      if (premiumOk.length) usable = premiumOk;
-    }
-    const { counts } = this._activeSessionCounts();
-    // Atomic in-flight cap (DL-2226): an account at maxInflightPerAccount takes no
-    // new bind, so a burst spills across accounts in pace order. This is the only
-    // in-flight admission gate — reactive-only dropped the graduated probe-gate.
-    const underCap = usable.filter(a => (a._inflight || 0) < this.maxInflightPerAccount);
-    const capped = underCap.length ? underCap : usable;
-    // Hard session cap (instances limit) — a burst spills beyond maxSessionsPerAccount.
-    const underSession = capped.filter(a => (counts[a.index] || 0) < this.maxSessionsPerAccount);
-    const pool = underSession.length ? underSession : capped;
-    const best = pool.reduce((m, a) => Math.max(m, this._paceScore(a)), -Infinity);
-    const band = pool.filter(a => best - this._paceScore(a) <= this.paceTieBand);
-    return band.reduce((b, a) => {
-      const ca = counts[a.index] || 0, cb = counts[b.index] || 0;
-      if (ca !== cb) return ca < cb ? a : b;
-      return (a._inflight || 0) < (b._inflight || 0) ? a : b;
-    }, band[0]);
-  }
+  _pickAccountForBinding(opts = {}) { return selPickAccountForBinding(this, opts); }
 
-  // D1DX (D-2182): true when `account` is the apikey last-resort AND at least one
-  // OAuth account is usable right now — so a session sitting on the paid apikey
-  // (from an OAuth-outage window) should yield back to Max. Gates the two sticky
-  // paths so apikey use never outlives the OAuth recovery.
-  _apikeyShouldYield(account) {
-    if (!account || account.type !== 'apikey') return false;
-    return this.accounts.some(a => a.type !== 'apikey' && this._isUsable(a));
-  }
+  // apikey yields back to Max the moment any OAuth account recovers (core/selection.js).
+  _apikeyShouldYield(account) { return selApikeyShouldYield(this, account); }
 
-  // D1DX (D-2420): is there a usable apikey account to fall back to as the genuine
-  // last resort? The server's all-throttled HOLD loop checks this before firing the
-  // paid key (at the deadline, or immediately when the OAuth pool is hard-capped).
-  hasUsableApikey() {
-    return this.accounts.some(a => a.type === 'apikey' && this._isUsable(a));
-  }
+  // Is a usable apikey last-resort configured? (core/selection.js) — hold loop checks this.
+  hasUsableApikey() { return selHasUsableApikey(this); }
 
   // ── D1DX patch (D-1903): per-account in-flight accounting ──────────
   // server.js brackets each real upstream attempt with start/end so the count
@@ -883,13 +791,7 @@ export class AccountManager {
     return !this._atHardLimit(account);
   }
 
-  _switchTo(account, reason) {
-    if (account.index !== this.currentIndex) {
-      console.log(`[TeamClaude] Switched to ${reason}`);
-    }
-    this.currentIndex = account.index;
-    return account;
-  }
+  _switchTo(account, reason) { return selSwitchTo(this, account, reason); }
 
   /**
    * Update an account's quota tracking from upstream response headers.
