@@ -1394,6 +1394,15 @@ export class AccountManager {
   markRateLimited(accountIndex, retryAfterSeconds) {
     const account = this.accounts[accountIndex];
     if (!account) return;
+    // DL-3032 (operator directive): rate-limit BENCHING DISABLED. Under heavy
+    // concurrent fleet load the escalating-ladder benches synchronized the whole
+    // OAuth pool into "all throttled" holds, cutting the fleet's Claude access. Do
+    // NOT bench on a 429 — a 429 fails over to another account for that request, but
+    // the account is never sidelined, so the pool never collapses to a hold. Genuine
+    // header caps (_atHardLimit) still exclude an account; concurrency is still paced
+    // by the probe-gate. Re-enabling bench = restore the body below this return.
+    return;
+    // eslint-disable-next-line no-unreachable
     const now = Date.now();
 
     // D-2286: concurrent-burst debounce. If this account is ALREADY benched from
