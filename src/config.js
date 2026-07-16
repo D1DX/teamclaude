@@ -1,5 +1,5 @@
-import { readFile, writeFile, mkdir } from 'node:fs/promises';
-import { writeFileSync, mkdirSync } from 'node:fs';
+import { readFile, writeFile, mkdir, rename } from 'node:fs/promises';
+import { writeFileSync, mkdirSync, renameSync } from 'node:fs';
 import { join, dirname } from 'node:path';
 import { homedir } from 'node:os';
 import { randomBytes } from 'node:crypto';
@@ -65,32 +65,79 @@ export async function loadOrCreateConfig() {
   return config;
 }
 
-export async function saveConfig(config) {
+// ── DL-3024/DL-3101: in-process serialization + atomic disk writes ────────────
+// Anthropic rotates the refresh token on each refresh. At boot `warmAll` refreshes
+// every expired account CONCURRENTLY (Promise.all), and each success fires
+// onTokenRefresh → atomicConfigUpdate. With no in-process lock those read-modify-
+// writes interleave: a later writer strands an earlier writer's rotated token stale
+// on disk (lost-update), and a concurrent reader parses a half-written file
+// ("Unexpected end of JSON input") — the 03:37:47 mass invalid_grant burst (DL-3024).
+//
+// Two guarantees close it:
+//   1. A single in-process promise-chain queue serializes EVERY write path
+//      (saveConfig / saveConfigSync-via-queue is not needed — sync is exit-only —
+//      and atomicConfigUpdate), so read-modify-write cycles never interleave.
+//   2. tmp + rename: a write lands on a `.tmp` sibling then atomically renames over
+//      the target (POSIX rename is atomic on the same filesystem), so a concurrent
+//      reader sees either the whole old file or the whole new one — never a torn one.
+//      Mirrors the usage-ledger writer (account-manager.js).
+let _configWriteQueue = Promise.resolve();
+
+/** Serialize `fn` behind every prior queued config write; returns fn's result. */
+function _enqueueConfigWrite(fn) {
+  const run = _configWriteQueue.then(fn, fn);
+  // Keep the chain alive even if `fn` rejects (settle to undefined for the NEXT waiter),
+  // while still surfacing the rejection to THIS caller via `run`.
+  _configWriteQueue = run.then(() => undefined, () => undefined);
+  return run;
+}
+
+/** Atomic disk write (tmp + rename). Not serialized itself — callers go through the queue. */
+async function _writeConfigAtomic(config) {
   const path = getConfigPath();
   await mkdir(dirname(path), { recursive: true });
-  await writeFile(path, JSON.stringify(config, null, 2) + '\n', { mode: 0o600 });
+  const tmp = path + '.tmp';
+  await writeFile(tmp, JSON.stringify(config, null, 2) + '\n', { mode: 0o600 });
+  await rename(tmp, path);
+}
+
+export function saveConfig(config) {
+  return _enqueueConfigWrite(() => _writeConfigAtomic(config));
 }
 
 /**
  * Synchronous config write for exit paths (D-2286). saveConfig is async — on
  * SIGINT/SIGTERM or a Deck quit the process can die before the async write lands,
  * stranding a rotated-but-unpersisted refresh token on the OLD value → invalid_grant
- * on the next boot. A sync write completes before process.exit().
+ * on the next boot. A sync write completes before process.exit(). Atomic tmp+rename
+ * so a signal mid-write can't leave a torn config either (DL-3101). NOT queued — the
+ * exit path runs synchronously to completion, past the async queue, and is the last
+ * writer by construction.
  */
 export function saveConfigSync(config) {
   const path = getConfigPath();
   mkdirSync(dirname(path), { recursive: true });
-  writeFileSync(path, JSON.stringify(config, null, 2) + '\n', { mode: 0o600 });
+  // Distinct tmp suffix from the async writer (`.tmp`): if SIGTERM lands in the
+  // microtask window of an in-flight async write, the two must not target the same
+  // tmp path. rename is atomic either way, so `path` always ends up whole — this just
+  // keeps the exit flush from tripping the async writer's rename (harmless but noisy).
+  const tmp = path + '.sync.tmp';
+  writeFileSync(tmp, JSON.stringify(config, null, 2) + '\n', { mode: 0o600 });
+  renameSync(tmp, path);
 }
 
 /**
- * Atomically update the config: re-reads from disk, calls updater(config),
- * then saves. Returns the updated config. This prevents overwriting changes
- * made by other processes (e.g. `teamclaude import` while the server runs).
+ * Atomically update the config: re-reads from disk, calls updater(config), then
+ * saves — all serialized behind the in-process write queue so concurrent updates
+ * (the boot-warm refresh storm) run one-at-a-time instead of racing. Returns the
+ * updated config. The re-read-before-save also prevents overwriting changes made by
+ * other processes (e.g. `teamclaude import` while the server runs).
  */
-export async function atomicConfigUpdate(updater) {
-  const config = await loadConfig() || createDefaultConfig();
-  await updater(config);
-  await saveConfig(config);
-  return config;
+export function atomicConfigUpdate(updater) {
+  return _enqueueConfigWrite(async () => {
+    const config = await loadConfig() || createDefaultConfig();
+    await updater(config);
+    await _writeConfigAtomic(config);
+    return config;
+  });
 }

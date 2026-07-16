@@ -285,6 +285,36 @@ async function serverCommand() {
       warmDeadline,
     ]);
     clearTimeout(deadline);
+
+    // DL-3024 F2: post-warm reconciliation flush. warmAll refreshes every expired
+    // account concurrently; each success fires onTokenRefresh → atomicConfigUpdate
+    // (now serialized, F1). Those persists are fire-and-forget, so some may still be
+    // queued when the race resolves. One authoritative full-config write from the
+    // in-memory AccountManager tokens — enqueued behind them via the same serialized
+    // queue, so it runs LAST and self-heals any residual stranding before we serve a
+    // single request. Best-effort: F1 is the correctness guarantee, this is belt-and-braces.
+    await atomicConfigUpdate(diskConfig => {
+      // Pick up any accounts added on disk since boot (parity with onTokenRefresh).
+      for (const diskAcct of diskConfig.accounts) {
+        const known = (diskAcct.accountUuid && config.accounts.some(a => a.accountUuid === diskAcct.accountUuid))
+          || config.accounts.some(a => a.name === diskAcct.name);
+        if (!known) {
+          config.accounts.push(diskAcct);
+          accountManager.addAccount(diskAcct);
+        }
+      }
+      // Write each known account's LIVE token (from AccountManager, the authoritative
+      // post-refresh state) over the disk copy — never the stale config.accounts mirror.
+      for (let i = 0; i < config.accounts.length; i++) {
+        const am = accountManager.accounts[i];
+        if (!am) continue;
+        const cfgIdx = findConfigAccount(diskConfig, config.accounts[i]);
+        if (cfgIdx < 0) continue;
+        if (am.credential != null) diskConfig.accounts[cfgIdx].accessToken = am.credential;
+        if (am.refreshToken != null) diskConfig.accounts[cfgIdx].refreshToken = am.refreshToken;
+        if (am.expiresAt != null) diskConfig.accounts[cfgIdx].expiresAt = am.expiresAt;
+      }
+    }).catch(err => console.error(`[TeamClaude] Post-warm reconciliation flush failed: ${err.message}`));
   }
 
   // D-1644: bind loopback-only (::1) by default — reachable only from this host
