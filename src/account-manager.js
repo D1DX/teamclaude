@@ -4,6 +4,7 @@ import { homedir } from 'node:os';
 import { join } from 'node:path';
 import { systemSnapshot as _systemSnapshot } from './infra/system.js';
 import { priceFor, CACHE_WRITE_5M_MULT, CACHE_WRITE_1H_MULT, CACHE_READ_MULT } from './accounting/pricing.js';
+import { createAccounts, addAccount as poolAddAccount, removeAccount as poolRemoveAccount } from './core/pool.js';
 
 // DL-2841: premium (7d_oi) sub-axis reject with no server-stated reset — bench the
 // premium axis for this long, then re-probe. Only fires when Anthropic sends a
@@ -29,30 +30,6 @@ const NEW_SESSION_GRACE_MS = 2 * 60 * 1000; // 2m
 // behind the trailing no-ts metadata block; a bounded read keeps it O(tail)).
 const TURN_TAIL_BYTES = 65536;
 
-function emptyQuota() {
-  return {
-    // Standard API rate limits (API key accounts)
-    tokensLimit: null,
-    tokensRemaining: null,
-    requestsLimit: null,
-    requestsRemaining: null,
-    // Unified rate limits (Claude Max accounts)
-    unified5h: null,       // utilization 0-1
-    unified7d: null,       // utilization 0-1
-    unified5hReset: null,  // ms timestamp
-    unified7dReset: null,  // ms timestamp
-    unifiedStatus: null,   // allowed | allowed_warning | rejected (BASE 5h/7d axes only — NOT the premium sub-axis)
-    // DL-2841: per-model-tier weekly sub-limit (Anthropic's `unified-7d_oi-*` axis —
-    // the flagship/premium tier, e.g. Fable). Anthropic rejects premium-model requests
-    // on this axis while the account's BASE 5h/7d budget is fine, so it must be tracked
-    // SEPARATELY from unifiedStatus (which gates the whole account).
-    premiumStatus: null,   // allowed | rejected — the 7d_oi sub-axis status
-    premiumUtil: null,     // utilization 0-1 on the premium sub-axis
-    premiumReset: null,    // ms timestamp — when the premium sub-limit resets
-    resetsAt: null,
-  };
-}
-
 // D-2697: wall-clock time string, byte-identical to tui.js's timestamp() so the
 // server-side Activity ring renders the same as the interactive Deck's.
 function _actTimestamp() {
@@ -74,35 +51,9 @@ export class AccountManager {
   //     only, never admission (covered by capacity.test).
   // switchThreshold (0.98) is a reporting band only (the near-ceiling display log).
   constructor(accounts, switchThreshold = 0.98, opts = {}) {
-    this.accounts = accounts.map((acct, index) => ({
-      index,
-      name: acct.name,
-      type: acct.type,
-      accountUuid: acct.accountUuid || null,
-      credential: acct.accessToken || acct.apiKey,
-      upstream: acct.upstream || null,   // D-2655: per-account upstream override (GLM/OpenRouter last-resort)
-      model: acct.model || null,         // D-2655: rewrite body.model for this account
-      provider: acct.provider || null,   // D-2655: OpenRouter provider routing (fp8 pin)
-      refreshToken: acct.refreshToken || null,
-      expiresAt: acct.expiresAt || null,
-      status: 'active',
-      quota: emptyQuota(),
-      usage: {
-        totalInputTokens: 0,
-        totalOutputTokens: 0,
-        totalRequests: 0,
-        lastUsed: null,
-      },
-      rateLimitedUntil: null,
-      _inflight: 0,        // live concurrent upstream requests (spread tiebreak + display)
-      _lastBenchSec: 0,    // last bench duration in seconds (display + capacity)
-      _burn: null,         // Map(hourEpoch → tokens) — rolling burn buckets (≤168 = 7d)
-      _capEst5h: null,     // success-taught 5h cap (reporting only; recalibrated on 200s)
-      _maxSuccessBurn5h: null, // DL-3032: max observed SUCCESSFUL 5h burn — the recalibration target
-      _capEstAt: 0,        // DL-3032: last capEst recalibration instant (ms) — drives time-decay
-      _proven: false,      // D-2104 probe-gate: returned a 200 in this active spell? unproven → in-flight cap 1
-      _premiumRejectedUntil: 0, // DL-2841: ms — the account is premium-tier (7d_oi) capped until this instant; usable for non-premium models throughout
-    }));
+    // §3.1(b): the ONE mutable account array — created by core/pool.js, held by
+    // reference here, read (never copied) by every core module.
+    this.accounts = createAccounts(accounts);
     this.currentIndex = 0;
     this.switchThreshold = switchThreshold; // hard ceiling — 5h axis + real weekly limit
     this._didBootSelect = false;            // first selection picks best, not config index 0
@@ -1467,44 +1418,11 @@ export class AccountManager {
     });
   }
 
-  /**
-   * Add a new account at runtime.
-   */
-  addAccount(acctData) {
-    const index = this.accounts.length;
-    this.accounts.push({
-      index,
-      name: acctData.name,
-      type: acctData.type,
-      accountUuid: acctData.accountUuid || null,
-      credential: acctData.accessToken || acctData.apiKey,
-      upstream: acctData.upstream || null,   // D-2655
-      model: acctData.model || null,         // D-2655
-      provider: acctData.provider || null,   // D-2655
-      refreshToken: acctData.refreshToken || null,
-      expiresAt: acctData.expiresAt || null,
-      status: 'active',
-      quota: emptyQuota(),
-      usage: { totalInputTokens: 0, totalOutputTokens: 0, totalRequests: 0, lastUsed: null },
-      rateLimitedUntil: null,
-      _inflight: 0, // D1DX (D-1903)
-    });
-    return index;
-  }
+  // Add a new account at runtime (core/pool.js). Returns its index.
+  addAccount(acctData) { return poolAddAccount(this, acctData); }
 
-  /**
-   * Remove an account by index.
-   */
-  removeAccount(index) {
-    if (index < 0 || index >= this.accounts.length) return;
-    this.accounts.splice(index, 1);
-    this.accounts.forEach((a, i) => a.index = i);
-    if (this.currentIndex >= this.accounts.length) {
-      this.currentIndex = Math.max(0, this.accounts.length - 1);
-    } else if (this.currentIndex > index) {
-      this.currentIndex--;
-    }
-  }
+  // Remove an account by index (core/pool.js) — reindexes + repairs currentIndex.
+  removeAccount(index) { return poolRemoveAccount(this, index); }
 
   /**
    * D1DX patch: warm all accounts at startup. Refreshes each OAuth
