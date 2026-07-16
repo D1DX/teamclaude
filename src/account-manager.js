@@ -1,10 +1,11 @@
 import { refreshAccessToken, isTokenExpiringSoon } from './oauth.js';
-import { readFileSync, writeFileSync, renameSync, readdirSync, statSync, openSync, readSync, closeSync } from 'node:fs';
+import { readFileSync, readdirSync, statSync, openSync, readSync, closeSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
 import { systemSnapshot as _systemSnapshot } from './infra/system.js';
 import { priceFor } from './accounting/pricing.js';
 import { updateUsage as usageUpdateUsage, recordBurn as usageRecordBurn, burnWindow as usageBurnWindow } from './accounting/usage.js';
+import { setLedgerPath as ledgerSetPath, loadLedger as ledgerLoad, saveLedger as ledgerSave, pruneLedger as ledgerPrune, ledgerTouch as ledgerTouchFn, maybeSaveLedger as ledgerMaybeSave, ledgerByIssue as ledgerByIssueFn, ledgerBySid as ledgerBySidFn } from './accounting/ledger.js';
 import { createAccounts, addAccount as poolAddAccount, removeAccount as poolRemoveAccount } from './core/pool.js';
 import { getAccountForSession as sessGetAccountForSession, activeSessionCounts as sessActiveSessionCounts, evictStaleBindings as sessEvictStaleBindings, sessionBindingSummary as sessBindingSummary, sessionAggregate as sessAggregate } from './core/session.js';
 import { getActiveAccount as selGetActiveAccount, pickAccountForBinding as selPickAccountForBinding, paceLine as selPaceLine, paceGap as selPaceGap, rampBoost as selRampBoost, paceScore as selPaceScore, apikeyShouldYield as selApikeyShouldYield, hasUsableApikey as selHasUsableApikey, switchTo as selSwitchTo } from './core/selection.js';
@@ -518,21 +519,8 @@ export class AccountManager {
     } catch { return false; }
   }
 
-  // D-1739: bare-sid → last-known account name, from the durable ledger (survives
-  // restart + idle eviction). Lets the Deck cluster a registry agent UNDER the
-  // account that last served it even with no current binding — so idle / just-
-  // restarted agents still group by account instead of floating in a flat list.
-  ledgerBySid() {
-    const bySid = new Map();
-    for (const e of this.usageLedger.values()) {
-      if (!e.sid || !e.account) continue;
-      const prev = bySid.get(e.sid);
-      if (!prev || (e.lastActiveAt || 0) > prev.lastActiveAt) {
-        bySid.set(e.sid, { account: e.account, lastActiveAt: e.lastActiveAt || 0 });
-      }
-    }
-    return bySid; // Map<bareSid, { account, lastActiveAt }>
-  }
+  // bareSid → last-known account name from the durable ledger (accounting/ledger.js).
+  ledgerBySid() { return ledgerBySidFn(this); }
 
   // Process + system resource snapshot for the dashboard (D-1728 S8). Cheap host
   // introspection — delegated to infra/system.js (mem/CPU gauge caches live there).
@@ -546,125 +534,23 @@ export class AccountManager {
   // Aggregate across all live sessions for the dashboard TOTAL (core/session.js).
   sessionAggregate() { return sessAggregate(this); }
 
-  // ── D1DX patch (D-1728 S6): durable usage ledger ───────────────
-  setLedgerPath(p) { this.ledgerPath = p || null; }
+  // ── Durable per-issue usage ledger (accounting/ledger.js) ───────────────
+  setLedgerPath(p) { return ledgerSetPath(this, p); }
 
-  // Load the ledger from disk at startup (best-effort) + prune stale entries.
-  loadLedger() {
-    if (!this.ledgerPath) return;
-    try {
-      const data = JSON.parse(readFileSync(this.ledgerPath, 'utf-8'));
-      const entries = Array.isArray(data?.entries) ? data.entries : [];
-      for (const e of entries) {
-        if (e && e.sid != null) this.usageLedger.set(`${e.sid}::${e.issue || ''}`, e);
-      }
-      // D-2179: restore per-account usage + capacity model (v2, keyed by name;
-      // absent in a v1 file → skipped). The 429 streak is NOT persisted — a cold
-      // boot has no recent 429s, so resetting it to 0 is correct.
-      const accounts = (data && typeof data.accounts === 'object') ? data.accounts : null;
-      if (accounts) {
-        const hr = Math.floor(Date.now() / 3600000);
-        for (const a of this.accounts) {
-          const s = accounts[a.name];
-          if (!s) continue;
-          if (s.usage) {
-            a.usage.totalInputTokens  = s.usage.totalInputTokens  || 0;
-            a.usage.totalOutputTokens = s.usage.totalOutputTokens || 0;
-            a.usage.totalRequests     = s.usage.totalRequests     || 0;
-            a.usage.totalCost         = s.usage.totalCost         || 0;
-            a.usage.lastUsed          = s.usage.lastUsed          || null;
-          }
-          if (Array.isArray(s.burn) && s.burn.length) {
-            a._burn = new Map(s.burn.filter(([k]) => k >= hr - 168)); // re-prune to 7d
-          }
-          if (s.capEst5h != null) a._capEst5h = s.capEst5h;
-          if (s.maxSuccessBurn5h != null) a._maxSuccessBurn5h = s.maxSuccessBurn5h; // DL-3032
-        }
-      }
-    } catch { /* missing/corrupt → start empty */ }
-    this._pruneLedger();
-  }
+  loadLedger() { return ledgerLoad(this); }
 
-  // Atomic save (tmp + rename) so a crash mid-write can't corrupt the ledger.
-  saveLedger() {
-    if (!this.ledgerPath) return;
-    try {
-      const entries = [...this.usageLedger.values()];
-      // D-2179: per-account durable state (cumulative usage + capacity model),
-      // keyed by name so it survives an account reorder across restarts.
-      const accounts = {};
-      for (const a of this.accounts) {
-        accounts[a.name] = {
-          usage: { ...a.usage },
-          burn: a._burn ? [...a._burn] : [],
-          capEst5h: a._capEst5h ?? null,
-          maxSuccessBurn5h: a._maxSuccessBurn5h ?? null, // DL-3032: proven-headroom recalibration floor
-        };
-      }
-      const tmp = this.ledgerPath + '.tmp';
-      writeFileSync(tmp, JSON.stringify({ version: 2, savedAt: Date.now(), entries, accounts }), { mode: 0o600 });
-      renameSync(tmp, this.ledgerPath);
-      this._ledgerDirty = false;
-      this._ledgerLastSaveAt = Date.now();
-    } catch { /* best-effort */ }
-  }
+  saveLedger() { return ledgerSave(this); }
 
-  _pruneLedger() {
-    if (!this.ledgerRetentionMs) return;
-    const cutoff = Date.now() - this.ledgerRetentionMs;
-    for (const [k, e] of this.usageLedger) {
-      if ((e.lastActiveAt || 0) < cutoff) this.usageLedger.delete(k);
-    }
-  }
+  _pruneLedger() { return ledgerPrune(this); }
 
-  // Attribute one message's usage to the durable ledger (keyed by sid::issue).
-  // D1DX (D-2169): also accumulates `cost` ($) and remembers the last `model`.
   _ledgerTouch(sessionId, accountName, inputTokens, outputTokens, cost = 0, model = null) {
-    if (!sessionId) return;
-    const issue = this._sessionRow(sessionId)?.pinned_issue || '';
-    const key = `${sessionId}::${issue}`;
-    let e = this.usageLedger.get(key);
-    const now = Date.now();
-    if (!e) {
-      e = { sid: sessionId, issue, account: accountName, messages: 0, inputTokens: 0, outputTokens: 0, cost: 0, model: null, firstSeenAt: now, lastActiveAt: now };
-      this.usageLedger.set(key, e);
-    }
-    e.account = accountName;
-    if (inputTokens) { e.messages++; e.inputTokens += inputTokens; }
-    if (outputTokens) e.outputTokens += outputTokens;
-    if (cost) e.cost = (e.cost || 0) + cost;
-    if (model) e.model = model;
-    e.lastActiveAt = now;
-    this._ledgerDirty = true;
+    return ledgerTouchFn(this, sessionId, accountName, inputTokens, outputTokens, cost, model);
   }
 
-  // Debounced disk write — called from the hot path; writes at most every ledgerSaveMs.
-  _maybeSaveLedger() {
-    if (!this.ledgerPath || !this._ledgerDirty) return;
-    if (Date.now() - this._ledgerLastSaveAt < this.ledgerSaveMs) return;
-    this.saveLedger();
-  }
+  _maybeSaveLedger() { return ledgerMaybeSave(this); }
 
-  // Per-issue rollup across ALL ledger entries (durable, all sessions). The
-  // operator's "all usage on the issue across all sessions" view.
-  ledgerByIssue() {
-    const byIssue = new Map();
-    for (const e of this.usageLedger.values()) {
-      const k = e.issue || '(unassigned)';
-      let g = byIssue.get(k);
-      if (!g) { g = { issue: k, sessions: 0, messages: 0, inputTokens: 0, outputTokens: 0, cost: 0, lastActiveAt: 0 }; byIssue.set(k, g); }
-      g.sessions++;
-      g.messages += e.messages || 0;
-      g.inputTokens += e.inputTokens || 0;
-      g.outputTokens += e.outputTokens || 0;
-      g.cost += e.cost || 0;
-      if ((e.lastActiveAt || 0) > g.lastActiveAt) g.lastActiveAt = e.lastActiveAt;
-    }
-    return [...byIssue.values()].map(g => {
-      const tokens = g.inputTokens + g.outputTokens;
-      return { ...g, tokens, avgTokensPerMsg: g.messages ? Math.round(tokens / g.messages) : 0 };
-    }).sort((a, c) => c.tokens - a.tokens);
-  }
+  // Per-issue rollup across ALL ledger entries (accounting/ledger.js).
+  ledgerByIssue() { return ledgerByIssueFn(this); }
 
   // Clear stale quota windows (5h/7d/standard) on an account (core/bench.js).
   _clearExpiredQuotas(account) { return benchClearExpiredQuotas(this, account); }
