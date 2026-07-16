@@ -1395,13 +1395,22 @@ export class AccountManager {
   markRateLimited(accountIndex, retryAfterSeconds) {
     const account = this.accounts[accountIndex];
     if (!account) return;
-    // DL-3032 (operator directive): rate-limit BENCHING DISABLED. Under heavy
-    // concurrent fleet load the escalating-ladder benches synchronized the whole
-    // OAuth pool into "all throttled" holds, cutting the fleet's Claude access. Do
-    // NOT bench on a 429 — a 429 fails over to another account for that request, but
-    // the account is never sidelined, so the pool never collapses to a hold. Genuine
-    // header caps (_atHardLimit) still exclude an account; concurrency is still paced
-    // by the probe-gate. Re-enabling bench = restore the body below this return.
+    // DL-3032 (operator directive): REACTIVE-ONLY rate limiting. No prediction, no
+    // escalating ladder, no utilization guessing. Exactly ONE signal is obeyed:
+    // Anthropic's explicit retry-after on a real 429 — bench that one account for
+    // exactly the server-stated duration so selection moves to the rest of the pool
+    // (without this, a genuinely capped account ranks FIRST in pace order — lowest
+    // weekly utilization — and generates an endless 429/failover storm). A header-less
+    // 429 does NOT bench: it just fails over for that request.
+    if (retryAfterSeconds != null && !isNaN(retryAfterSeconds) && retryAfterSeconds > 0) {
+      const until = Date.now() + retryAfterSeconds * 1000;
+      if (!(account.status === 'throttled' && account.rateLimitedUntil >= until)) {
+        account.status = 'throttled';
+        account.rateLimitedUntil = until;
+        account._lastBenchSec = Math.round(retryAfterSeconds);
+        console.log(`[TeamClaude] Account "${account.name}" rate limited +${account._lastBenchSec}s (server retry-after)`);
+      }
+    }
     return;
     // eslint-disable-next-line no-unreachable
     const now = Date.now();
