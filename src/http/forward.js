@@ -1,34 +1,39 @@
-import http from 'node:http';
-import { writeFile, mkdir } from 'node:fs/promises';
-import { join } from 'node:path';
-import { BUILD } from './version.js';
-import { decideHold } from './core/hold-policy.js';
+// http/forward.js — the request-forwarding path: account selection → dispatch →
+// upstream, the 429/5xx failover loop, and the all-throttled HOLD loop.
+// Owns:
+//   • forwardRequest — select (session cache-affinity), atomic in-flight reserve,
+//     build the upstream request, relay the response, and fail over on 429 /
+//     retry on 5xx / hold when the whole pool is throttled.
+//   • relayRaw — header-rewriting-free passthrough (the /v1/oauth/token relay).
+//   • holdForThrottle + sendAllThrottled429 — the all-throttled HOLD LOOP. The
+//     DECISION is pure in core/hold-policy.js; the loop lives HERE because it
+//     reads/writes the live req/res and recurses into forwardRequest — the
+//     forward↔hold cycle must stay inside one module for the core-imports-nothing-
+//     from-http rule to hold.
+//   • configureForward — resolve the HOLD knobs from config once at startup.
+//   covered by: test/all-throttled-hold.test.mjs (HOLD loop, failover, apikey gate),
+//   test/session-routing.test.mjs + test/selection.test.mjs (selection the forward
+//   path drives via the AccountManager facade).
 
+import { writeFile } from 'node:fs/promises';
+import { join } from 'node:path';
+import { decideHold } from '../core/hold-policy.js';
+import { streamResponse, extractUsageFromBody } from './sse.js';
 
 const HOP_BY_HOP_HEADERS = new Set([
   'host', 'connection', 'keep-alive', 'transfer-encoding',
   'te', 'trailer', 'upgrade', 'proxy-authorization', 'proxy-authenticate',
 ]);
 
-// D1DX patch (D-1741): all-throttled HOLD-and-wait config. Set once in
-// createProxyServer from config; defaults cover configs predating the keys.
-// (Lives here, not on AccountManager, because D-1741 shares account-manager.js
-// with a live sibling session — see the D-1741 issue thread.)
+// D1DX patch (D-1741): all-throttled HOLD-and-wait config. Set once by
+// configureForward (called from createProxyServer) from config; defaults cover
+// configs predating the keys.
 // D1DX (D-2420): apikeyDeadlineSec/apikeyLeadSec gate the paid-key last resort.
 let HOLD = { budgetSec: 1800, pollSec: 5, apikeyDeadlineSec: 300, apikeyLeadSec: 1 };
 
-export function createProxyServer(accountManager, config, hooks = {}) {
-  const upstream = config.upstream || 'https://api.anthropic.com';
-  const proxyApiKey = config.proxy?.apiKey;
-  // D1DX (D-1728): per-request full-body dumps are OFF unless `logRequests` is
-  // explicitly true. This nulls the dump dir, so all the per-request log-section
-  // building + writeRequestLog calls below short-circuit on `if (logDir)`. The
-  // daily operational log (switches/throttles/binds/errors) is written separately
-  // via the console tee in index.js (resolveLogDir) and is unaffected.
-  const logDir = (config.logRequests === true && config.logDir) ? config.logDir : null;
-  let requestCounter = 0;
-
-  // D1DX patch (D-1741): resolve the all-throttled hold knobs once.
+// D1DX patch (D-1741): resolve the all-throttled hold knobs once, at server
+// construction. createProxyServer calls this before the listener is created.
+export function configureForward(config) {
   HOLD = {
     budgetSec: Number.isFinite(config.allThrottledHoldBudgetSec) ? config.allThrottledHoldBudgetSec : 1800,
     pollSec:   Number.isFinite(config.holdPollSec) ? config.holdPollSec : 5,
@@ -43,132 +48,12 @@ export function createProxyServer(accountManager, config, hooks = {}) {
     apikeyDeadlineSec: Number.isFinite(config.apikeyFallbackDeadlineSec) ? config.apikeyFallbackDeadlineSec : 290,
     apikeyLeadSec:     Number.isFinite(config.apikeyLastResortLeadSec) ? config.apikeyLastResortLeadSec : 1,
   };
-
-  if (logDir) {
-    mkdir(logDir, { recursive: true }).catch(() => {});
-  }
-
-  const server = http.createServer(async (req, res) => {
-    try {
-      // Auth check — skip for localhost connections
-      const clientKey = req.headers['x-api-key'];
-      const remoteAddr = req.socket.remoteAddress;
-      const isLocal = remoteAddr === '127.0.0.1' || remoteAddr === '::1' || remoteAddr === '::ffff:127.0.0.1';
-      if (proxyApiKey && clientKey !== proxyApiKey && !isLocal) {
-        res.writeHead(401, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify({
-          type: 'error',
-          error: { type: 'authentication_error', message: 'Invalid proxy API key' },
-        }));
-        return;
-      }
-
-      // Status endpoint
-      if (req.method === 'GET' && req.url === '/teamclaude/status') {
-        res.writeHead(200, { 'Content-Type': 'application/json' });
-        // D-2226: report the RUNNING proxy's build (this process), so `teamclaude
-        // status` shows what's actually live — not the on-disk copy the CLI sees.
-        res.end(JSON.stringify({ ...accountManager.getStatus(), build: BUILD }, null, 2));
-        return;
-      }
-
-      // D-2179: capacity endpoint — orchestrators gate worker launches on this
-      // (verdict / headroom / soonestResetSec). Localhost-only like /status.
-      if (req.method === 'GET' && (req.url === '/teamclaude/capacity' || req.url === '/capacity')) {
-        res.writeHead(200, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify(accountManager.computeCapacity(), null, 2));
-        return;
-      }
-
-      // D-2485: full Deck snapshot — everything tui.js render() needs, so
-      // `teamclaude watch` can render the live Deck READ-ONLY (no port bind, no
-      // second server). Localhost + x-api-key gated exactly like /status; served
-      // locally, never routed upstream, never logged.
-      if (req.method === 'GET' && req.url === '/teamclaude/deck') {
-        res.writeHead(200, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify({ ...accountManager.getDeckSnapshot(), build: BUILD }, null, 2));
-        return;
-      }
-
-      // D-2805: on-demand mint — start the 5h window EARLY for the headroom
-      // OAuth accounts (the morning primer curls this from localhost). Gated by
-      // the top auth check exactly like /status (remote needs the key; localhost
-      // exempt). Uses the proxy's own warmOne → ensureTokenFresh, so an expired
-      // token is refreshed clobber-safely (no second process racing the token
-      // store). Never routed upstream as a proxied request.
-      if (req.method === 'POST' && req.url === '/teamclaude/warm') {
-        const threshold = Number.isFinite(config.warmHeadroomThreshold) ? config.warmHeadroomThreshold : 0.90;
-        const summary = await accountManager.warmHeadroom(threshold, upstream);
-        res.writeHead(200, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify({ ...summary, build: BUILD }, null, 2));
-        return;
-      }
-
-      // D1DX patch (D-1903): local health endpoint. A bare `GET`/`HEAD /` (and
-      // `/health`) is a connectivity probe Claude Code / monitors fire ~every 30s.
-      // Anthropic returns 404 for it, so WITHOUT this short-circuit every probe is
-      // forwarded upstream on a real Max account — burning a token refresh + a
-      // selection + a real round-trip to api.anthropic.com, AND emitting a
-      // `GET / → <acct> (404)` oplog line (23% of the daily log on 2026-06-05) +
-      // consuming the all-throttled path during saturation (234 spurious 429s that
-      // day). Answer it locally with 200, no routing, and return BEFORE the request
-      // counter / onRequest* hooks so it never reaches an account or the log.
-      if ((req.method === 'GET' || req.method === 'HEAD') && (req.url === '/' || req.url === '/health')) {
-        res.writeHead(200, { 'Content-Type': 'application/json' });
-        res.end(req.method === 'HEAD' ? undefined : JSON.stringify({ status: 'ok', service: 'teamclaude', build: BUILD }));
-        return;
-      }
-
-      // Let client token refresh requests pass through to upstream untouched.
-      // The proxy manages its own tokens via ensureTokenFresh(); intercepting
-      // or rewriting client refreshes would cause token rotation conflicts.
-      if (req.method === 'POST' && req.url === '/v1/oauth/token') {
-        await relayRaw(req, res, upstream);
-        return;
-      }
-
-      // Track request
-      const reqId = ++requestCounter;
-      hooks.onRequestStart?.(reqId, { method: req.method, path: req.url });
-
-      // Buffer request body (needed for retry on 429)
-      const bodyChunks = [];
-      for await (const chunk of req) {
-        bodyChunks.push(chunk);
-      }
-      const body = Buffer.concat(bodyChunks);
-
-      const ctx = { account: null, status: null };
-      try {
-        await forwardRequest(req, res, body, accountManager, upstream, 0, hooks, reqId, ctx, logDir);
-      } catch (err) {
-        ctx.status = ctx.status || 502;
-        console.error('[TeamClaude] Unhandled error:', err);
-        if (!res.headersSent) {
-          res.writeHead(502, { 'Content-Type': 'application/json' });
-          res.end(JSON.stringify({
-            type: 'error',
-            error: { type: 'proxy_error', message: 'Internal proxy error' },
-          }));
-        }
-      } finally {
-        hooks.onRequestEnd?.(reqId, {
-          method: req.method, path: req.url,
-          account: ctx.account, status: ctx.status,
-        });
-      }
-    } catch (err) {
-      console.error('[TeamClaude] Unhandled error:', err);
-    }
-  });
-
-  return server;
 }
 
 /**
  * Relay a request to upstream with no header rewriting — pure passthrough.
  */
-async function relayRaw(req, res, upstream) {
+export async function relayRaw(req, res, upstream) {
   const bodyChunks = [];
   for await (const chunk of req) bodyChunks.push(chunk);
   const body = Buffer.concat(bodyChunks);
@@ -226,7 +111,7 @@ function formatHeaders(headers) {
   return Object.entries(headers).map(([k, v]) => `  ${k}: ${v}`).join('\n');
 }
 
-async function forwardRequest(req, res, body, accountManager, upstream, retryCount, hooks, reqId, ctx, logDir) {
+export async function forwardRequest(req, res, body, accountManager, upstream, retryCount, hooks, reqId, ctx, logDir) {
   const maxRetries = accountManager.accounts.length;
 
   // Select account — per-session cache-affinity routing (D-1728). The
@@ -682,107 +567,6 @@ function sendAllThrottled429(res, accountManager, ctx) {
       message: `All ${accountManager.accounts.length} accounts throttled. Retry in ${retryAfter}s.`,
     },
   }));
-}
-
-/**
- * Stream an SSE response to the client, parsing usage data along the way.
- */
-async function streamResponse(webStream, res, accountIndex, accountManager, streamLog, sessionId = null) {
-  const reader = webStream.getReader();
-  const decoder = new TextDecoder();
-  let sseBuffer = '';
-
-  try {
-    while (true) {
-      const { done, value } = await reader.read();
-      if (done) break;
-
-      // Client disconnected — stop reading from upstream
-      if (res.destroyed) break;
-
-      // Forward chunk immediately
-      const ok = res.write(value);
-
-      const text = decoder.decode(value, { stream: true });
-
-      // Capture for logging
-      if (streamLog) streamLog.push(text);
-
-      // Parse SSE events for usage tracking
-      sseBuffer += text;
-      const events = sseBuffer.split('\n\n');
-      sseBuffer = events.pop(); // keep incomplete event
-
-      for (const event of events) {
-        parseSSEUsage(event, accountIndex, accountManager, sessionId);
-      }
-
-      // Handle backpressure — also bail out if client disconnects,
-      // because 'drain' will never fire on a destroyed socket
-      if (!ok) {
-        await new Promise(resolve => {
-          res.once('drain', resolve);
-          res.once('close', resolve);
-        });
-        if (res.destroyed) break;
-      }
-    }
-
-    // Parse any remaining buffer
-    if (sseBuffer.trim()) {
-      parseSSEUsage(sseBuffer, accountIndex, accountManager, sessionId);
-    }
-  } finally {
-    // Cancel upstream reader to stop consuming data nobody needs
-    reader.cancel().catch(() => {});
-    if (!res.writableEnded) res.end();
-  }
-}
-
-function parseSSEUsage(event, accountIndex, accountManager, sessionId = null) {
-  const dataLine = event.split('\n').find(l => l.startsWith('data: '));
-  if (!dataLine) return;
-
-  try {
-    const data = JSON.parse(dataLine.slice(6));
-    if (data.type === 'message_start' && data.message?.usage) {
-      // D-2169: input + cache tokens + model land on message_start. Output
-      // tokens arrive on message_delta (no model — the binding remembers it).
-      accountManager.updateUsage(
-        accountIndex, data.message.usage.input_tokens || 0, 0, sessionId,
-        { ..._cacheOpts(data.message.usage), model: data.message.model || null },
-      );
-    } else if (data.type === 'message_delta' && data.usage) {
-      accountManager.updateUsage(accountIndex, 0, data.usage.output_tokens || 0, sessionId);
-    }
-  } catch {
-    // not valid JSON, skip
-  }
-}
-
-// D-2169: split a usage object's cache-creation into 5m vs 1h. When the API
-// omits the breakdown, treat all cache-creation as 5m (Claude Code's default TTL).
-function _cacheOpts(usage) {
-  const cc = usage.cache_creation || {};
-  let c5 = cc.ephemeral_5m_input_tokens;
-  let c1 = cc.ephemeral_1h_input_tokens;
-  if (c5 == null && c1 == null) { c5 = usage.cache_creation_input_tokens || 0; c1 = 0; }
-  else { c5 = c5 || 0; c1 = c1 || 0; }
-  return { cacheCreate5m: c5, cacheCreate1h: c1, cacheRead: usage.cache_read_input_tokens || 0 };
-}
-
-function extractUsageFromBody(buffer, accountIndex, accountManager, sessionId = null) {
-  try {
-    const json = JSON.parse(buffer.toString());
-    if (json.usage) {
-      accountManager.updateUsage(
-        accountIndex, json.usage.input_tokens || 0, json.usage.output_tokens || 0, sessionId,
-        { ..._cacheOpts(json.usage), model: json.model || null },
-      );
-    }
-  } catch {
-    // not JSON or no usage
-  }
 }
 
 // D1DX patch (D-1705): the free `computeRetryAfter(accounts)` helper was removed.

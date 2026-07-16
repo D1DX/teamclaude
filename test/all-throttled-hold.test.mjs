@@ -1,5 +1,5 @@
 import http from 'node:http';
-import { createProxyServer } from '../src/server.js';
+import { createProxyServer } from '../src/http/server.js';
 
 // D1DX (D-1741): all-throttled HOLD-and-wait. Integration test — spins the real
 // proxy with a stub AccountManager + a mock upstream, drives /v1/messages and a

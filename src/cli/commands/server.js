@@ -1,6 +1,6 @@
 import { join } from 'node:path';
 import { AccountManager } from '../../account-manager.js';
-import { createProxyServer } from '../../server.js';
+import { createProxyServer } from '../../http/server.js';
 import { TUI } from '../../tui.js';
 import { loadOrCreateConfig, loadConfig, saveConfig, saveConfigSync, atomicConfigUpdate } from '../../config.js';
 import { resolveLogDir, appendOpLog, pruneOldLogs, setLogRetentionHours } from '../../oplog.js';
