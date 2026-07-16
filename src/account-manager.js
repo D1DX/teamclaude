@@ -8,6 +8,7 @@ import { createAccounts, addAccount as poolAddAccount, removeAccount as poolRemo
 import { getAccountForSession as sessGetAccountForSession, activeSessionCounts as sessActiveSessionCounts, evictStaleBindings as sessEvictStaleBindings, sessionBindingSummary as sessBindingSummary, sessionAggregate as sessAggregate } from './core/session.js';
 import { getActiveAccount as selGetActiveAccount, pickAccountForBinding as selPickAccountForBinding, paceLine as selPaceLine, paceGap as selPaceGap, rampBoost as selRampBoost, paceScore as selPaceScore, apikeyShouldYield as selApikeyShouldYield, hasUsableApikey as selHasUsableApikey, switchTo as selSwitchTo } from './core/selection.js';
 import { noteInflightStart as dispNoteInflightStart, noteInflightEnd as dispNoteInflightEnd, tryReserveInflight as dispTryReserveInflight, atInflightCap as dispAtInflightCap } from './core/dispatch.js';
+import { sweepAll as benchSweepAll, clearExpiredQuotas as benchClearExpiredQuotas, isBlocked as benchIsBlocked, atHardLimit as benchAtHardLimit, isUsable as benchIsUsable, soonestUsableOrNull as benchSoonestUsableOrNull, isPremiumModel as benchIsPremiumModel, premiumRejected as benchPremiumRejected, markRateLimited as benchMarkRateLimited, allHardCapped as benchAllHardCapped } from './core/bench.js';
 
 // DL-2841: premium (7d_oi) sub-axis reject with no server-stated reset — bench the
 // premium axis for this long, then re-probe. Only fires when Anthropic sends a
@@ -173,12 +174,7 @@ export class AccountManager {
   // not just `current`. Clears an expired throttle (so a freed account rejoins the
   // failover pool immediately) and stale quota windows. In-memory, no network, no
   // timer — keeps the whole pool fresh and the status display truthful.
-  _sweepAll() {
-    for (const account of this.accounts) {
-      this._isBlocked(account);       // side effect: flips an expired throttle back to active
-      this._clearExpiredQuotas(account);
-    }
-  }
+  _sweepAll() { return benchSweepAll(this); }
 
   /**
    * Get the best available account (sticky while the current one is preferred).
@@ -212,20 +208,11 @@ export class AccountManager {
   // How far BEHIND its weekly line the account is (core/selection.js).
   _paceGap(account) { return selPaceGap(this, account); }
 
-  // DL-2841: is this outbound model in the premium/flagship weekly tier (the one
-  // Anthropic meters on the `unified-7d_oi` sub-axis)? Config-driven regex; default
-  // matches the Fable/Mythos flagship family. Non-premium models (Sonnet/Opus/Haiku)
-  // are never gated by a premium sub-limit.
-  _isPremiumModel(model) {
-    return !!model && this.premiumModelRe.test(model);
-  }
+  // Premium/flagship weekly-tier (7d_oi) model classification (core/bench.js).
+  _isPremiumModel(model) { return benchIsPremiumModel(this, model); }
 
-  // DL-2841: is this account currently premium-tier (7d_oi) capped? True only while the
-  // sub-limit is live. Non-premium traffic ignores this entirely (the account stays
-  // usable); premium binds skip it while it holds.
-  _premiumRejected(account) {
-    return !!account && account._premiumRejectedUntil > Date.now();
-  }
+  // Is this account currently premium-tier (7d_oi) capped? (core/bench.js).
+  _premiumRejected(account) { return benchPremiumRejected(this, account); }
 
   // End-of-cycle ramp (control law #3): as the account nears its 7d-reset, escalate
   // preference to drain unused weekly quota before it resets (use-it-or-lose-it).
@@ -292,22 +279,9 @@ export class AccountManager {
   // DL-2226: at/over the in-flight cap? (core/dispatch.js) — server holds for a slot.
   atInflightCap(accountIndex) { return dispAtInflightCap(this, accountIndex); }
 
-  // Tier-3 fallback (pure): the soonest-to-reset account, reactivated only if its
-  // reset has actually passed; else null (= genuinely exhausted → honest 429).
-  _soonestUsableOrNull() {
-    let soonest = null, soonestTime = Infinity;
-    for (const a of this.accounts) {
-      const t = a.rateLimitedUntil || a.quota.unified5hReset || a.quota.unified7dReset
-        || (a.quota.resetsAt ? new Date(a.quota.resetsAt).getTime() : null);
-      if (t && t < soonestTime) { soonestTime = t; soonest = a; }
-    }
-    if (soonest && soonestTime <= Date.now()) {
-      soonest.status = 'active';
-      soonest.rateLimitedUntil = null;
-      return soonest;
-    }
-    return null;
-  }
+  // Tier-3 fallback: soonest-to-reset account, reactivated only if its reset has
+  // passed; else null (genuinely exhausted → honest 429) (core/bench.js).
+  _soonestUsableOrNull() { return benchSoonestUsableOrNull(this); }
 
   _evictStaleBindings() { return sessEvictStaleBindings(this); }
 
@@ -711,59 +685,17 @@ export class AccountManager {
     }).sort((a, c) => c.tokens - a.tokens);
   }
 
-  _clearExpiredQuotas(account) {
-    const q = account.quota;
-    const now = Date.now();
-    if (q.unified5h != null && q.unified5hReset && now >= q.unified5hReset) {
-      console.log(`[TeamClaude] Account "${account.name}" session quota reset`);
-      q.unified5h = null;
-      q.unified5hReset = null;
-    }
-    if (q.unified7d != null && q.unified7dReset && now >= q.unified7dReset) {
-      console.log(`[TeamClaude] Account "${account.name}" weekly quota reset`);
-      q.unified7d = null;
-      q.unified7dReset = null;
-      q.unifiedStatus = null;
-    }
-    if (q.resetsAt && now >= new Date(q.resetsAt).getTime()) {
-      q.tokensRemaining = null;
-      q.tokensLimit = null;
-      q.requestsRemaining = null;
-      q.requestsLimit = null;
-      q.resetsAt = null;
-    }
-  }
+  // Clear stale quota windows (5h/7d/standard) on an account (core/bench.js).
+  _clearExpiredQuotas(account) { return benchClearExpiredQuotas(this, account); }
 
-  // Throttled / errored / exhausted — unusable. A throttle whose window has passed
-  // flips the account back to active immediately (normal 429 failover).
-  _isBlocked(account) {
-    if (!account) return true;
-    if (account.status === 'throttled' && account.rateLimitedUntil) {
-      if (Date.now() < account.rateLimitedUntil) return true;
-      account.status = 'active';
-      account.rateLimitedUntil = null;
-      console.log(`[TeamClaude] Account "${account.name}" rate limit expired, marking active`);
-    }
-    if (account.status === 'exhausted' || account.status === 'error') return true;
-    return false;
-  }
+  // Throttled / errored / exhausted — unusable; expired throttle flips active (core/bench.js).
+  _isBlocked(account) { return benchIsBlocked(this, account); }
 
-  // Q1 explicit-server-signal hard cap: the account's BASE (5h/7d) axis carries
-  // unified-status `rejected` — the server saying it is over. Excluded from
-  // selection until its reset clears the status (_clearExpiredQuotas nulls it on the
-  // 7d reset). Reactive, not predictive: `allowed_warning` (≈24% of normal requests)
-  // is NOT a trigger, and a utilization number never is. covered by selection.test,
-  // per-family-reject.test, capacity.test.
-  _atHardLimit(account) {
-    return !!account && account.quota?.unifiedStatus === 'rejected';
-  }
+  // Q1 hard cap: base-axis unified-status `rejected` (core/bench.js).
+  _atHardLimit(account) { return benchAtHardLimit(this, account); }
 
-  // Usable — not blocked and not base-axis `rejected` (Q1 hard cap).
-  _isUsable(account) {
-    if (this._isBlocked(account)) return false;
-    this._clearExpiredQuotas(account);
-    return !this._atHardLimit(account);
-  }
+  // Usable — not blocked and not base-axis `rejected` (core/bench.js).
+  _isUsable(account) { return benchIsUsable(this, account); }
 
   _switchTo(account, reason) { return selSwitchTo(this, account, reason); }
 
@@ -922,45 +854,8 @@ export class AccountManager {
     }
   }
 
-  /**
-   * Mark an account rate-limited (429) — reactive-only. The server's explicit signal
-   * is the only one obeyed (no prediction, no ladder, no utilization thresholds):
-   *   • a premium (7d_oi) 429 is scoped to the premium axis — it must NOT bench the
-   *     whole account, which stays usable for non-premium models (Q1 signal 3);
-   *   • a retry-after benches that one account for exactly the stated duration —
-   *     honored verbatim (Q2), a longer retry-after extends an existing bench, a
-   *     shorter one never shrinks it;
-   *   • a header-less (or non-positive) 429 does NOT bench — it just fails over.
-   * covered by reactive-bench.test, per-family-reject.test.
-   */
-  markRateLimited(accountIndex, retryAfterSeconds) {
-    const account = this.accounts[accountIndex];
-    if (!account) return;
-    // Q1 signal 3 (DL-2841): a premium-scoped 429 (premium axis rejected, base axes
-    // NOT rejected) benches the premium axis only — never the account. updateQuota
-    // runs first in the 429 path and has already set _premiumRejectedUntil, so premium
-    // binds skip this account while non-premium keeps flowing. Benching here would
-    // stall its Sonnet/Opus/Haiku traffic too.
-    if (this._premiumRejected(account) && account.quota?.unifiedStatus !== 'rejected') {
-      console.log(`[TeamClaude] Account "${account.name}" premium-tier (7d_oi) capped — NOT benching account; stays usable for non-premium models`);
-      return;
-    }
-    // Q1 signal 1 / Q2: obey an explicit server retry-after, verbatim. Bench that one
-    // account so selection moves to the rest of the pool; a longer retry-after extends
-    // an existing bench, a shorter one never shrinks it. Log when the server asks for
-    // more than 15 min (the server is the authority; a clamp would re-probe an account
-    // it told us to leave alone).
-    if (retryAfterSeconds != null && !isNaN(retryAfterSeconds) && retryAfterSeconds > 0) {
-      const until = Date.now() + retryAfterSeconds * 1000;
-      if (!(account.status === 'throttled' && account.rateLimitedUntil >= until)) {
-        account.status = 'throttled';
-        account.rateLimitedUntil = until;
-        account._lastBenchSec = Math.round(retryAfterSeconds);
-        const overLong = retryAfterSeconds > 15 * 60 ? ' — over 15min, honored verbatim (Q2)' : '';
-        console.log(`[TeamClaude] Account "${account.name}" rate limited +${account._lastBenchSec}s (server retry-after)${overLong}`);
-      }
-    }
-  }
+  // Mark an account rate-limited (429) — reactive-only (core/bench.js).
+  markRateLimited(accountIndex, retryAfterSeconds) { return benchMarkRateLimited(this, accountIndex, retryAfterSeconds); }
 
   /** A successful response on an account — mark it proven + recalibrate its cap. */
   noteAccountSuccess(accountIndex) {
@@ -1092,18 +987,8 @@ export class AccountManager {
     };
   }
 
-  /**
-   * Q1 signal 2: true when EVERY account is server-`rejected` for this request's axis
-   * — the pool is hard-capped, so the server hold-loop stops holding (a stated reset
-   * says recovery is hours out) and fires the apikey last resort immediately (DL-2420).
-   * Base-axis rejection counts for any request; premium (7d_oi) rejection counts only
-   * for a premium model. covered by capacity.test.
-   */
-  allHardCapped(model = null) {
-    if (!this.accounts.length) return false;
-    const premium = this._isPremiumModel(model);
-    return this.accounts.every(a => this._atHardLimit(a) || (premium && this._premiumRejected(a)));
-  }
+  // Q1 signal 2: every account server-`rejected` for this request's axis (core/bench.js).
+  allHardCapped(model = null) { return benchAllHardCapped(this, model); }
 
   /**
    * Ensure an OAuth account's token is fresh, refreshing if needed.
