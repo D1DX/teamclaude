@@ -50,6 +50,87 @@ export function configureForward(config) {
   };
 }
 
+// #83 (d723417): paths bound to the CLIENT's own claude.ai identity, not a pooled
+// account. forwardRequest rewrites Authorization to the rotated account token,
+// which 403s these — so relay them with the client's OWN credential instead:
+//   • /v1/code/*            Remote Control (teleoperated Claude Code) worker stream
+//   • /api/oauth/files/*    attachment DOWNLOAD (images on a message → 403 = the
+//                           image is silently dropped, message arrives text-only)
+//   • /api/oauth/file_upload attachment UPLOAD
+const CLIENT_CREDENTIAL_PATHS = ['/v1/code/', '/api/oauth/files/', '/api/oauth/file_upload'];
+
+export function isClientCredentialPath(url) {
+  return typeof url === 'string' && CLIENT_CREDENTIAL_PATHS.some(p => url.startsWith(p));
+}
+
+/**
+ * #83 (d723417): client-credential passthrough. Forward the request with the
+ * client's OWN Authorization untouched — no account selection, no auth rewrite.
+ * STREAMED, never buffered/.text(): the Remote Control channel is a long-lived
+ * event stream and attachment bodies are binary (.text() would corrupt them).
+ */
+export async function relayStream(req, res, upstream) {
+  const headers = {};
+  for (const [key, value] of Object.entries(req.headers)) {
+    const lk = key.toLowerCase();
+    if (HOP_BY_HOP_HEADERS.has(lk)) continue;
+    if (lk === 'x-api-key') continue;        // the PROXY key — not an upstream credential
+    // Strip accept-encoding: Node fetch auto-decompresses, which would mismatch
+    // the Content-Encoding we'd otherwise forward to the client.
+    if (lk === 'accept-encoding') continue;
+    headers[key] = value;                     // the client's own Authorization is preserved
+  }
+
+  const bodyChunks = [];
+  for await (const chunk of req) bodyChunks.push(chunk);
+  const body = Buffer.concat(bodyChunks);
+
+  try {
+    const upstreamRes = await fetch(`${upstream}${req.url}`, {
+      method: req.method,
+      headers,
+      body: ['GET', 'HEAD'].includes(req.method) ? undefined : (body.length ? body : undefined),
+      redirect: 'manual',
+    });
+
+    const responseHeaders = {};
+    for (const [key, value] of upstreamRes.headers.entries()) {
+      if (key === 'transfer-encoding' || key === 'connection') continue;
+      // fetch may auto-decompress — drop the now-inaccurate length/encoding.
+      if (key === 'content-encoding' || key === 'content-length') continue;
+      responseHeaders[key] = value;
+    }
+    res.writeHead(upstreamRes.status, responseHeaders);
+
+    if (!upstreamRes.body) { res.end(); return; }
+
+    // Stream the body through chunk-by-chunk (backpressure-aware, client-disconnect
+    // safe). Binary-preserving — no text decode.
+    const reader = upstreamRes.body.getReader();
+    try {
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        if (res.destroyed) break;
+        const ok = res.write(Buffer.from(value));
+        if (!ok) {
+          await new Promise(resolve => { res.once('drain', resolve); res.once('close', resolve); });
+          if (res.destroyed) break;
+        }
+      }
+    } finally {
+      reader.cancel().catch(() => {});
+      if (!res.writableEnded) res.end();
+    }
+  } catch (err) {
+    console.error('[TeamClaude] Client-credential relay error:', err.message);
+    if (!res.headersSent) {
+      res.writeHead(502, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ type: 'error', error: { type: 'proxy_error', message: 'Upstream unreachable' } }));
+    }
+  }
+}
+
 /**
  * Relay a request to upstream with no header rewriting — pure passthrough.
  */

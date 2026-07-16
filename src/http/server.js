@@ -11,7 +11,7 @@ import { timingSafeEqual } from 'node:crypto';
 import { mkdir } from 'node:fs/promises';
 import { BUILD } from '../version.js';
 import { handleAdminRoute } from './admin.js';
-import { forwardRequest, relayRaw, configureForward } from './forward.js';
+import { forwardRequest, relayRaw, relayStream, isClientCredentialPath, configureForward } from './forward.js';
 
 // #81 (4fc849a): constant-time proxy-key comparison. A plain `!==` leaks the
 // match length via early-exit timing; timingSafeEqual doesn't. Returns false on
@@ -80,6 +80,17 @@ export function createProxyServer(accountManager, config, hooks = {}) {
       // or rewriting client refreshes would cause token rotation conflicts.
       if (req.method === 'POST' && req.url === '/v1/oauth/token') {
         await relayRaw(req, res, upstream);
+        return;
+      }
+
+      // #83 (d723417): client-credential passthrough — Remote Control (/v1/code/*)
+      // and attachment transfers (/api/oauth/files/*, /api/oauth/file_upload) are
+      // bound to the client's own claude.ai identity. Relay them with the client's
+      // credential (streamed), never a rotated account token (which 403s). Handled
+      // BEFORE the request counter / inference hooks — these are passthroughs, not
+      // pooled inference.
+      if (isClientCredentialPath(req.url)) {
+        await relayStream(req, res, upstream);
         return;
       }
 
