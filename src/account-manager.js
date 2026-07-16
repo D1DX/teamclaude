@@ -5,6 +5,7 @@ import { join } from 'node:path';
 import { systemSnapshot as _systemSnapshot } from './infra/system.js';
 import { priceFor, CACHE_WRITE_5M_MULT, CACHE_WRITE_1H_MULT, CACHE_READ_MULT } from './accounting/pricing.js';
 import { createAccounts, addAccount as poolAddAccount, removeAccount as poolRemoveAccount } from './core/pool.js';
+import { getAccountForSession as sessGetAccountForSession, activeSessionCounts as sessActiveSessionCounts, evictStaleBindings as sessEvictStaleBindings, sessionBindingSummary as sessBindingSummary, sessionAggregate as sessAggregate } from './core/session.js';
 
 // DL-2841: premium (7d_oi) sub-axis reject with no server-stated reset — bench the
 // premium axis for this long, then re-probe. Only fires when Anthropic sends a
@@ -208,72 +209,10 @@ export class AccountManager {
    * session id (warmer / health checks / non-Claude-Code clients).
    * Returns null only when the pool is genuinely exhausted.
    */
-  getAccountForSession(sessionId, opts = {}) {
-    this._sweepAll();
-    this._evictStaleBindings();
-    if (!sessionId) return this.getActiveAccount(opts);
+  getAccountForSession(sessionId, opts = {}) { return sessGetAccountForSession(this, sessionId, opts); }
 
-    const now = Date.now();
-    const b = this.sessionBindings.get(sessionId);
-    if (b) {
-      const acct = this.accounts[b.index];
-      const warm = now - b.lastUsedAt < this.cacheAffinityWindowMs;
-      // Stay put while warm AND safe AND not far past the weekly line. Rebind on:
-      // a blocker / hard-cap, the 5h never-stall rail (control law #1), or being
-      // far over the weekly line (control law #6 — cache yields ONLY then; normal
-      // over-pace doesn't churn a warm session).
-      const farOverLine = acct ? this._paceGap(acct) < -this.farOverLineThreshold : false;
-      // DL-2841: a warm binding rebinds if THIS request is a premium-tier model and the
-      // bound account is premium-capped — otherwise every Fable request on a warm-bound
-      // account would 429. Non-premium requests keep the warm binding unchanged.
-      const premiumMiss = this._isPremiumModel(opts.model) && this._premiumRejected(acct);
-      if (acct && warm && !this._isBlocked(acct) && !this._atHardLimit(acct)
-          && !farOverLine
-          && !this._apikeyShouldYield(acct) && !premiumMiss) {
-        b.lastUsedAt = now;
-        return acct;
-      }
-    }
-
-    // (Re)bind: no binding, window lapsed, or bound account blocked/capped.
-    const chosen = this._pickAccountForBinding(opts);
-    if (!chosen) return null; // genuinely exhausted — server returns an honest 429
-
-    const prevIdx = b?.index;
-    const stillWarm = b && now - b.lastUsedAt < this.cacheAffinityWindowMs;
-    const reason = !b ? 'new session'
-      : !stillWarm ? 'window lapsed'
-      : 'blocker'; // was warm; bound acct blocked/capped
-    // Preserve per-session stats across a rebind — a session's work spans its
-    // account switches (firstSeenAt = the session's true start, not the latest bind).
-    this.sessionBindings.set(sessionId, {
-      index: chosen.index, lastUsedAt: now, boundAt: now,
-      firstSeenAt: b?.firstSeenAt ?? now,
-      requests: b?.requests ?? 0,
-      inputTokens: b?.inputTokens ?? 0,
-      outputTokens: b?.outputTokens ?? 0,
-    });
-    this.currentIndex = chosen.index; // keep TUI "active account" meaningful
-    if (prevIdx !== chosen.index) {
-      console.log(`[TeamClaude] Session ${this._sessionTag(sessionId)} → "${chosen.name}" (${reason})`);
-    }
-    return chosen;
-  }
-
-  // Per-account count of sessions whose binding is still warm (within the cache
-  // window) — drives the parallel-spread load cap. Returns { counts, active }.
-  _activeSessionCounts() {
-    const now = Date.now();
-    const counts = new Array(this.accounts.length).fill(0);
-    let active = 0;
-    for (const b of this.sessionBindings.values()) {
-      if (now - b.lastUsedAt < this.cacheAffinityWindowMs && b.index < counts.length) {
-        counts[b.index]++;
-        active++;
-      }
-    }
-    return { counts, active };
-  }
+  // Per-account count of warm-bound sessions (core/session.js). { counts, active }.
+  _activeSessionCounts() { return sessActiveSessionCounts(this); }
 
   // ── Pace-to-weekly-line helpers (D-2104, real-data) ──────────────────
   // Expected weekly utilization right now: fraction of the account's own 7d
@@ -488,12 +427,7 @@ export class AccountManager {
     return null;
   }
 
-  _evictStaleBindings() {
-    const now = Date.now();
-    for (const [sid, b] of this.sessionBindings) {
-      if (now - b.lastUsedAt > this.bindingEvictMs) this.sessionBindings.delete(sid);
-    }
-  }
+  _evictStaleBindings() { return sessEvictStaleBindings(this); }
 
   // Resolve a session's D1DX presence-registry row (or null). Best-effort,
   // cached ~5s. The x-claude-code-session-id header equals the registry SID
@@ -769,70 +703,11 @@ export class AccountManager {
     return _systemSnapshot();
   }
 
-  // Snapshot of live session→account bindings + per-session usage for the
-  // dashboard (D-1728). tokens = input + output; avgTokensPerMsg = tokens /
-  // messages; tokensPerMin = throughput over the session's elapsed time.
-  sessionBindingSummary() {
-    const now = Date.now();
-    const out = [];
-    for (const [sid, b] of this.sessionBindings) {
-      const acct = this.accounts[b.index];
-      if (!acct) continue;
-      const row = this._sessionRow(sid);
-      const pin = row ? this._sessionPin(row.sid) : null; // D-1739: local issue title/status overlay
-      const tokens = (b.inputTokens || 0) + (b.outputTokens || 0);
-      const reqs = b.requests || 0;
-      const elapsedSec = Math.max(1, Math.round((now - (b.firstSeenAt ?? now)) / 1000));
-      out.push({
-        sid,
-        sid8: String(sid).slice(0, 8),
-        emoji: row?.emoji || null,
-        issue: row?.pinned_issue || null,
-        intent: row?.intent || null,                              // D-1739: agent activity line
-        fullSid: row?.sid || ('cc-' + sid),                       // D-1739: registry sid (whole-fleet merge key)
-        title: pin?.title || null,                                // D-1739: local pin.json overlay
-        status: pin?.status || null,                              // D-1739: agent's last-claimed issue status
-        needsYou: !!(pin && (pin.status === 'blocked' || pin.status === 'in_review' || pin.assigneeUserId)),
-        pid: row?.pid ?? null, // D-1728 S8: Claude Code process pid for per-instance mem/cpu
-        tag: this._sessionTag(sid),
-        account: acct.name,
-        warm: now - b.lastUsedAt < this.cacheAffinityWindowMs,
-        idleSec: Math.round((now - b.lastUsedAt) / 1000),
-        elapsedSec,
-        requests: reqs,
-        inputTokens: b.inputTokens || 0,
-        outputTokens: b.outputTokens || 0,
-        tokens,
-        cost: b.cost || 0,            // D-2169: API-equivalent $ for this session
-        model: b.model || null,       // D-2169: last-seen model (for the price tier)
-        avgTokensPerMsg: reqs ? Math.round(tokens / reqs) : 0,
-        tokensPerMin: Math.round(tokens / (elapsedSec / 60)),
-      });
-    }
-    return out.sort((a, c) => a.account.localeCompare(c.account) || c.tokens - a.tokens);
-  }
+  // Live session→account bindings + per-session usage for the dashboard (core/session.js).
+  sessionBindingSummary() { return sessBindingSummary(this); }
 
-  // Aggregate across all live sessions for the dashboard TOTAL (D-1728).
-  sessionAggregate() {
-    const now = Date.now();
-    let sessions = 0, warm = 0, requests = 0, inputTokens = 0, outputTokens = 0, cost = 0, earliest = now;
-    for (const b of this.sessionBindings.values()) {
-      sessions++;
-      if (now - b.lastUsedAt < this.cacheAffinityWindowMs) warm++;
-      requests += b.requests || 0;
-      inputTokens += b.inputTokens || 0;
-      outputTokens += b.outputTokens || 0;
-      cost += b.cost || 0;
-      if (b.firstSeenAt && b.firstSeenAt < earliest) earliest = b.firstSeenAt;
-    }
-    const tokens = inputTokens + outputTokens;
-    const elapsedSec = Math.max(1, Math.round((now - earliest) / 1000));
-    return {
-      sessions, warm, requests, inputTokens, outputTokens, tokens, cost, elapsedSec,
-      avgTokensPerMsg: requests ? Math.round(tokens / requests) : 0,
-      tokensPerMin: Math.round(tokens / (elapsedSec / 60)),
-    };
-  }
+  // Aggregate across all live sessions for the dashboard TOTAL (core/session.js).
+  sessionAggregate() { return sessAggregate(this); }
 
   // ── D1DX patch (D-1728 S6): durable usage ledger ───────────────
   setLedgerPath(p) { this.ledgerPath = p || null; }
