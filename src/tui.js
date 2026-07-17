@@ -1,5 +1,6 @@
 import { importCredentials, fetchProfile } from './oauth.js';
 import { resolveLogDir, appendOpLog } from './oplog.js';
+import { modelEffortTag } from './model.js';
 import { execSync } from 'node:child_process';
 
 // Deck render helpers (ANSI / width / bar / fmt) live in deck/render-util.js.
@@ -126,7 +127,7 @@ export class TUI {
     if (r) {
       r.account = info.account;
       // DL-2785 data: carry the parsed model + effort on the live request record
-      // for the model·effort Activity tag (this render never builds the tag yet).
+      // for the model·effort Activity tag (rendered on spinner rows + log lines).
       if (info.model != null) r.model = info.model;
       if (info.effort != null) r.effort = info.effort;
     }
@@ -137,9 +138,11 @@ export class TUI {
     this.active.delete(id);
     const dur = r ? ((Date.now() - r.started) / 1000).toFixed(1) : '?';
     const acct = info.account || r?.account || '?';
+    // DL-2785: the model·effort tag rides the completed log line too.
+    const tag = modelEffortTag(r?.model, r?.effort);
     // D1DX (D-1728): routine 2xx request lines stay in the live Activity pane only;
     // only non-2xx (errors / 429) persist to the daily log. Keeps the file minimal.
-    this._addLog(`${info.method} ${info.path} → ${acct} (${info.status}, ${dur}s)`, info.status >= 400);
+    this._addLog(`${info.method} ${info.path}${tag ? ' ' + tag : ''} → ${acct} (${info.status}, ${dur}s)`, info.status >= 400);
   }
 
   _addLog(msg, persist = true) {
@@ -896,7 +899,9 @@ export class TUI {
       const el = ((now - r.started) / 1000).toFixed(1);
       const sp = cyan(SPINNER[this.frame]);
       const a = r.account ? ` → ${r.account}` : '';
-      lines.push(` ${sp} ${gray(r.t)}  ${r.method} ${r.path}${a} ${dim(`(${el}s...)`)}`);
+      // DL-2785: the model·effort tag, dim so method/path stay the row's anchor.
+      const tag = modelEffortTag(r.model, r.effort);
+      lines.push(` ${sp} ${gray(r.t)}  ${r.method} ${r.path}${tag ? ' ' + dim(tag) : ''}${a} ${dim(`(${el}s...)`)}`);
     }
 
     // Completed log

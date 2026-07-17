@@ -15,6 +15,7 @@ import { noteInflightStart as dispNoteInflightStart, noteInflightEnd as dispNote
 import { sweepAll as benchSweepAll, clearExpiredQuotas as benchClearExpiredQuotas, isBlocked as benchIsBlocked, atHardLimit as benchAtHardLimit, isUsable as benchIsUsable, soonestUsableOrNull as benchSoonestUsableOrNull, isPremiumModel as benchIsPremiumModel, premiumRejected as benchPremiumRejected, premiumRequested as benchPremiumRequested, markRateLimited as benchMarkRateLimited, allHardCapped as benchAllHardCapped } from './core/bench.js';
 import { updateQuota as quotaUpdateQuota, applyProbeUsage as quotaApplyProbeUsage } from './core/quota.js';
 import { allThrottledBackoff as holdAllThrottledBackoff } from './core/hold-policy.js';
+import { modelEffortTag } from './model.js';
 
 // D1DX (D-1728): D1DX session presence registry — used only to resolve a
 // session emoji for log/TUI display. Best-effort; never load-bearing for routing.
@@ -704,8 +705,9 @@ export class AccountManager {
     if (r) {
       r.account = info.account;
       // DL-2785 data: surface the parsed executor model + effort on the live
-      // request record so the Deck's model·effort Activity tag can render them
-      // (this module never builds the tag — data only).
+      // request record. The snapshot spreads the whole record, so the watch
+      // viewer's spinner rows get them for free; the tag on completed log
+      // lines is built in onRequestEnd below.
       if (info.model != null) r.model = info.model;
       if (info.effort != null) r.effort = info.effort;
     }
@@ -716,7 +718,10 @@ export class AccountManager {
     this._active.delete(id);
     const dur = r ? ((Date.now() - r.started) / 1000).toFixed(1) : '?';
     const acct = info.account || r?.account || '?';
-    this._addLog(`${info.method} ${info.path} → ${acct} (${info.status}, ${dur}s)`);
+    // DL-2785: mirror tui.js — the model·effort tag rides the log line so the
+    // watch viewer (which renders this ring verbatim) shows it too.
+    const tag = modelEffortTag(r?.model, r?.effort);
+    this._addLog(`${info.method} ${info.path}${tag ? ' ' + tag : ''} → ${acct} (${info.status}, ${dur}s)`);
   }
 
   _addLog(msg) {

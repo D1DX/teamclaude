@@ -223,7 +223,7 @@ export function parseAdvisorModel(body) {
 // rootKey), target object]; a matching key nested deeper (message text, another
 // root key) never resolves. D1DX addition (not upstream): used to surface
 // `output_config.effort` on the request record for the Deck's model·effort
-// Activity tag (DL-2785 — data only; this module never builds the tag).
+// Activity tag (DL-2785 — the tag itself is built by modelEffortTag below).
 export class NestedStringFieldFinder {
   constructor(rootKey, field) {
     this.rootKey = rootKey;
@@ -301,4 +301,18 @@ export function parseRequestEffort(body) {
     if (!buf.includes('effort')) return null;
     return new NestedStringFieldFinder('output_config', 'effort').push(buf);
   } catch { return null; }
+}
+
+// The `[<model>·<effort>]` Activity tag (DL-2785 render). Display-only: the
+// model id is compacted for the Deck's narrow rows — the `claude-` prefix and a
+// trailing `-YYYYMMDD` date stamp drop; anything else (a `[1m]` context variant,
+// a non-Anthropic id) passes through verbatim. Returns '' when neither field is
+// known, so rows without parsed data render exactly as before.
+export function modelEffortTag(model, effort) {
+  const m = (typeof model === 'string' && model)
+    ? model.replace(/^claude-/, '').replace(/-\d{8}$/, '')
+    : null;
+  const e = (typeof effort === 'string' && effort) ? effort : null;
+  if (m == null && e == null) return '';
+  return `[${m ?? '?'}${e ? '·' + e : ''}]`;
 }
