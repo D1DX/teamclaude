@@ -18,7 +18,7 @@ import { BUILD } from '../version.js';
  * (and a response was written), false to let the caller keep routing.
  *   ctx = { accountManager, config, upstream }
  */
-export async function handleAdminRoute(req, res, { accountManager, config, upstream }) {
+export async function handleAdminRoute(req, res, { accountManager, config, upstream, reloadAccounts }) {
   // Status endpoint
   if (req.method === 'GET' && req.url === '/teamclaude/status') {
     res.writeHead(200, { 'Content-Type': 'application/json' });
@@ -57,6 +57,23 @@ export async function handleAdminRoute(req, res, { accountManager, config, upstr
     const summary = await accountManager.warmHeadroom(threshold, upstream);
     res.writeHead(200, { 'Content-Type': 'application/json' });
     res.end(JSON.stringify({ ...summary, build: BUILD }, null, 2));
+    return true;
+  }
+
+  // DL-2931: hot account reload — re-read the on-disk config and sync new
+  // accounts + refreshed credentials into the running pool WITHOUT a restart
+  // (parity with the TUI R key + the CLI server-boot sync). The reload closure
+  // is injected by the composition root (cli/commands/server.js) so this module
+  // never reaches down into cli/*; absent injection is a 503, not a crash.
+  if (req.method === 'POST' && req.url === '/teamclaude/accounts/reload') {
+    if (typeof reloadAccounts !== 'function') {
+      res.writeHead(503, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: 'reload not wired', build: BUILD }, null, 2));
+      return true;
+    }
+    const added = await reloadAccounts();
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ reloaded: true, added, accounts: accountManager.accounts.length, build: BUILD }, null, 2));
     return true;
   }
 

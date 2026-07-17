@@ -208,6 +208,17 @@ export async function serverCommand() {
     console.error = (...a) => { appendOpLog(opLogDir, a.join(' ')); try { origErr(...a); } catch {} };
   }
 
+  // DL-2931: expose account reload to the ops surface (POST /teamclaude/accounts/
+  // /reload). Built here at the composition root — the only layer that already
+  // holds loadConfig + syncAccountsFromDisk — and injected via hooks so http/
+  // admin.js stays free of any cli/* import. Wired in BOTH modes (headless is
+  // exactly the deployment that has no TUI R key). Returns the new-account count.
+  hooks.reloadAccounts = async () => {
+    const diskConfig = await loadConfig();
+    if (!diskConfig) return 0;
+    return syncAccountsFromDisk(diskConfig, config, accountManager);
+  };
+
   const server = createProxyServer(accountManager, config, hooks);
 
   // D1DX patch: warm BEFORE listening so request #1 is never blind — quota populated

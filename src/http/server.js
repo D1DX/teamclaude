@@ -65,7 +65,7 @@ export function createProxyServer(accountManager, config, hooks = {}) {
       }
 
       // Ops surface (/teamclaude/* + /capacity) — served locally, never upstream.
-      if (await handleAdminRoute(req, res, { accountManager, config, upstream })) return;
+      if (await handleAdminRoute(req, res, { accountManager, config, upstream, reloadAccounts: hooks.reloadAccounts })) return;
 
       // D1DX patch (D-1903): local health endpoint. A bare `GET`/`HEAD /` (and
       // `/health`) is a connectivity probe Claude Code / monitors fire ~every 30s.
