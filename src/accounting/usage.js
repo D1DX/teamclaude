@@ -49,7 +49,9 @@ export function updateUsage(mgr, accountIndex, inputTokens, outputTokens, sessio
   // binding's last-seen model (message_delta) → else null (→ opus).
   const model = opts.model || sb?.model || null;
   if (opts.model && sb) sb.model = opts.model;
-  const price = mgr._priceFor(model);
+  // §7: pricing keys off provider+model — the account's provider selects the price
+  // table (default anthropic). account.provider is null for OAuth/plain-apikey.
+  const price = mgr._priceFor(model, account.provider);
   const cacheCreate5m = opts.cacheCreate5m || 0;
   const cacheCreate1h = opts.cacheCreate1h || 0;
   const cacheRead = opts.cacheRead || 0;

@@ -4,6 +4,7 @@
 // upstream before and after the seam extraction (the DL-3106 parity DoD).
 import '../src/providers/anthropic.js';                       // self-registers 'anthropic'
 import { resolveProvider, getProvider, configureProviders, resolveUpstream, registerProvider } from '../src/providers/provider.js';
+import { priceFor, PROVIDER_PRICING } from '../src/accounting/pricing.js';
 
 let pass = 0, fail = 0;
 const ok = (name, cond) => { if (cond) { pass++; console.log('  ok  ', name); } else { fail++; console.log('  FAIL', name); } };
@@ -135,6 +136,18 @@ ok('modelMap grammar → an UNMAPPED family returns null (the no-alternative sig
   ok('classifyRateLimit → header-less 429 gives null (fails over, never benches)',
     anthropic.classifyRateLimit(noHdr).retryAfterSec === null);
 }
+
+// ── pricing keys off provider + model (§7) ───────────────────────────────────
+ok('priceFor keys off model family (default/anthropic table)',
+  priceFor('claude-opus-4-8').in === 5 && priceFor('claude-sonnet-5').out === 15);
+ok('priceFor honors the provider dimension (anthropic table selected explicitly)',
+  priceFor('claude-opus-4-8', null, 'anthropic').in === 5);
+ok('priceFor → an unknown provider (e.g. the z-ai pin) falls back to the default table',
+  priceFor('z-ai/glm-5.2', null, 'z-ai').in === 5);         // unknown family → opus rates, default table
+ok('priceFor → per-family override still applies on top of the selected table',
+  priceFor('claude-opus-4-8', { opus: [7, 30] }).in === 7);
+ok('only the anthropic price table exists today (no route choices hardcoded)',
+  Object.keys(PROVIDER_PRICING).length === 1 && PROVIDER_PRICING.anthropic);
 
 console.log(`\n${pass} passed, ${fail} failed`);
 process.exit(fail ? 1 : 0);

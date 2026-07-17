@@ -164,11 +164,12 @@ export class AccountManager {
     this._log = [];           // [{ t, msg }] newest-first, capped at LOG_CAP
   }
 
-  // D1DX (D-2169): resolve $/Mtok [input, output] for a model string. Delegated
-  // to accounting/pricing.js (the price table + family match live there); passes
-  // this manager's per-family overrides (opts.pricing).
-  _priceFor(model) {
-    return priceFor(model, this.pricing);
+  // D1DX (D-2169): resolve $/Mtok [input, output] for a model on a given provider.
+  // Delegated to accounting/pricing.js (the per-provider table + family match live
+  // there); passes this manager's per-family overrides (opts.pricing). §7: the
+  // provider selects the price table (default anthropic).
+  _priceFor(model, provider = null) {
+    return priceFor(model, this.pricing, provider);
   }
 
   // D1DX patch: actively sweep ALL accounts every request + on every status read,
