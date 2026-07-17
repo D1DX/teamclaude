@@ -71,6 +71,17 @@ export function computeCapacity(mgr) {
       burn5h, capEst5h: cap, headroomTok,
       constrained, nearCap: constrained,   // nearCap retained as an alias for existing readers (status label)
       live: !benched && !dead && !mgr._atHardLimit(a),
+      // DL-3160: the Fable/premium (7d_oi) axis as a distinct reporting field so the
+      // capacity snapshot (GET /capacity + `teamclaude capacity --json`) and any
+      // central-deck reader render it. Real-header-driven; null util when unseen (no
+      // estimate). `capped` mirrors the premium-only admission bench (still usable for
+      // non-premium models) — reporting only, never widens/narrows base headroom.
+      premium: {
+        util: a.quota?.premiumUtil ?? null,
+        reset: a.quota?.premiumReset ?? null,
+        status: a.quota?.premiumStatus ?? null,
+        capped: !!mgr._premiumRejected(a),
+      },
     };
   });
   const live = accounts.filter(a => a.live);

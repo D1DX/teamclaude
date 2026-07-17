@@ -58,6 +58,18 @@ export async function statusCommand() {
         console.log(`    Tokens:   ${tok} used    Requests: ${req} used`);
       }
 
+      // DL-3160: distinct per-account Fable/premium (7d_oi) meter — its own weekly
+      // sub-axis, separate from base 5h/7d, real-header-driven (or prober-fed). Shown
+      // only when the account carries premium data; never a silent estimate.
+      if (q.premiumUtil != null || q.premiumStatus != null) {
+        const fbl = q.premiumUtil != null ? (q.premiumUtil * 100).toFixed(1) + '%'
+          : (q.premiumStatus === 'rejected' ? '100%' : '-');
+        const capped = (acct.premiumCappedSec > 0 || q.premiumStatus === 'rejected') ? ' (capped)' : '';
+        const resetIn = (q.premiumReset && q.premiumReset > Date.now())
+          ? ' · resets ' + fmtDur(Math.ceil((q.premiumReset - Date.now()) / 1000)) : '';
+        console.log(`    Fable:    ${fbl} used${capped}${resetIn}`);
+      }
+
       console.log(`    Total:    ${acct.usage.totalInputTokens + acct.usage.totalOutputTokens} tokens, ${acct.usage.totalRequests} requests`);
       if (acct.rateLimitedUntil) console.log(`    Throttled until: ${acct.rateLimitedUntil}`);
       console.log('');

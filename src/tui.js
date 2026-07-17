@@ -993,6 +993,10 @@ export class TUI {
     let line = ` ${sel}${cur} ${name} ${type} ${status} ${l1} ${bar(r1, bw, t1)}`;
     if (showBoth) {
       line += `  ${l2} ${bar(r2, bw, t2)}`;
+      // DL-3160: distinct Fable/premium (7d_oi) meter — real-header-driven, shown
+      // only when the account carries premium-axis data; separate from base 5h/7d.
+      const pa = this._premiumAxis(q);
+      if (pa) line += `  Fbl ${bar(pa.r, bw, pa.t)}`;
     }
     return line;
   }
@@ -1040,12 +1044,29 @@ export class TUI {
     const w2 = isUnified ? SEVEN_D_MS : null;
     let line = ` ${sel}${glyph} ${name} ${status} ${l1}${bar(r1, bw, t1)} ${this._paceArrow(r1, t1, w1)}`;
     if (showBoth) line += `   ${l2}${bar(r2, bw, t2)} ${this._paceArrow(r2, t2, w2)}`;
+    // DL-3160: distinct Fable/premium (7d_oi) meter after the base axes — shown only
+    // when the account carries premium-axis data (real header or prober), never estimated.
+    if (showBoth) {
+      const pa = this._premiumAxis(q);
+      if (pa) line += `   Fbl${bar(pa.r, bw, pa.t)}`;
+    }
     line += `  ${roll}`;
     return line;
   }
 
   _acctGlyph(type) {
     return type === 'apikey' ? cyan('◇') : cyan('◆');
+  }
+
+  // DL-3160: the Fable/premium (7d_oi) axis for the Deck meter — real-header-driven,
+  // never estimated. Returns { r: utilization, t: reset } when the account carries
+  // premium data, else null (→ no meter rendered, we never fabricate a bar). A
+  // rejected account with no util still reads as full (r=1) so the cap is visible.
+  _premiumAxis(q) {
+    if (!q) return null;
+    if (q.premiumUtil != null) return { r: q.premiumUtil, t: q.premiumReset ?? null };
+    if (q.premiumStatus === 'rejected') return { r: 1, t: q.premiumReset ?? null };
+    return null;
   }
 
   // D-1820: burn-rate arrow for one quota window — compares used% against how

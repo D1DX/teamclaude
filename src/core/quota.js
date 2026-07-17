@@ -54,14 +54,17 @@ export function updateQuota(mgr, accountIndex, headers) {
     if (!isNaN(oiUtil)) account.quota.premiumUtil = oiUtil;
     const oiReset = headers['anthropic-ratelimit-unified-7d_oi-reset'];
     const oiResetMs = oiReset ? parseInt(oiReset, 10) * 1000 : null;
+    // DL-3160: capture the premium reset whenever the header carries a future-dated
+    // one — like the base 5h/7d axes (unconditional), not only on rejection — so the
+    // Fable meter shows value + reset even while the axis is `allowed` but utilized.
+    // A passed reset clears it (D-2236 guard). Display-only; no admission field.
+    if (oiResetMs != null) account.quota.premiumReset = oiResetMs > nowMs ? oiResetMs : null;
     if (oiStatus === 'rejected') {
-      account.quota.premiumReset = oiResetMs && oiResetMs > nowMs ? oiResetMs : null;
       // Bench premium-only: usable for every non-premium model throughout. Fall back
       // to a bounded re-probe when Anthropic sends no forward-dated reset.
       account._premiumRejectedUntil = (oiResetMs && oiResetMs > nowMs)
         ? oiResetMs : nowMs + PREMIUM_REJECT_FALLBACK_MS;
     } else {
-      account.quota.premiumReset = null;
       account._premiumRejectedUntil = 0; // recovered
     }
   }

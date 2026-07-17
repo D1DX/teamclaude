@@ -35,7 +35,13 @@ export async function capacityCommand() {
     const cap = a.capEst5h != null
       ? ` · burn ${fmtN(a.burn5h)}/${fmtN(Math.round(a.capEst5h))} (5h)`
       : ` · burn ${fmtN(a.burn5h)} (5h, cap unlearned)`;
-    console.log(`  ${String(a.name).padEnd(8)} ${state}${cap}`);
+    // DL-3160: distinct Fable/premium (7d_oi) segment — shown only when the account
+    // carries premium data; capped = premium-only bench (still serves non-premium).
+    const p = a.premium || {};
+    const fbl = p.capped ? ' · Fable capped'
+      : p.util != null ? ` · Fable ${(p.util * 100).toFixed(0)}%`
+      : '';
+    console.log(`  ${String(a.name).padEnd(8)} ${state}${cap}${fbl}`);
   }
   process.exit(_verdictExit(data.verdict));
 }
