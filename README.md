@@ -1,8 +1,10 @@
-# TeamClaude
+# teamclaude
 
-Multi-account Claude proxy with automatic quota-based rotation for [Claude Code](https://claude.ai/claude-code).
+**One Claude Code fleet, many accounts.** A multi-account Claude proxy with automatic quota-based rotation, built and maintained by [D1DX](https://d1dx.com) to keep a fleet of parallel [Claude Code](https://claude.com/claude-code) agents running all day on Max subscriptions.
 
 Sits transparently between Claude Code and the Anthropic API, managing multiple Claude Max (or API key) accounts and automatically switching when one approaches its session or weekly quota limit.
+
+Started as a fork of [KarpelesLab/teamclaude](https://github.com/KarpelesLab/teamclaude); it has been substantially rebuilt since: pace-to-weekly-line routing, a learned per-account capacity model, an anti-dogpile admission layer, fleet control-plane data, and the TUI below.
 
 ![TeamClaude TUI](screenshots/teamclaude.png)
 
@@ -24,7 +26,7 @@ Requires Node.js 18+.
 
 ```bash
 # Install
-npm install -g @karpeleslab/teamclaude
+npm install -g github:D1DX/teamclaude
 
 # Add your first account (opens browser for OAuth)
 teamclaude login
@@ -204,4 +206,4 @@ TEAMCLAUDE_CONFIG=./my-config.json teamclaude server
 
 ## License
 
-MIT
+MIT. Original work by [KarpelesLab](https://github.com/KarpelesLab/teamclaude); extended and maintained by [D1DX](https://github.com/D1DX).
