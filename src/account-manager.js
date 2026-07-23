@@ -10,7 +10,7 @@ import { computeCapacity as capComputeCapacity, noteAccountSuccess as capNoteAcc
 import { warmAll as warmerWarmAll, warmOne as warmerWarmOne, warmHeadroom as warmerWarmHeadroom, rewarmFailed as warmerRewarmFailed } from './auth/warmer.js';
 import { createAccounts, addAccount as poolAddAccount, removeAccount as poolRemoveAccount } from './core/pool.js';
 import { getAccountForSession as sessGetAccountForSession, activeSessionCounts as sessActiveSessionCounts, evictStaleBindings as sessEvictStaleBindings, sessionBindingSummary as sessBindingSummary, sessionAggregate as sessAggregate } from './core/session.js';
-import { getActiveAccount as selGetActiveAccount, pickAccountForBinding as selPickAccountForBinding, paceLine as selPaceLine, paceGap as selPaceGap, rampBoost as selRampBoost, paceScore as selPaceScore, apikeyShouldYield as selApikeyShouldYield, hasUsableApikey as selHasUsableApikey, switchTo as selSwitchTo } from './core/selection.js';
+import { getActiveAccount as selGetActiveAccount, pickAccountForBinding as selPickAccountForBinding, paceLine as selPaceLine, paceGap as selPaceGap, rampBoost as selRampBoost, paceScore as selPaceScore, apikeyShouldYield as selApikeyShouldYield, hasUsableApikey as selHasUsableApikey, switchTo as selSwitchTo, isFableReserved as selIsFableReserved } from './core/selection.js';
 import { noteInflightStart as dispNoteInflightStart, noteInflightEnd as dispNoteInflightEnd, tryReserveInflight as dispTryReserveInflight, atInflightCap as dispAtInflightCap } from './core/dispatch.js';
 import { sweepAll as benchSweepAll, clearExpiredQuotas as benchClearExpiredQuotas, isBlocked as benchIsBlocked, atHardLimit as benchAtHardLimit, isUsable as benchIsUsable, soonestUsableOrNull as benchSoonestUsableOrNull, isPremiumModel as benchIsPremiumModel, premiumRejected as benchPremiumRejected, premiumRequested as benchPremiumRequested, markRateLimited as benchMarkRateLimited, allHardCapped as benchAllHardCapped } from './core/bench.js';
 import { updateQuota as quotaUpdateQuota, applyProbeUsage as quotaApplyProbeUsage } from './core/quota.js';
@@ -118,6 +118,14 @@ export class AccountManager {
       try { return new RegExp(src, 'i'); } catch { return /fable|mythos/i; }
     })();
 
+    // ── DL-3563: Fable (7d_oi) RESERVATION — a NON-premium request avoids accounts that
+    //    still hold Fable headroom, so their scarce base-5h budget stays free to serve
+    //    Fable. Bind-time only; empty-set fallback preserves availability. Selection
+    //    ORDERING, never admission (mirror of the premium filter). Covered by
+    //    fable-reserve.test. ──
+    this.reserveFableHeadroom      = opts.reserveFableHeadroom      ?? true; // toggle the reservation
+    this.fableReserveHeadroomFloor = opts.fableReserveHeadroomFloor ?? 0.10; // min Fable headroom (0..1) that reserves an account
+
     // ── 429 handling: reactive-only bench (covered by reactive-bench.test) ──
     // A 429 with a server retry-after benches that one account for exactly the
     // stated duration; a header-less 429 fails over, never benches. backoffBaseSec
@@ -216,6 +224,10 @@ export class AccountManager {
 
   // Is this account currently premium-tier (7d_oi) capped? (core/bench.js).
   _premiumRejected(account) { return benchPremiumRejected(this, account); }
+
+  // DL-3563: is this account reserved for Fable (still holds premium 7d_oi headroom)? A
+  // non-premium request avoids reserved accounts (core/selection.js).
+  _isFableReserved(account) { return selIsFableReserved(this, account); }
 
   // Does this request need a premium account — executor OR advisor model premium
   // (DL-2841 advisor-aware premium skip)? (core/bench.js).

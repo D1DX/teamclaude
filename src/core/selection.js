@@ -93,9 +93,20 @@ export function pickAccountForBinding(mgr, { allowApikey = false, model = null, 
   // fine but would 429 this model). Premium = executor OR nested advisor model premium
   // (DL-2841). Fall back to the unfiltered set only if every candidate is premium-capped
   // (then it 429s honestly rather than never binding).
-  if (mgr._premiumRequested({ model, advisorModel })) {
+  const premiumReq = mgr._premiumRequested({ model, advisorModel });
+  if (premiumReq) {
     const premiumOk = usable.filter(a => !mgr._premiumRejected(a));
     if (premiumOk.length) usable = premiumOk;
+  } else if (mgr.reserveFableHeadroom) {
+    // DL-3563 — the MIRROR of the premium filter: a NON-premium request AVOIDS accounts
+    // that still hold Fable (7d_oi) headroom, so their scarce base-5h budget is not burned
+    // by non-premium traffic and stays free to serve Fable. Fable-capable accounts often
+    // sit on the fleet's LOWEST weekly line, so pace-to-line would otherwise pile ALL
+    // traffic onto exactly them, cap their 5h, and leave the pool with zero Fable capacity.
+    // Same empty-set fallback — every usable account reserved → non-premium still binds
+    // (availability preserved). Pure eligibility ORDERING, never an admission signal.
+    const nonReserved = usable.filter(a => !isFableReserved(mgr, a));
+    if (nonReserved.length) usable = nonReserved;
   }
   const { counts } = mgr._activeSessionCounts();
   // Atomic in-flight cap (DL-2226): an account at maxInflightPerAccount takes no new
@@ -113,6 +124,24 @@ export function pickAccountForBinding(mgr, { allowApikey = false, model = null, 
     if (ca !== cb) return ca < cb ? a : b;
     return (a._inflight || 0) < (b._inflight || 0) ? a : b;
   }, band[0]);
+}
+
+// DL-3563 — is this account currently RESERVED for Fable? True when it still holds
+// meaningful Fable (premium 7d_oi) headroom, so a NON-premium request should avoid it and
+// leave its scarce base-5h budget free to serve Fable. Requires REAL premium data
+// (premiumUtil non-null) AND not premium-capped AND headroom >= fableReserveHeadroomFloor.
+// An account with no premium data (unknown Fable capability) is NEVER reserved — a
+// conservative default that lets non-premium traffic use it. Config-gated
+// (reserveFableHeadroom). Reporting data ORDERING eligibility; the caller keeps the
+// empty-set fallback, so admission stays reactive-only.
+export function isFableReserved(mgr, account) {
+  if (!mgr.reserveFableHeadroom || !account) return false;
+  if (mgr._premiumRejected(account)) return false;          // Fable already exhausted → not reserved
+  const util = account.quota?.premiumUtil;
+  if (util == null) return false;                           // no Fable data → don't reserve
+  const headroom = Math.max(0, 1 - util);
+  const floor = mgr.fableReserveHeadroomFloor > 0 ? mgr.fableReserveHeadroomFloor : 0.1;
+  return headroom >= floor;
 }
 
 // True when `account` is the apikey last-resort AND at least one OAuth account is

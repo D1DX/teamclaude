@@ -47,6 +47,10 @@ export async function serverCommand() {
     maxInflightPerAccount: config.maxInflightPerAccount ?? 5,  // atomic in-flight cap per account — D-2236
     maxSessionsPerAccount: config.maxSessionsPerAccount ?? 7,  // hard cap on bound warm sessions per account (instances limit) — D-2236
     premiumModelPattern: config.premiumModelPattern ?? 'fable|mythos', // DL-2841: regex for the flagship/premium weekly tier (Anthropic's 7d_oi sub-axis) — a premium-capped account is skipped for these models only, stays usable for the rest
+    // DL-3563: Fable (7d_oi) reservation — a non-premium request avoids Fable-headroom
+    // accounts so their base-5h budget stays free to serve Fable. Bind-time; fallback-safe.
+    reserveFableHeadroom: config.reserveFableHeadroom ?? true,
+    fableReserveHeadroomFloor: config.fableReserveHeadroomFloor ?? 0.10,
     // 429 handling — reactive-only bench
     backoffSec: config.backoffSec ?? 60,           // all-throttled client retry-after floor
     allThrottledCapSec: config.allThrottledCapSec ?? 600,
