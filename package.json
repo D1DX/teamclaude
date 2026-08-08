@@ -11,7 +11,7 @@
     "src/"
   ],
   "dependencies": {
-    "undici": "^6.21.0"
+    "undici": "6.28.0"
   },
   "scripts": {
     "start": "node src/index.js",
