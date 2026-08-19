@@ -21,6 +21,7 @@ import { decideHold } from '../core/hold-policy.js';
 import { streamResponse, extractUsageFromBody } from './sse.js';
 import { parseRequestModel, parseAdvisorModel, parseRequestEffort } from '../model.js';
 import { resolveProvider } from '../providers/provider.js';
+import { isModelsPath, mergeModelsBody } from './gpt-route.js';
 import '../providers/anthropic.js'; // self-registers the default 'anthropic' adapter
 
 const HOP_BY_HOP_HEADERS = new Set([
@@ -496,8 +497,17 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
         writeRequestLog(logDir, reqId, logSections);
       }
     } else {
-      const buf = Buffer.from(await upstreamRes.arrayBuffer());
+      let buf = Buffer.from(await upstreamRes.arrayBuffer());
       extractUsageFromBody(buf, account.index, accountManager, sessionId, provider);
+      // DL-4819 — one door: the model list this gateway publishes must name every
+      // model it can serve, so the gpt-* leg's ids join the Claude ids Anthropic
+      // just returned. Only a 200 `{data:[…]}` body is touched; anything else
+      // (an error, a non-JSON answer) passes through byte-for-byte. Safe after
+      // writeHead because content-length was stripped from the relayed headers
+      // above, so the response is already chunked.
+      if (upstreamRes.status === 200 && isModelsPath(req.url)) {
+        buf = await mergeModelsBody(buf);
+      }
       if (logDir) {
         try {
           logSections.push(`=== RESPONSE BODY ===\n${JSON.stringify(JSON.parse(buf.toString()), null, 2)}`);

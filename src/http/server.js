@@ -13,6 +13,7 @@ import { BUILD } from '../version.js';
 import { handleAdminRoute } from './admin.js';
 import { forwardRequest, relayRaw, relayStream, isClientCredentialPath, configureForward } from './forward.js';
 import { configureProviders, resolveUpstream } from '../providers/provider.js';
+import { configureGptRoute, isGptRequest, forwardGptRequest } from './gpt-route.js';
 import '../providers/anthropic.js'; // self-registers the default 'anthropic' adapter
 
 // #81 (4fc849a): constant-time proxy-key comparison. A plain `!==` leaks the
@@ -44,6 +45,8 @@ export function createProxyServer(accountManager, config, hooks = {}) {
   configureForward(config);
   // Provider seam (§7): fold config.upstream into the default adapter's origin.
   configureProviders(config);
+  // DL-4819: resolve the gpt-* leg (origin, family pattern, credential) once.
+  configureGptRoute(config);
 
   if (logDir) {
     mkdir(logDir, { recursive: true }).catch(() => {});
@@ -101,16 +104,28 @@ export function createProxyServer(accountManager, config, hooks = {}) {
         return;
       }
 
-      // Track request
-      const reqId = ++requestCounter;
-      hooks.onRequestStart?.(reqId, { method: req.method, path: req.url });
-
-      // Buffer request body (needed for retry on 429)
+      // Buffer request body (needed for retry on 429, and to read the model)
       const bodyChunks = [];
       for await (const chunk of req) {
         bodyChunks.push(chunk);
       }
       const body = Buffer.concat(bodyChunks);
+
+      // DL-4819 — one door: a request naming a model of the gpt-* family is
+      // served by the sibling openai leg on this host, which speaks the same
+      // Anthropic shape. It is answered BEFORE the request counter and the
+      // inference hooks on purpose: it selects no account, spends no pool quota
+      // and books no ledger entry, so counting it as a pool request would put a
+      // request the Claude accounts never saw into their books. Proxy-key auth
+      // (above) still gates it — the gateway has one front door, not two.
+      if (isGptRequest(body)) {
+        await forwardGptRequest(req, res, body);
+        return;
+      }
+
+      // Track request
+      const reqId = ++requestCounter;
+      hooks.onRequestStart?.(reqId, { method: req.method, path: req.url });
 
       const ctx = { account: null, status: null };
       try {
