@@ -137,8 +137,19 @@ export function forwardGptRequest(req, res, body) {
       up.on('error', () => { res.destroy(); done(); });
     });
 
+    // destroy(err) is what turns the timeout into the 502 below — node emits
+    // 'error' with the given error. Never reduce this to a bare destroy(): the
+    // client would then hang with no response at all.
     upstream.setTimeout(ROUTE.timeoutMs, () => {
       upstream.destroy(new Error(`gpt leg timeout after ${ROUTE.timeoutMs}ms`));
+    });
+
+    // A client that hangs up mid-answer — an interrupted agent turn, a closed
+    // terminal — must take the leg request down with it. Without this the leg
+    // keeps generating into a socket nobody reads until the timeout, and a retry
+    // storm stacks those up against a subscription quota.
+    res.on('close', () => {
+      if (!res.writableEnded) upstream.destroy();
     });
 
     upstream.on('error', (err) => {
